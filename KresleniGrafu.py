@@ -34,6 +34,9 @@ redraw_interval = 1 / 30  # max 30x za sekundu
 # Proměnná pro posouvání dat
 scroll_offset = 0
 
+# Flag pro výpis stavu
+waiting_for_data = True
+
 print("Plotter spuštěn. Čekám na UDP data...")
 
 try:
@@ -43,10 +46,7 @@ try:
             data, addr = sock.recvfrom(BUFFER_SIZE)
             text = data.decode('utf-8').strip()
 
-            # Logování příchozích dat pro kontrolu
-            print(f"Přijato: {text}")
-
-            # Rozdělení příchozích dat do jednotlivých řádků a zpracování
+            # Zpracování příchozích dat
             for line_text in text.splitlines():
                 try:
                     x_str, y_str = line_text.strip().split()
@@ -58,13 +58,18 @@ try:
                     y_data.append(y)
 
                 except ValueError:
-                    print(f"Chyba při zpracování dat: {line_text}")
+                    continue  # Pokud je formát dat neplatný, ignorujeme
+
+            if waiting_for_data:  # Vypíšeme pouze jednou, když se začnou přijímat data
+                print("Data přijata...")
+                waiting_for_data = False  # Po první informaci o přijetí dat nebudeme už nic vypisovat
 
         except socket.timeout:
-            pass  # žádná data, pokračuj
+            if not waiting_for_data:  # Pokud už byly data přijata, vypíšeme, že čekáme na data pouze jednou
+                print("Čekám na data...")
+                waiting_for_data = True  # Změníme stav na čekání, aby další výpis byl o čekání na data
 
         # Posunování dat na ose X tak, aby nová data byla na pravé straně grafu
-        # Udržujeme rozsah 10 jednotek na ose X
         if len(x_data) > 0:
             # Posuneme data vlevo, aby nová data byla na pravé straně
             while x_data[-1] - x_data[0] > 10:
