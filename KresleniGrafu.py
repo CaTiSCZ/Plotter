@@ -1,50 +1,57 @@
 import matplotlib.pyplot as plt
 import socket
 import time
+from collections import deque
 
 # UDP nastavení
-UDP_IP = "0.0.0.0"  # přijímat na všech rozhraních
+UDP_IP = "0.0.0.0"
 UDP_PORT = 9999
 BUFFER_SIZE = 1024
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((UDP_IP, UDP_PORT))
-sock.settimeout(0.1)  # krátký timeout pro plynulý loop
+sock.settimeout(0.1)
 
 # Nastavení grafu
 plt.ion()
 fig, ax = plt.subplots()
 line, = ax.plot([], [], 'b-', label='sin(x)')
 ax.set_ylim(-1.1, 1.1)
-ax.set_xlim(0, 10)  # Rozsah osy X bude stále 10 jednotek (0 až 10)
+ax.set_xlim(0, 10)
 ax.set_title('Zobrazení sinusoidy z UDP')
 ax.set_xlabel('x')
 ax.set_ylabel('sin(x)')
 ax.grid(True, which='both', axis='both', color='lightgrey', linestyle='-', linewidth=0.5)
 ax.legend(loc='upper right')
 
-# Seznam pro uložení dat
-x_data = []
-y_data = []
+# Seznam pro uložení dat (pomocí deque pro efektivní odstraňování starých dat)
+BUFFER_CAPACITY = 100000
+x_data = deque(maxlen=BUFFER_CAPACITY)
+y_data = deque(maxlen=BUFFER_CAPACITY)
 
 # Čas pro zkrácení vykreslování (max 30x za sekundu)
 last_redraw = time.time()
-redraw_interval = 1 / 30  # max 30x za sekundu
+redraw_interval = 1 / 30
 
 # Flag pro výpis stavu
 waiting_for_data = True
 
-# Funkce pro resetování dat a grafu
+# Funkce pro resetování grafu
 def reset_graph():
     global x_data, y_data, last_redraw
     print("Resetování grafu...")
-    x_data = []
-    y_data = []
+    x_data.clear()
+    y_data.clear()
     line.set_data(x_data, y_data)
-    ax.set_xlim(0, 10)  # Resetování osy X
-    ax.set_ylim(-1.1, 1.1)  # Resetování osy Y
+    ax.set_xlim(0, 10)
+    ax.set_ylim(-1.1, 1.1)
     plt.draw()
     last_redraw = time.time()
+
+# Funkce pro výpis zaplnění bufferu
+def print_buffer_fill():
+    buffer_fill_percentage = (len(x_data) / BUFFER_CAPACITY) * 100
+    print(f"Zaplnění bufferu: {buffer_fill_percentage:.2f}%")
 
 print("Plotter spuštěn. Čekám na UDP data...")
 
@@ -81,18 +88,21 @@ try:
                     print("Čekám na data...")
                     waiting_for_data = True  # Změníme stav na čekání, aby další výpis byl o čekání na data
 
+            # Zobrazení zaplnění bufferu
+            print_buffer_fill()
+
         except socket.timeout:
             # Pokud čekáme na data, ale žádná nepřichází
             if not waiting_for_data:
                 print("Čekám na data...")
                 waiting_for_data = True  # Změníme stav na čekání, aby další výpis byl o čekání na data
 
-        # Posunování dat na ose X tak, aby nová data byla na pravé straně grafu
+        # Posunujeme data na ose X, aby nová data byla na pravé straně
         if len(x_data) > 0:
             # Posuneme data vlevo, aby nová data byla na pravé straně
             while x_data[-1] - x_data[0] > 10:
-                x_data.pop(0)  # Odebereme první bod
-                y_data.pop(0)  # Odebereme odpovídající hodnotu z Y
+                x_data.popleft()  # Odebereme první bod
+                y_data.popleft()  # Odebereme odpovídající hodnotu z Y
 
         # Kontrola, zda uplynul čas pro vykreslení (max 30x za sekundu)
         if x_data and y_data and time.time() - last_redraw >= redraw_interval:
