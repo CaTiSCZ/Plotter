@@ -36,6 +36,9 @@ redraw_interval = 1 / 30
 # Flag pro výpis stavu
 waiting_for_data = True
 
+# Proměnná pro zapamatování posledního zaplnění bufferu
+last_buffer_fill_percentage = -1
+
 # Funkce pro resetování grafu
 def reset_graph():
     global x_data, y_data, last_redraw
@@ -48,10 +51,14 @@ def reset_graph():
     plt.draw()
     last_redraw = time.time()
 
-# Funkce pro výpis zaplnění bufferu
+# Funkce pro výpis zaplnění bufferu pouze při změně > 1 %
 def print_buffer_fill():
+    global last_buffer_fill_percentage
     buffer_fill_percentage = (len(x_data) / BUFFER_CAPACITY) * 100
-    print(f"Zaplnění bufferu: {buffer_fill_percentage:.2f}%")
+    # Pokud změna zaplnění bufferu je větší než 1 %, vypíšeme novou hodnotu
+    if abs(buffer_fill_percentage - last_buffer_fill_percentage) > 1:
+        print(f"Zaplnění bufferu: {buffer_fill_percentage:.2f}%")
+        last_buffer_fill_percentage = buffer_fill_percentage
 
 print("Plotter spuštěn. Čekám na UDP data...")
 
@@ -88,7 +95,7 @@ try:
                     print("Čekám na data...")
                     waiting_for_data = True  # Změníme stav na čekání, aby další výpis byl o čekání na data
 
-            # Zobrazení zaplnění bufferu
+            # Zobrazení zaplnění bufferu, pokud změna je > 1 %
             print_buffer_fill()
 
         except socket.timeout:
