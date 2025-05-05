@@ -31,11 +31,20 @@ y_data = []
 last_redraw = time.time()
 redraw_interval = 1 / 30  # max 30x za sekundu
 
-# Proměnná pro posouvání dat
-scroll_offset = 0
-
 # Flag pro výpis stavu
 waiting_for_data = True
+
+# Funkce pro resetování dat a grafu
+def reset_graph():
+    global x_data, y_data, last_redraw
+    print("Resetování grafu...")
+    x_data = []
+    y_data = []
+    line.set_data(x_data, y_data)
+    ax.set_xlim(0, 10)  # Resetování osy X
+    ax.set_ylim(-1.1, 1.1)  # Resetování osy Y
+    plt.draw()
+    last_redraw = time.time()
 
 print("Plotter spuštěn. Čekám na UDP data...")
 
@@ -47,6 +56,7 @@ try:
             text = data.decode('utf-8').strip()
 
             # Zpracování příchozích dat
+            new_data = False
             for line_text in text.splitlines():
                 try:
                     x_str, y_str = line_text.strip().split()
@@ -56,16 +66,24 @@ try:
                     # Přidání dat do seznamu
                     x_data.append(x)
                     y_data.append(y)
+                    new_data = True  # Pokud přijdou nová data, označíme to
 
                 except ValueError:
                     continue  # Pokud je formát dat neplatný, ignorujeme
 
-            if waiting_for_data:  # Vypíšeme pouze jednou, když se začnou přijímat data
-                print("Data přijata...")
-                waiting_for_data = False  # Po první informaci o přijetí dat nebudeme už nic vypisovat
+            if new_data:
+                if waiting_for_data:  # Vypíšeme pouze jednou, když se začnou přijímat data
+                    print("Data přijata...")
+                    waiting_for_data = False  # Po první informaci o přijetí dat nebudeme už nic vypisovat
+                    reset_graph()  # Reset grafu při přechodu na přijímání dat
+            else:
+                if not waiting_for_data:
+                    print("Čekám na data...")
+                    waiting_for_data = True  # Změníme stav na čekání, aby další výpis byl o čekání na data
 
         except socket.timeout:
-            if not waiting_for_data:  # Pokud už byly data přijata, vypíšeme, že čekáme na data pouze jednou
+            # Pokud čekáme na data, ale žádná nepřichází
+            if not waiting_for_data:
                 print("Čekám na data...")
                 waiting_for_data = True  # Změníme stav na čekání, aby další výpis byl o čekání na data
 
