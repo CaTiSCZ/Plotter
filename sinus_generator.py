@@ -55,6 +55,7 @@ class DualSignalGenerator:
     def _run(self):
         samples_per_packet = 200
         triangle_period = 1.0  # 1 sekunda pro jednu periodu trojúhelníku
+        
 
         while self.running:
             lines = []
