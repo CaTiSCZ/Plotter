@@ -26,16 +26,6 @@ plot = win.addPlot(title="Napětí a proud")  # Přímo přidáme plot do layout
 plot.setLabel('left', 'Napětí [V]', color='blue')  # Label pro osu Y1
 plot.setLabel('bottom', 'Čas [s]', color='black')  # Label pro osu X
 
-# Data pro grafy
-rozsah = 50000
-x_data = deque(maxlen=rozsah)  # Osa X (max 500 bodů)
-y1_data = deque(maxlen=rozsah)  # Osa Y1 (napětí)
-y2_data = deque(maxlen=rozsah)  # Osa Y2 (proud)
-
-# Křivky pro napětí (Y1) a proud (Y2)
-curve_y1 = plot.plot(pen='b', name="Napětí [V]")
-curve_y2 = plot.plot(pen='r', name="Proud [A]")
-
 # Vytvoření druhé osy Y pro proud
 right_axis = pg.ViewBox()
 plot.showAxis('right')  # Zobrazí osu Y na pravé straně
@@ -44,13 +34,27 @@ plot.scene().addItem(right_axis)
 plot.getAxis('right').linkToView(right_axis)
 right_axis.setXLink(plot)
 
-# Nastavení rozsahu pro osy Y
-# Nastavení pro levé Y (napětí)
 plot.setYRange(-2, 2)  # Nastavíme rozmezí osy Y pro napětí (modrá křivka)
-
-# Nastavení pro pravé Y (proud)
 right_axis.setYRange(-5, 12)  # Nastavíme rozmezí osy Y pro proud (červená křivka)
 right_axis.enableAutoRange(axis='y', enable=False)  # Deaktivujeme automatické rozmezí pro pravou osu Y
+
+# Synchronizace velikosti pravé ViewBox s hlavní ViewBox
+def update_views():
+    right_axis.setGeometry(plot.vb.sceneBoundingRect())
+    right_axis.linkedViewChanged(plot.vb, right_axis.XAxis)
+
+plot.vb.sigResized.connect(update_views)
+
+# Data pro grafy
+rozsah = 50000
+x_data = deque(maxlen=rozsah)  # Osa X (max 500 bodů)
+y1_data = deque(maxlen=rozsah)  # Osa Y1 (napětí)
+y2_data = deque(maxlen=rozsah)  # Osa Y2 (proud)
+
+# Křivky pro napětí (Y1) a proud (Y2)
+curve_y1 = plot.plot(pen='b', name="Napětí [V]")
+curve_y2 = pg.PlotDataItem(pen='r', name="Proud [A]")
+right_axis.addItem(curve_y2)
 
 # Funkce pro aktualizaci grafu
 def update():
