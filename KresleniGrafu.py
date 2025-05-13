@@ -12,7 +12,7 @@ BUFFER_SIZE = 65507
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((UDP_IP, UDP_PORT))
-sock.settimeout(0.1)
+sock.settimeout(0.5)  # Zvyšujeme časový limit pro příjem dat
 
 # PyQtGraph a Qt setup
 app = QtWidgets.QApplication([])
@@ -62,7 +62,7 @@ right_axis.setYRange(-5, 12)
 right_axis.enableAutoRange(axis='y', enable=False)
 
 # Data
-MAX_DATA = 5*60*1000*200
+MAX_DATA = 5 * 60 * 1000  # Zvětšeno pro uchování až 5 minut dat
 x_data = deque(maxlen=MAX_DATA)
 y1_data = deque(maxlen=MAX_DATA)
 y2_data = deque(maxlen=MAX_DATA)
@@ -89,8 +89,8 @@ def update():
     if live_mode:
         x_max = x_np[-1]
         x_min = x_max - display_range
-        plot.setXRange(x_min, x_max, padding=0)
-        right_axis.setXRange(x_min, x_max, padding=0)
+        plot.setXRange(x_min, x_max, padding=0.05)  # Padding pro zlepšení zobrazení
+        right_axis.setXRange(x_min, x_max, padding=0.05)
 
 # Funkce pro příjem UDP dat
 def receive_data():
@@ -101,7 +101,6 @@ def receive_data():
             data, addr = sock.recvfrom(BUFFER_SIZE)
             text = data.decode('utf-8').strip()
 
-            # Zpracování příchozích dat
             for line in text.splitlines():
                 try:
                     # Předpokládáme formát: x y1 y2
@@ -110,34 +109,28 @@ def receive_data():
                     y1 = float(y1_str)
                     y2 = float(y2_str)
 
-                    # Přidání dat do seznamu
                     x_data.append(x)
                     y1_data.append(y1)
                     y2_data.append(y2)
 
-                    # Pokud jsou velikosti všech dat stejný, pak se křivky aktualizují
-                    if len(x_data) == len(y1_data) == len(y2_data):
-                        curve_y1.setData(np.array(x_data), np.array(y1_data))
-                        curve_y2.setData(np.array(x_data), np.array(y2_data))
-
                 except ValueError:
-                    continue  # Pokud je formát dat neplatný, ignorujeme
+                    continue  # Ignoruje chybné řádky
 
         except socket.timeout:
-            continue  # Ignoruje timeouty (pokud neprobíhá žádná komunikace)
+            continue  # Ignoruje timeouty
         except Exception as e:
             print(f"Chyba při příjmu dat: {e}")
 
 def on_slider_change():
     global display_range
     display_range = range_slider.value()
-    # nepřepínáme zpět do live módu, jen měníme velikost zobrazené oblasti
-    range_label.setText(f"{display_range} s")  # aktualizace textu
+    range_label.setText(f"{display_range} s")
+    update()
 
 def on_live_button():
     global live_mode
     live_mode = True
-    update()  # okamžitě skočí na nejnovější data
+    update()
 
 # Event: změna rozsahu
 range_slider.valueChanged.connect(on_slider_change)
