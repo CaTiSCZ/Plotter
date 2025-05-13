@@ -1,18 +1,28 @@
-import pyqtgraph as pg
-import numpy as np
 import socket
-import threading
-from collections import deque
+import sys
+import numpy as np
+import pyqtgraph as pg
 from PyQt5 import QtWidgets, QtCore
+from collections import deque
+from queue import Queue
+import threading
 
 # UDP nastavení
 UDP_IP = "0.0.0.0"
 UDP_PORT = 9999
 BUFFER_SIZE = 65507
+display_range = 5  # sekund
+update_interval_ms = 33  # cca 1/30 sekundy
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((UDP_IP, UDP_PORT))
-sock.settimeout(0.5)  # Zvyšujeme časový limit pro příjem dat
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+
+
+data_queue = Queue()
+x_data = deque()
+y1_data = deque()
+y2_data = deque()
 
 # PyQtGraph a Qt setup
 app = QtWidgets.QApplication([])
@@ -40,7 +50,6 @@ controls_layout.addWidget(range_slider)
 range_label = QtWidgets.QLabel("10 s")  # zobrazení aktuální hodnoty
 controls_layout.addWidget(range_label)
 
-
 live_button = QtWidgets.QPushButton("Live View")
 controls_layout.addWidget(live_button)
 
@@ -61,8 +70,9 @@ plot.setYRange(-2, 2)
 right_axis.setYRange(-5, 12)
 right_axis.enableAutoRange(axis='y', enable=False)
 
+data_lock = threading.Lock()
 # Data
-MAX_DATA = 5 * 60 * 1000  # Zvětšeno pro uchování až 5 minut dat
+MAX_DATA = 1000000  
 x_data = deque(maxlen=MAX_DATA)
 y1_data = deque(maxlen=MAX_DATA)
 y2_data = deque(maxlen=MAX_DATA)
@@ -76,50 +86,52 @@ display_range = 10  # sekund
 live_mode = True
 
 def update():
-    if len(x_data) == 0:
+    if not x_data:
         return
 
-    x_np = np.array(x_data)
-    y1_np = np.array(y1_data)
-    y2_np = np.array(y2_data)
+    with data_lock:
+        x_np  = np.array(x_data, dtype=float)  # nebo np.array(list(x_data))
+        y1_np = np.array(y1_data, dtype=float)
+        y2_np = np.array(y2_data, dtype=float)
 
-    curve_y1.setData(x_np, y1_np)
-    curve_y2.setData(x_np, y2_np)
+    x_max = x_np[-1]
+    x_min = x_max - display_range
+    mask  = (x_np >= x_min)
 
-    if live_mode:
-        x_max = x_np[-1]
-        x_min = x_max - display_range
-        plot.setXRange(x_min, x_max, padding=0.05)  # Padding pro zlepšení zobrazení
-        right_axis.setXRange(x_min, x_max, padding=0.05)
+    curve_y1.setData(x_np[mask], y1_np[mask])
+    curve_y2.setData(x_np[mask], y2_np[mask])
+
+    plot.setXRange(x_min, x_max, padding=0.01)
+    right_axis.setXRange(x_min, x_max, padding=0.01)
 
 # Funkce pro příjem UDP dat
 def receive_data():
-    print("Čekám na UDP data...")
+    print("Čekám na UDP data…")
     while True:
         try:
-            # Čekání na UDP data
-            data, addr = sock.recvfrom(BUFFER_SIZE)
-            text = data.decode('utf-8').strip()
+            data, _ = sock.recvfrom(BUFFER_SIZE)
+            text = data.decode('utf‑8').strip()
 
+            # zpracuj CELÝ paket (200 řádků) a pak jedním zámkem přidej do deque
+            loc_x, loc_y1, loc_y2 = [], [], []
             for line in text.splitlines():
                 try:
-                    # Předpokládáme formát: x y1 y2
-                    x_str, y1_str, y2_str = line.split()
-                    x = float(x_str)
-                    y1 = float(y1_str)
-                    y2 = float(y2_str)
-
-                    x_data.append(x)
-                    y1_data.append(y1)
-                    y2_data.append(y2)
-
+                    xs, vstr, istr = line.split()
+                    loc_x.append(float(xs))
+                    loc_y1.append(float(vstr))
+                    loc_y2.append(float(istr))
                 except ValueError:
-                    continue  # Ignoruje chybné řádky
+                    continue            # přeskoč neplatný řádek
+
+            with data_lock:
+                x_data.extend(loc_x)
+                y1_data.extend(loc_y1)
+                y2_data.extend(loc_y2)
 
         except socket.timeout:
-            continue  # Ignoruje timeouty
+            continue
         except Exception as e:
-            print(f"Chyba při příjmu dat: {e}")
+            print("Chyba při příjmu:", e)
 
 def on_slider_change():
     global display_range
@@ -146,7 +158,7 @@ plot.getViewBox().sigResized.connect(sync_views)
 # Timer pro aktualizaci
 timer = QtCore.QTimer()
 timer.timeout.connect(update)
-timer.start(100)
+timer.start(30)
 
 # Start přijímání dat
 threading.Thread(target=receive_data, daemon=True).start()
