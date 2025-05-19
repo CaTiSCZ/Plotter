@@ -23,56 +23,79 @@ class MultiSignalTestGenerator:
         self.interval = interval
         self.num_signals = num_signals
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((self.ip, self.port))
         self.running = False
         self.packet_id = 0
+        self.num_packets_to_send = 0  # 0 = continuous
 
     def start(self):
-        self.running = True
-        threading.Thread(target=self._run, daemon=True).start()
+        self.running = True 
+        self.listener_thread = threading.Thread(target=self._listen_for_command)
+        self.listener_thread.start()
 
     def stop(self):
         self.running = False
+        if hasattr(self, 'listener_thread'):
+            self.listener_thread.join()
         self.sock.close()
 
-    def _run(self):
-        length = 200
-        int16_min = -32768
-        int16_max = 32767
-        base_signal_raw = np.arange(length, dtype=np.float32)
-        base_signal_scaled = ((base_signal_raw / (length - 1)) * (int16_max - int16_min) + int16_min).astype(np.int16)
+    def _listen_for_command(self):
+        print("Čekám na příkazový paket...")
+        while self.running:
+            cmd_data, addr = self.sock.recvfrom(1024)
+            if len(cmd_data) == 12:
+                command_type, num_packets = struct.unpack('<IQ', cmd_data)
+                if command_type == 5:
+                    print(f"Přijat příkaz: typ={command_type}, počet paketů={num_packets}")
+                    self.num_packets_to_send = num_packets
+
+                    # vynucení odpovědi na port 9998
+                    response_addr = (addr[0], 9998)
+
+                    # Odpověď (potvrzení příjmu)
+                    response = struct.pack('<HHIQ', 0, 0, command_type, num_packets)
+                    self.sock.sendto(response, response_addr)
+
+                    # Spusť odesílání dat
+                    self._send_data(addr)
+                else:
+                    print(f"Neznámý příkaz typu {command_type}")
+
+    def _send_data(self, addr):
+        base_signal = np.linspace(-32768, 32767, 200, dtype=np.int16)
+        packets_sent = 0
 
         while self.running:
             signals = []
             for i in range(self.num_signals):
-                shift = (i * length) // self.num_signals
-                signal = np.roll(base_signal_scaled + self.packet_id, shift)
+                shift = (i * 200) // self.num_signals
+                signal = np.roll(base_signal + self.packet_id, shift)
                 signals.append(signal.astype(np.int16))
 
-            # Konverze všech signálů do bytového formátu
             signal_bytes = b''.join(s.tobytes() for s in signals)
-            
+
             # Chybové hodnoty – zatím 0 pro každý signál
             error_counts = struct.pack('<' + 'H' * self.num_signals, *([0] * self.num_signals))
 
-            # Hlavička: typ paketu (2), číslo paketu
             header = struct.pack('<HH', 2, self.packet_id % 65536)
             packet = header + signal_bytes + error_counts
 
-            # Zarovnání na sudý počet bajtů
             if len(packet) % 2 != 0:
                 packet += b'\x00'
 
-            # Přidání CRC-16
             crc = crc16(packet)
             packet += struct.pack('<H', crc)
 
-            # Odeslání UDP paketu
-            self.sock.sendto(packet, (self.ip, self.port))
-            break
+            data_addr = (addr[0], 9998)  # Zajisti, že data jdou na správný port
+            self.sock.sendto(packet, data_addr)
             self.packet_id += 1
+            packets_sent += 1
+
+            if self.num_packets_to_send != 0 and packets_sent >= self.num_packets_to_send:
+                break
+
             time.sleep(self.interval)
 
-# --- Spuštění jako program ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Testovací UDP generátor více signálů")
     parser.add_argument('--signals', type=int, default=1, help="Počet signálů v jednom packetu")
@@ -80,7 +103,7 @@ if __name__ == '__main__':
 
     gen = MultiSignalTestGenerator(num_signals=args.signals)
     gen.start()
-    print(f"Generátor spuštěn: {args.signals} signál(ů), Ctrl+C pro ukončení.")
+    print(f"Generátor připraven (signálů: {args.signals}). Čekám na příkaz.")
 
     try:
         while True:

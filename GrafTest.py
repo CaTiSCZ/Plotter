@@ -2,6 +2,7 @@ import socket
 import struct
 import matplotlib.pyplot as plt
 import numpy as np
+import time
 
 # --- CRC-16 (Modbus / CRC-16-IBM) ---
 def crc16_ibm(data: bytes, poly=0xA001):
@@ -17,16 +18,59 @@ def crc16_ibm(data: bytes, poly=0xA001):
 
 # --- Parametry ---
 UDP_IP = "127.0.0.1"
-UDP_PORT = 9999
+UDP_PORT_SEND = 9999
+UDP_PORT_RECV = 9998
 SAMPLES_PER_SIGNAL = 200
 SIGNAL_TYPE = np.int16
+MAX_ATTEMPTS = 3
+RECV_TIMEOUT = 3.0  # v sekundách
 
-# --- Přijmi jeden UDP paket ---
+# --- Vytvoř socket a odešli příkazový paket ---
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind((UDP_IP, UDP_PORT))
-print(f"Čekám na 1 paket na {UDP_IP}:{UDP_PORT}...")
-packet, addr = sock.recvfrom(4096)
-print(f"Přijato {len(packet)} bajtů od {addr}")
+sock.bind((UDP_IP, UDP_PORT_RECV))
+sock.settimeout(RECV_TIMEOUT)
+
+def send_command_and_receive():
+    for attempt in range (1, MAX_ATTEMPTS + 1):
+        try:
+            print(f"\n[Pokus {attempt}/{MAX_ATTEMPTS}] Odesílám příkaz...")
+
+            # Odeslání příkazového paketu (command_type=5, num_packets=1)
+            command_type = 5
+            num_packets = 1
+            command_packet = struct.pack('<IQ', command_type, num_packets)
+            sock.sendto(command_packet, (UDP_IP, UDP_PORT_SEND))
+
+
+            # --- Přijmi potvrzení ---
+            ack_packet, _ = sock.recvfrom(1024)
+            ack_type, ack_error, ack_cmd, ack_count = struct.unpack('<HHIQ', ack_packet)
+            print(f"Přijato potvrzení: typ={ack_type}, error={ack_error}, command={ack_cmd}, count={ack_count}")
+
+
+            # --- Přijmi datový paket ---
+            print(f"Čekám na datový paket na {UDP_IP}:{UDP_PORT_RECV}...")
+            packet, addr = sock.recvfrom(4096)
+            print(f"Přijato {len(packet)} bajtů od {addr}")
+            return packet  # úspěch
+        except socket.timeout:
+            print("⚠️  Timeout při čekání na odpověď.")
+        except Exception as e:
+            print(f"⚠️  Chyba: {e}")
+
+    return None  # po všech pokusech
+
+# --- Hlavní smyčka ---
+while True:
+    packet = send_command_and_receive()
+    if packet is not None:
+        break
+
+    # Po 3 neúspěšných pokusech se ptáme uživatele
+    user_input = input("\n❌ Nepodařilo se odeslat příkaz. Chceš to zkusit znovu? [a/n]: ").strip().lower()
+    if user_input != 'a':
+        print("Ukončuji program.")
+        exit()
 
 # --- CRC kontrola ---
 if len(packet) < 6:
@@ -49,15 +93,11 @@ print(f"Typ paketu: {packet_type}, ID: {packet_id}")
 
 # --- Rozparsuj data ---
 payload = data_part[4:]  # bez hlavičky
-#num_values = len(payload) // 2  # počet int16
-#max_possible_signals = num_values // (SAMPLES_PER_SIGNAL + 1)  # minimální možné maximum (kdyby byl 1 error za signál)
-
 data = np.frombuffer(payload, dtype=SIGNAL_TYPE)
 num_values = len(data)
 
 # --- Detekuj počet signálů ---
-# Hledáme takové N, že N * (SAMPLES_PER_SIGNAL + 1) == num_values
-for possible_n in range(1, 100):  # přiměřený rozsah pro testy
+for possible_n in range(1, 100):
     if possible_n * (SAMPLES_PER_SIGNAL + 1) == num_values:
         num_signals = possible_n
         break
@@ -65,13 +105,8 @@ else:
     print("Neplatný počet vzorků!")
     exit()
 
-num_signals = num_values // SAMPLES_PER_SIGNAL
 print(f"Počet signálů: {num_signals}")
 
-
-if num_signals is None:
-    print("Neplatná struktura paketu – nelze rozdělit na signály a chyby.")
-    exit()
 # --- Rozdělení signálů ---
 signals = []
 for i in range(num_signals):
