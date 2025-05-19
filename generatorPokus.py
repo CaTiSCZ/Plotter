@@ -17,13 +17,14 @@ def crc16(data: bytes, poly=0xA001):
     return crc & 0xFFFF
 
 class MultiSignalTestGenerator:
-    def __init__(self, ip='127.0.0.1', port=9999, interval=0.001, num_signals=1):
+    def __init__(self, ip='127.0.0.1', port=9999, interval=0.001, num_signals = 1):
         self.ip = ip
         self.port = port
         self.interval = interval
         self.num_signals = num_signals
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.ip, self.port))
+        self.sock.settimeout(1.0)  # ← timeout na recvfrom
         self.running = False
         self.packet_id = 0
         self.num_packets_to_send = 0  # 0 = continuous
@@ -42,7 +43,10 @@ class MultiSignalTestGenerator:
     def _listen_for_command(self):
         print("Čekám na příkazový paket...")
         while self.running:
-            cmd_data, addr = self.sock.recvfrom(1024)
+            try:
+                cmd_data, addr = self.sock.recvfrom(1024)
+            except socket.timeout:
+                continue  # → umožní kontrolu self.running
             if len(cmd_data) == 12:
                 command_type, num_packets = struct.unpack('<IQ', cmd_data)
                 if command_type == 5:
@@ -98,7 +102,7 @@ class MultiSignalTestGenerator:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Testovací UDP generátor více signálů")
-    parser.add_argument('--signals', type=int, default=1, help="Počet signálů v jednom packetu")
+    parser.add_argument('--signals', type=int, default=2, help="Počet signálů v jednom packetu")
     args = parser.parse_args()
 
     gen = MultiSignalTestGenerator(num_signals=args.signals)

@@ -23,7 +23,7 @@ UDP_PORT_RECV = 9998
 SAMPLES_PER_SIGNAL = 200
 SIGNAL_TYPE = np.int16
 MAX_ATTEMPTS = 3
-RECV_TIMEOUT = 3.0  # v sekundách
+RECV_TIMEOUT = 1.0  # v sekundách
 
 # --- Vytvoř socket a odešli příkazový paket ---
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
