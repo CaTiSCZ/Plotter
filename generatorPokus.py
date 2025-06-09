@@ -62,9 +62,71 @@ class MultiSignalTestGenerator:
 
                     # Spusť odesílání dat
                     self._send_data(addr)
+
+                elif command_type == 1:
+                    print("Přijat požadavek na identifikační paket.")
+                    self._send_identification_packet(addr)
+
                 else:
                     print(f"Neznámý příkaz typu {command_type}")
 
+    
+    def _send_identification_packet(self, addr):
+        # TODO: Nahraď tyto hodnoty reálnými podle potřeby
+        packet_type = 1
+        state = 0
+        hw_id = 0x1234
+        hw_ver_major = 1
+        hw_ver_minor = 0
+        hw_mcu_serial = 0x11223344
+        hw_adc_serial = 0x55667788
+        fw_id = 0xABCD
+        fw_ver_major = 2
+        fw_ver_minor = 3
+        build_time = b"2025-05-13T12:43:13\0".ljust(30, b'\x00')
+        channels_count = self.num_signals
+        units_and_gains = b''
+
+        for i in range(channels_count):
+            if i == 0:
+                unit = b"mV\0".ljust(4, b'\x00')
+                offset = 0.0
+                gain = 1.0
+            elif i == 1:
+                unit = b"A\0".ljust(4, b'\x00')
+                offset = 0.0
+                gain = 1.0
+            else:
+                unit = b"?\0".ljust(4, b'\x00')
+                offset = 0.0
+                gain = 1.0
+            units_and_gains += struct.pack('<4sff', unit, offset, gain)
+
+        header = struct.pack(
+            '<HHHHBBIIHBB30sH',
+            packet_type,
+            state,
+            hw_id,
+            hw_ver_major,
+            hw_ver_minor,
+            0,  # padding
+            hw_mcu_serial,
+            hw_adc_serial,
+            fw_id,
+            fw_ver_major,
+            fw_ver_minor,
+            build_time,
+            channels_count
+        )
+
+        full_packet = header + units_and_gains
+        crc = crc16(full_packet)
+        full_packet += struct.pack('<H', crc)
+
+        data_addr = (addr[0], 9998)
+        self.sock.sendto(full_packet, data_addr)
+
+        
     def _send_data(self, addr):
         base_signal = np.linspace(-32768, 32767, 200, dtype=np.int16)
         packets_sent = 0
