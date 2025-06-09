@@ -3,19 +3,14 @@ import struct
 import matplotlib.pyplot as plt
 import numpy as np
 
-# --- CRC-16 (Modbus / CRC-16-IBM) ---
 def crc16_ibm(data: bytes, poly=0xA001):
     crc = 0xFFFF
     for b in data:
         crc ^= b
         for _ in range(8):
-            if (crc & 1):
-                crc = (crc >> 1) ^ poly
-            else:
-                crc >>= 1
+            crc = (crc >> 1) ^ poly if (crc & 1) else crc >> 1
     return crc & 0xFFFF
 
-# --- Parametry ---
 UDP_IP = "127.0.0.1"
 UDP_PORT_SEND = 9999
 UDP_PORT_RECV = 9998
@@ -23,147 +18,142 @@ SAMPLES_PER_SIGNAL = 200
 SIGNAL_TYPE = np.int16
 MAX_ATTEMPTS = 3
 RECV_TIMEOUT = 1.0
+RECEIVER_IP = UDP_IP
+RECEIVER_PORT = UDP_PORT_RECV
 
-# --- Socket ---
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((UDP_IP, UDP_PORT_RECV))
 sock.settimeout(RECV_TIMEOUT)
 
 def send_command(command_type, num_packets=0):
-    command_packet = struct.pack('<IQ', command_type, num_packets)
-    sock.sendto(command_packet, (UDP_IP, UDP_PORT_SEND))
-
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    cmd = struct.pack('<IQ', command_type, num_packets)
+    sock.sendto(cmd, (UDP_IP, UDP_PORT_SEND))
+    for _ in range(MAX_ATTEMPTS):
         try:
-            print(f"[{attempt}/{MAX_ATTEMPTS}] Čekám na odpověď pro příkaz {command_type}...")
-            packet, addr = sock.recvfrom(4096)
-            print(f"Přijato {len(packet)} bajtů od {addr}")
-            return packet
+            return sock.recvfrom(4096)[0]
         except socket.timeout:
-            print("⚠️ Timeout.")
-        except Exception as e:
-            print(f"⚠️ Chyba: {e}")
+            continue
     return None
 
 def verify_crc(packet):
-    packet_type = struct.unpack('<H', packet[:2])[0]
-
-    # Přeskočit CRC kontrolu pro ACK paket (typ 0)
-    if packet_type == 0:
-        print("ACK paket – CRC se neprovádí.")
+    if struct.unpack('<H', packet[:2])[0] == 0:
         return packet
-
-    # Pro ostatní pakety proveď kontrolu CRC
     received_crc = struct.unpack('<H', packet[-2:])[0]
-    crc_input = packet[:-2]
-    calculated_crc = crc16_ibm(crc_input)
+    calc_crc = crc16_ibm(packet[:-2])
+    return packet[:-2] if received_crc == calc_crc else None
 
-    if received_crc != calculated_crc:
-        print(f"CRC ERROR! Očekáváno {hex(calculated_crc)}, přijato {hex(received_crc)}")
-        return None
+def send_register(ip_str, port):
+    ip = socket.inet_aton(ip_str)
+    cmd = struct.pack('<I4sH', 2, ip, port)
+    sock.sendto(cmd, (UDP_IP, UDP_PORT_SEND))
+    try:
+        resp, _ = sock.recvfrom(1024)
+        if len(resp) >= 15:
+            _, _, _, ip_b, p, idx = struct.unpack('<HHI4sHB', resp[:15])
+            print(f"[OK] Registrován {socket.inet_ntoa(ip_b)}:{p} (#{idx})")
+            return True
+    except socket.timeout:
+        pass
+    print("[ERR] Registrace selhala")
+    return False
 
-    print("CRC OK")
-    return crc_input
+def send_get_receivers():
+    sock.sendto(struct.pack('<I', 4), (UDP_IP, UDP_PORT_SEND))
+    try:
+        packet, _ = sock.recvfrom(1024)
+        n = (len(packet) - 8) // 6
+        print(f"[INFO] Počet přijímačů: {n}")
+    except socket.timeout:
+        print("[ERR] Nelze získat seznam přijímačů.")
 
-# --- 1. Get ID ---
-print("\n--- Odesílám příkaz Get ID ---")
+print("[0] Ping")
+packet = send_command(0)
+if not packet:
+    print("[ERR] Žádná odpověď na Ping.")
+else:
+    print(f"[INFO] Ping OK")
+
+print("[1] Get ID")
 packet = send_command(1)
-if packet is None:
-    print("Chyba: Nepodařilo se získat identifikaci.")
+if not packet:
+    print("[ERR] Žádná odpověď na Get ID.")
+    exit()
+data = verify_crc(packet)
+if not data:
+    print("[ERR] CRC chyba v ID paketu.")
     exit()
 
-data_part = verify_crc(packet)
-if data_part is None:
+typ = struct.unpack('<H', data[:2])[0]
+if typ != 1:
+    print(f"[ERR] Očekáván typ 1, přišel {typ}")
     exit()
 
-# --- Zpracuj ID paket ---
-packet_type = struct.unpack('<H', data_part[:2])[0]
-if packet_type != 1:
-    print(f"Očekáván paket typu 1 (ID), ale přišel {packet_type}")
-    exit()
-
-print("Zpracovávám identifikační paket...")
-unpack_fmt = '<HHHHBBIIHBB30sH'
-header_len = struct.calcsize(unpack_fmt)
-values = struct.unpack(unpack_fmt, data_part[:header_len])
-
-fields = [
-    "Packet type", "Error/state", "HW ID", "HW ver major", "HW ver minor", "pad",
-    "HW MCU serial", "HW ADC serial", "FW ID", "FW ver major", "FW ver minor",
-    "Build time", "Channels count"
-]
-
-for name, val in zip(fields, values):
-    if isinstance(val, bytes):
-        val = val.decode('ascii').strip('\x00')
-    print(f"{name}: {val}")
-
+header_fmt = '<HHHHBBIIHBB30sH'
+values = struct.unpack(header_fmt, data[:struct.calcsize(header_fmt)])
 channels_count = values[-1]
-offset = header_len
+print(f"[INFO] ID OK – {channels_count} kanálů")
+
+offset = struct.calcsize(header_fmt)
 for i in range(channels_count):
-    chan = struct.unpack('<4sff', data_part[offset:offset + 12])
-    unit = chan[0].decode('ascii').strip('\x00')
-    offset_q, offset_k = chan[1], chan[2]
-    print(f"Kanál {i}: jednotka = '{unit}', offset = {offset_q}, gain = {offset_k}")
+    unit, offset_q, gain = struct.unpack('<4sff', data[offset:offset+12])
+    print(f"  Kanál {i+1}: {unit.decode().strip()} q={offset_q:.2f} k={gain:.2f}")
     offset += 12
 
-# --- 2. Get signal packet ---
-print("\n--- Odesílám příkaz Get Signal ---")
+print("[4] Get receivers")
+send_get_receivers()
+
+print("[2] Register self")
+send_register(RECEIVER_IP, RECEIVER_PORT)
+
+print("[4] Get receivers")
+send_get_receivers()
+
+print("[5] Get signal")
 packet = send_command(5, num_packets=1)
-if packet is None:
-    print("Chyba: Nepodařilo se získat datový paket.")
+if not packet:
+    print("[ERR] Signál nebyl přijat.")
+    exit()
+data = verify_crc(packet)
+if not data:
+    print("[ERR] CRC chyba v datovém paketu.")
     exit()
 
-data_part = verify_crc(packet)
-if data_part is None:
-    exit()
+packet_type = struct.unpack('<H', data[:2])[0]
+while packet_type == 0:
+    packet, _ = sock.recvfrom(4096)
+    data = verify_crc(packet)
+    if not data:
+        exit()
+    packet_type = struct.unpack('<H', data[:2])[0]
 
-packet_type = struct.unpack('<H', data_part[:2])[0]
-if packet_type == 0:
-    print("ACK paket – čekám na další paket...")
-    # tady je potřeba přijmout další paket, protože ACK není datový paket
-    # můžeš buď zkusit recvfrom znovu nebo celý blok dát do smyčky
-    # příklad smyčky:
-    while packet_type == 0:
-        packet, addr = sock.recvfrom(4096)
-        data_part = verify_crc(packet)
-        if data_part is None:
-            exit()
-        packet_type = struct.unpack('<H', data_part[:2])[0]
+_, packet_id = struct.unpack('<HH', data[:4])
+print(f"[INFO] Signální paket #{packet_id}")
 
-# nyní pokračuj se zpracováním datového paketu typu 2
-packet_type, packet_id = struct.unpack('<HH', data_part[:4])
-print(f"Typ paketu: {packet_type}, ID: {packet_id}")
+payload = data[4:]
+arr = np.frombuffer(payload, dtype=SIGNAL_TYPE)
+num_values = len(arr)
 
-payload = data_part[4:]
-data = np.frombuffer(payload, dtype=SIGNAL_TYPE)
-num_values = len(data)
-
-for possible_n in range(1, 100):
-    if possible_n * (SAMPLES_PER_SIGNAL + 1) == num_values:
-        num_signals = possible_n
+for n in range(1, 100):
+    if n * (SAMPLES_PER_SIGNAL + 1) == num_values:
+        num_signals = n
         break
 else:
-    print("Neplatný počet vzorků!")
+    print("[ERR] Chybný počet vzorků")
     exit()
 
-print(f"Počet signálů: {num_signals}")
+print(f"[INFO] Signálů: {num_signals}")
 
 signals = []
 for i in range(num_signals):
-    start = i * SAMPLES_PER_SIGNAL
-    end = (i + 1) * SAMPLES_PER_SIGNAL
-    signals.append(data[start:end])
+    s = i * SAMPLES_PER_SIGNAL
+    e = (i + 1) * SAMPLES_PER_SIGNAL
+    signals.append(arr[s:e])
 
-error_start = num_signals * SAMPLES_PER_SIGNAL
-error_end = error_start + num_signals
-error_counts = data[error_start:error_end]
+errors = arr[num_signals * SAMPLES_PER_SIGNAL:]
+print("Chyby:")
+for i, err in enumerate(errors):
+    print(f"  Signál {i+1}: {err}")
 
-print("Chybové hodnoty pro jednotlivé signály:")
-for i, err in enumerate(error_counts):
-    print(f"  Signál {i+1}: {err} chyb")
-
-# --- Vykreslení ---
 x = np.arange(SAMPLES_PER_SIGNAL)
 plt.figure()
 for i, sig in enumerate(signals):

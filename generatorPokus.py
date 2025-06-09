@@ -4,6 +4,7 @@ import time
 import struct
 import numpy as np
 import argparse
+from collections import deque
 
 def crc16(data: bytes, poly=0xA001):
     crc = 0xFFFF
@@ -28,6 +29,7 @@ class MultiSignalTestGenerator:
         self.running = False
         self.packet_id = 0
         self.num_packets_to_send = 0  # 0 = continuous
+        self.receivers = []  # ← seznam (IP, port)
 
     def start(self):
         self.running = True 
@@ -46,30 +48,40 @@ class MultiSignalTestGenerator:
             try:
                 cmd_data, addr = self.sock.recvfrom(1024)
             except socket.timeout:
-                continue  # → umožní kontrolu self.running
-            if len(cmd_data) == 12:
-                command_type, num_packets = struct.unpack('<IQ', cmd_data)
-                if command_type == 5:
-                    print(f"Přijat příkaz: typ={command_type}, počet paketů={num_packets}")
-                    self.num_packets_to_send = num_packets
+                continue
+            if len(cmd_data) >= 4:
+                command_type = struct.unpack('<I', cmd_data[:4])[0]
 
-                    # vynucení odpovědi na port 9998
-                    response_addr = (addr[0], 9998)
-
-                    # Odpověď (potvrzení příjmu)
-                    response = struct.pack('<HHIQ', 0, 0, command_type, num_packets)
-                    self.sock.sendto(response, response_addr)
-
-                    # Spusť odesílání dat
-                    self._send_data(addr)
-
+                if command_type == 0:
+                    print("Přijat ping.")
+                    response = struct.pack('<HHI', 0, 0, 0)  # Packet type, error, CMD
+                    self.sock.sendto(response, addr)
                 elif command_type == 1:
                     print("Přijat požadavek na identifikační paket.")
                     self._send_identification_packet(addr)
+                elif command_type == 2:
+                    self._register_receiver(cmd_data, addr)
+                elif command_type == 3:
+                    self._remove_receiver(cmd_data, addr)
+                elif command_type == 4:
+                    self._send_receivers_list(addr)
+                elif command_type == 5:
+                    if len(cmd_data) < 12:
+                        print("⚠️ CMD 5 má nedostatečnou délku.")
+                        continue
+                    _, num_packets = struct.unpack('<IQ', cmd_data)
+                    print(f"Přijat příkaz: typ={command_type}, počet paketů={num_packets}")
+                    self.num_packets_to_send = num_packets
+
+                    # Potvrzení na stejný port, odkud přišlo
+                    response = struct.pack('<HHIQ', 0, 0, command_type, num_packets)
+                    self.sock.sendto(response, addr)
+
+                    # Odesílání dat na všechny zaregistrované příjemce
+                    self._send_data_to_all_receivers()
 
                 else:
                     print(f"Neznámý příkaz typu {command_type}")
-
     
     def _send_identification_packet(self, addr):
         # TODO: Nahraď tyto hodnoty reálnými podle potřeby
@@ -123,11 +135,67 @@ class MultiSignalTestGenerator:
         crc = crc16(full_packet)
         full_packet += struct.pack('<H', crc)
 
-        data_addr = (addr[0], 9998)
+        data_addr = addr
         self.sock.sendto(full_packet, data_addr)
 
-        
-    def _send_data(self, addr):
+    def _register_receiver(self, cmd_data, addr):
+        ip_bytes = cmd_data[4:8]
+        port = struct.unpack('<H', cmd_data[8:10])[0]
+
+        if ip_bytes == b'\x00\x00\x00\x00':
+            ip = addr[0]
+        else:
+            ip = '.'.join(str(b) for b in ip_bytes)
+
+        if port == 0:
+            port = addr[1]
+
+        receiver = (ip, port)
+        if receiver not in self.receivers:
+            self.receivers.append(receiver)
+            print(f"Registrován nový přijímač: {receiver}")
+        else:
+            print(f"Přijímač už existuje: {receiver}")
+
+        index = self.receivers.index(receiver)
+
+        # Odpověď: ACK + CMD + IP + Port + index
+        response = struct.pack('<HHI4sHB',
+            0,                # packet type (ACK)
+            0,                # error/state
+            2,                # CMD
+            socket.inet_aton(ip),
+            port,
+            index             # pořadí v seznamu
+        )
+        self.sock.sendto(response, addr)
+
+    def _remove_receiver(self, cmd_data, addr):
+        ip_bytes = cmd_data[4:8]
+        port = struct.unpack('<H', cmd_data[8:10])[0]
+        ip = '.'.join(str(b) for b in ip_bytes)
+        receiver = (ip, port)
+
+        if receiver in self.receivers:
+            self.receivers.remove(receiver)
+            print(f"Odstraněn přijímač: {receiver}")
+        else:
+            print(f"Přijímač nenalezen: {receiver}")
+
+        response = struct.pack('<HHI', 0, 0, 3)
+        self.sock.sendto(response, addr)
+
+    def _send_receivers_list(self, addr):
+        response = struct.pack('<HHI', 0, 0, 4)
+
+        for ip, port in self.receivers:
+            ip_bytes = socket.inet_aton(ip)
+            response += ip_bytes
+            response += struct.pack('<H', port)
+
+        self.sock.sendto(response, addr)
+
+    def _send_data_to_all_receivers(self):
         base_signal = np.linspace(-32768, 32767, 200, dtype=np.int16)
         packets_sent = 0
 
@@ -139,10 +207,7 @@ class MultiSignalTestGenerator:
                 signals.append(signal.astype(np.int16))
 
             signal_bytes = b''.join(s.tobytes() for s in signals)
-
-            # Chybové hodnoty – zatím 0 pro každý signál
             error_counts = struct.pack('<' + 'H' * self.num_signals, *([0] * self.num_signals))
-
             header = struct.pack('<HH', 2, self.packet_id % 65536)
             packet = header + signal_bytes + error_counts
 
@@ -152,8 +217,9 @@ class MultiSignalTestGenerator:
             crc = crc16(packet)
             packet += struct.pack('<H', crc)
 
-            data_addr = (addr[0], 9998)  # Zajisti, že data jdou na správný port
-            self.sock.sendto(packet, data_addr)
+            for receiver in self.receivers:
+                self.sock.sendto(packet, receiver)
+
             self.packet_id += 1
             packets_sent += 1
 
@@ -161,6 +227,7 @@ class MultiSignalTestGenerator:
                 break
 
             time.sleep(self.interval)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Testovací UDP generátor více signálů")
