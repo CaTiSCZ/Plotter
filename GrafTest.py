@@ -1,8 +1,8 @@
 import socket
 import struct
 import numpy as np
-from PyQt5.QtWidgets import QApplication
 import pyqtgraph as pg
+from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget, QPushButton, QApplication
 
 # ---------------------- Parametry ----------------------
 UDP_IP = "127.0.0.1"
@@ -18,7 +18,10 @@ def crc16_ccitt(data: bytes, poly=0x1021, crc=0xFFFF):
     for b in data:
         crc ^= b << 8
         for _ in range(8):
-            crc = ((crc << 1) ^ poly) if (crc & 0x8000) else (crc << 1)
+            if crc & 0x8000:
+                crc = (crc << 1) ^ poly
+            else:
+                crc <<= 1
             crc &= 0xFFFF
     return crc
 
@@ -37,19 +40,31 @@ sock.bind((UDP_IP, UDP_PORT_RECV))
 sock.settimeout(RECV_TIMEOUT)
 
 # ---------------------- Odesílání příkazů ----------------------
-def send_command(cmd: int, data: bytes = b''):
+def send_command(cmd: int, data: bytes = b'', expect_response: bool = True, expected_packets: int = 1):
     pkt = struct.pack('<I', cmd) + data
     sock.sendto(pkt, (UDP_IP, UDP_PORT_SEND))
-    print(f"[SEND] CMD {cmd}, data={data.hex()}")
+    
 
-# ---------------------- Ping ----------------------
-send_command(0)
-try:
-    ack, _ = sock.recvfrom(1024)
-    print("[OK] Ping")
-except socket.timeout:
-    print("[ERR] Ping selhal")
-    exit()
+    if not expect_response:
+        return None
+
+    responses = []
+    sock.settimeout(0.3)
+    try:
+        for _ in range(expected_packets):
+            resp, _ = sock.recvfrom(1024)
+            responses.append(resp)
+            #print(f"[RECV] {resp.hex()}")
+    except socket.timeout:
+        if not responses:
+            print(f"[TIMEOUT] CMD {cmd} – žádná odpověď")
+        else:
+            print(f"[INFO] CMD {cmd} – přijato {len(responses)} / {expected_packets} paketů")
+    finally:
+        sock.settimeout(None)
+
+    return responses if expected_packets > 1 else (responses[0] if responses else None)
+
 
 # ---------------------- Get ID ----------------------
 ID_HEADER_STRUCT = struct.Struct('<HHHHBBIIHBB30sH')
@@ -73,120 +88,175 @@ def parse_id_packet(data):
         'channels_count': unpacked[12]
     }
 
-send_command(1)
-try:
-    id_pkt, _ = sock.recvfrom(1024)
-    data = verify_crc(id_pkt)
-    if not data:
-        raise ValueError("Chybný CRC nebo prázdný paket")
+
+# -------------------- GUI s více tlačítky ----------------------
+
+class SignalClient(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("UDP Signálový klient")
+        self.resize(800, 600)
+
+        self.ch = 0  # počet kanálů
+        self.layout = QVBoxLayout()
+        self.setLayout(self.layout)
+
+        self.plot_widget = pg.GraphicsLayoutWidget(title="Signály")
+        self.plot = self.plot_widget.addPlot(title="Signály ze všech kanálů")
+        self.plot.showGrid(x=True, y=True)
+        self.layout.addWidget(self.plot_widget)
+
+        self.error_label = QLabel("Chyby:\n")
+        self.error_label.setStyleSheet("font-family: monospace; padding: 6px;")
+        self.layout.addWidget(self.error_label)
+
+        # Tlačítka
+        self.ping_button = QPushButton("1. Ping")
+        self.ping_button.clicked.connect(self.ping)
+        self.layout.addWidget(self.ping_button)
+
+        self.get_id_button = QPushButton("2. Get ID")
+        self.get_id_button.clicked.connect(self.get_id)
+        self.layout.addWidget(self.get_id_button)
+
+        self.register_button = QPushButton("3. Registruj příjemce")
+        self.register_button.clicked.connect(self.register_receiver)
+        self.layout.addWidget(self.register_button)
+
+        self.get_receivers_button = QPushButton("4. Get receivers")
+        self.get_receivers_button.clicked.connect(self.get_receivers)
+        self.layout.addWidget(self.get_receivers_button)
+
+        self.start_sampling_button = QPushButton("5. Start sampling a vykresli")
+        self.start_sampling_button.clicked.connect(self.start_sampling)
+        self.layout.addWidget(self.start_sampling_button)
+
+        self.curves = []
+
+    def ping(self):
+        try:
+            responses = send_command(0)
+            if responses:
+                self.error_label.setText(f"[OK] Ping úspěšný")
+            else:
+                self.error_label.setText("[WARN] Ping bez odpovědi")
+        except Exception as e:
+            self.error_label.setText(f"[ERR] Ping: {e}")
+
+    def get_id(self):
+        try:
+            resp = send_command(1)
+            if not resp:
+                self.error_label.setText("[ERR] Get ID: žádná odpověď")
+                return
+            data = verify_crc(resp)
+            if not data:
+                self.error_label.setText("[ERR] Get ID: CRC selhalo")
+                return
+            parsed = parse_id_packet(data)
+            self.ch = parsed['channels_count']
+            txt = (
+                f"Firmware: v{parsed['fw_ver_major']}.{parsed['fw_ver_minor']}\n"
+                f"Build time: {parsed['build_time']}\n"
+                f"Počet kanálů: {self.ch}"
+            )
+            self.error_label.setText(txt)
+        except Exception as e:
+            self.error_label.setText(f"[ERR] Get ID: {e}")
+
+    def register_receiver(self):
+        try:
+            data = socket.inet_aton(UDP_IP) + struct.pack('<H', UDP_PORT_RECV)
+            resp = send_command(2, data=data)
+            if not resp:
+                self.error_label.setText("[WARN] Registrace - žádná odpověď")
+                return
+            
+            if len(resp) < 15:
+                self.error_label.setText(f"[ERR] Registrace - odpověď příliš krátká ({len(resp)} bajtů)")
+                return   
+                
+            ip = socket.inet_ntoa(resp[8:12])
+            port = struct.unpack('<H', resp[12:14])[0]
+            order = resp[14]
+
+            self.error_label.setText(
+                f"[OK] Registrován jako příjemce:\n"
+                f"IP: {ip}\n"
+                f"Port: {port}\n"
+                f"Pořadí registrace: {order}"
+            )
+        except Exception as e:
+            self.error_label.setText(f"[ERR] Registrace: {e}")
     
-    parsed = parse_id_packet(data)
-    if parsed['packet_type'] != 1:
-        raise ValueError("Nesprávný typ ID paketu")
+    def get_receivers(self):
+        try:
+            resp = send_command(4)
+            if not resp:
+                self.error_label.setText("[ERR] Get receivers: žádná odpověď")
+                return
+            data = resp
+            receivers = []
+            # Začneme za hlavičkou ACK, což jsou 8 bajtů podle předpokladu
+            offset = 8
+            while offset + 6 <= len(data):
+                ip = socket.inet_ntoa(data[offset:offset + 4])
+                port = struct.unpack('<H', data[offset + 4:offset + 6])[0]
+                receivers.append(f"{ip}:{port}")
+                offset += 6
+            if receivers:
+                txt = "Registrovaní příjemci:\n" + "\n".join(receivers)
+            else:
+                txt = "Žádní registrovaní příjemci"
+            self.error_label.setText(txt)
+        except Exception as e:
+            self.error_label.setText(f"[ERR] Get receivers: {e}")
+    def start_sampling(self):
+        if self.ch == 0:
+            self.error_label.setText("Nejdřív zavolej Get ID")
+            return
+        try:
+            n = NUM_SAMPLES
+            data = struct.pack('<Q', n)
+            responses = send_command(5, data=data, expected_packets=n+1)
+            if not responses or len(responses) < n+1:
+                self.error_label.setText(f"[ERR] Sampling: přišlo {len(responses) if responses else 0} paketů, očekáváno {n+1}")
+                return
 
-    ch = parsed['channels_count']
-    print(f"[INFO] Počet kanálů: {ch}")
-    print(f"[INFO] Build time: {parsed['build_time']}")
-    print(f"[INFO] FW v{parsed['fw_ver_major']}.{parsed['fw_ver_minor']} (ID: {hex(parsed['fw_id'])})")
-    if ch == 0:
-        raise ValueError("Počet kanálů je 0, nelze pokračovat")
+            signals = [[] for _ in range(self.ch)]
+            errors = [[] for _ in range(self.ch)]
 
-except Exception as e:
-    print("[ERR] Get ID selhal:", e)
-    exit()
+            for i, pkt in enumerate(responses[1:], start=1):  # první paket je ACK
+                verified = verify_crc(pkt)
+                if not verified:
+                    print(f"[WARN] CRC selhalo u paketu č.{i}")
+                    continue
+                offset = 4
+                for ch_i in range(self.ch):
+                    sig = struct.unpack('<' + 'h'*SAMPLES_PER_PACKET, verified[offset:offset+400])
+                    signals[ch_i].extend(sig)
+                    offset += 400
+                for ch_i in range(self.ch):
+                    errors[ch_i].append(verified[offset])
+                    offset += 1
 
+            self.plot.clear()
+            self.curves = [self.plot.plot(pen=pg.intColor(i, hues=self.ch)) for i in range(self.ch)]
+            min_len = min(len(sig) for sig in signals)
+            for i in range(self.ch):
+                self.curves[i].setData(signals[i][:min_len])
 
-# ---------------------- Register receiver ----------------------
-ip_bytes = socket.inet_aton(UDP_IP)
-port_bytes = struct.pack('<H', UDP_PORT_RECV)
-send_command(2, ip_bytes + port_bytes)
+            channel_errors = [sum(1 for val in err if val != 0) for err in errors]
+            error_text = "Chyby:\n" + "\n".join(f"Kanál {i}: {count}" for i, count in enumerate(channel_errors))
+            self.error_label.setText(error_text + f"\n[INFO] Přijato paketů: {len(responses)}")
+        except Exception as e:
+            self.error_label.setText(f"[ERR] Sampling: {e}")
 
-try:
-    ack, _ = sock.recvfrom(1024)
-    print("[INFO] Registrován jako příjemce")
-except socket.timeout:
-    print("[WARN] Nepřišlo ACK na registraci")
+# Pomocné funkce ponechány mimo GUI
+ID_HEADER_STRUCT = struct.Struct('<HHHHBBIIHBB30sH')
 
-# ---------------------- Get receivers ----------------------
-send_command(4)
-try:
-    ack, _ = sock.recvfrom(1024)
-    data = verify_crc(ack)
-    if not data:
-        raise ValueError("Chybný CRC u ACK receiverů")
-    receivers = []
-    offset = 8
-    while offset + 6 <= len(data):
-        ip = socket.inet_ntoa(data[offset:offset + 4])
-        port = struct.unpack('<H', data[offset + 4:offset + 6])[0]
-        receivers.append((ip, port))
-        offset += 6
-    print(f"[INFO] Seznam receiverů: {receivers}")
-except Exception as e:
-    print("[WARN] Nelze získat seznam receiverů:", e)
-
-# ---------------------- Start sampling ----------------------
-num_samples_bytes = struct.pack('<Q', NUM_SAMPLES)
-send_command(5, num_samples_bytes)
-
-# ---------------------- Příjem dat ----------------------
-datas = []
-while len(datas) < NUM_SAMPLES:
-    try:
-        pkt, _ = sock.recvfrom(4096)
-        print(f"[RECV] Paket délky {len(pkt)} přijat")   # Debug výpis délky paketu
-        d = verify_crc(pkt)
-        if not d:
-            print("[WARN] CRC neprošel, paket zahazuji")  # Pokud CRC nesedí, upozorní
-            continue
-        print(f"[DEBUG] Paket po CRC (prvních 10 bajtů): {d[:10].hex()}")  # Přidaný výpis dat paketu po CRC
-        pkt_type = struct.unpack('<H', d[:2])[0]
-        if pkt_type != 2:
-            print(f"[WARN] Neznámý typ paketu: {pkt_type}, ignoruji")  # Ignorujeme jiné typy paketů
-            continue
-        datas.append(d)
-    except socket.timeout:
-        print("[WARN] Timeout na příjem paketu")  # Timeout při čekání na paket
-        break
-
-if len(datas) == 0:
-    print("[ERR] Nepřišla žádná data")
-    exit()
-
-# ---------------------- Zpracování ----------------------
-# 1 paket = 4B hlavička + ch*200*2B signál + ch*1B chyby + padding
-signals = [[] for _ in range(ch)]
-errors = [[] for _ in range(ch)]
-
-for pkt in datas:
-    header, pkt_num = struct.unpack('<HH', pkt[:4])
-    print(f"Zpracovávám paket číslo {pkt_num}, hlavička: {header}")  # Debug výpis čísla paketu a hlavičky
-    offset = 4
-    for i in range(ch):
-        sig = struct.unpack('<' + 'h'*SAMPLES_PER_PACKET, pkt[offset:offset+400])
-        print(f"Kanál {i} - první 5 vzorků: {sig[:5]}")  # Výpis prvních 5 vzorků kanálu
-        signals[i].extend(sig)
-        offset += 400
-    for i in range(ch):
-        errors[i].append(pkt[offset])
-        offset += 1
-
-print(f"[DEBUG] Počet vzorků na kanál: {[len(s) for s in signals]}")  # Výpis délky dat v každém kanálu
-
-
-# ---------------------- Vykreslení ----------------------
+# Spuštění aplikace
 app = QApplication([])
-win = pg.GraphicsLayoutWidget(show=True, title="Signály")
-plot = win.addPlot(title="Signály ze všech kanálů")
-plot.showGrid(x=True, y=True)
-curves = [plot.plot(pen=pg.intColor(i, hues=ch)) for i in range(ch)]
-
-min_len = min(len(sig) for sig in signals)
-for i in range(ch):
-    curves[i].setData(signals[i][:min_len])
-
-print("Chybové hodnoty na kanál:")
-for i, err_list in enumerate(errors):
-    print(f"  Kanál {i}: {err_list}")
-
+client = SignalClient()
+client.show()
 app.exec_()
