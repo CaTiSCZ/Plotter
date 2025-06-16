@@ -6,16 +6,17 @@ import numpy as np
 import argparse
 from collections import deque
 
-def crc16(data: bytes, poly=0xA001):
-    crc = 0xFFFF
+def crc16_ccitt(data: bytes, poly=0x1021, crc=0xFFFF):
     for b in data:
-        crc ^= b
+        crc ^= b << 8
         for _ in range(8):
-            if (crc & 1):
-                crc = (crc >> 1) ^ poly
+            if crc & 0x8000:
+                crc = (crc << 1) ^ poly
             else:
-                crc >>= 1
-    return crc & 0xFFFF
+                crc <<= 1
+            crc &= 0xFFFF
+    return crc
+
 
 class MultiSignalTestGenerator:
     def __init__(self, ip='127.0.0.1', port=9999, interval=0.001, num_signals = 1):
@@ -72,6 +73,11 @@ class MultiSignalTestGenerator:
                     _, num_packets = struct.unpack('<IQ', cmd_data)
                     print(f"Přijat příkaz: typ={command_type}, počet paketů={num_packets}")
                     self.num_packets_to_send = num_packets
+
+                    if self.num_packets_to_send == 0:
+                        print("[INFO] Sampling spuštěn v nekonečném režimu.")
+                    else:
+                        print(f"[INFO] Sampling: bude odesláno {self.num_packets_to_send} paketů.")
 
                     # Potvrzení na stejný port, odkud přišlo
                     response = struct.pack('<HHIQ', 0, 0, command_type, num_packets)
@@ -132,7 +138,7 @@ class MultiSignalTestGenerator:
         )
 
         full_packet = header + units_and_gains
-        crc = crc16(full_packet)
+        crc = crc16_ccitt(full_packet)
         full_packet += struct.pack('<H', crc)
 
         data_addr = addr
@@ -207,18 +213,21 @@ class MultiSignalTestGenerator:
                 signals.append(signal.astype(np.int16))
 
             signal_bytes = b''.join(s.tobytes() for s in signals)
-            error_counts = struct.pack('<' + 'H' * self.num_signals, *([0] * self.num_signals))
+            error_counts = struct.pack('<' + 'B' * self.num_signals, *([0] * self.num_signals))
             header = struct.pack('<HH', 2, self.packet_id % 65536)
             packet = header + signal_bytes + error_counts
 
-            if len(packet) % 2 != 0:
-                packet += b'\x00'
+            if self.num_signals % 2 != 0:
+                packet += b'\x00'  # padding
 
-            crc = crc16(packet)
+            crc = crc16_ccitt(packet)
             packet += struct.pack('<H', crc)
 
             for receiver in self.receivers:
                 self.sock.sendto(packet, receiver)
+
+            print(f"[SEND] Paket #{self.packet_id} odeslán na {len(self.receivers)} příjemců.")
+
 
             self.packet_id += 1
             packets_sent += 1
