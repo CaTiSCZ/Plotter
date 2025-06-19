@@ -36,4 +36,33 @@ errory:
     počet špatně přečtených dat
     počet špatně přenesených packetů (CRC) vůči správným (jak absolutně tak v procentu)
 
+    
+
+sinus_generator.py
+spustím program, řeknu port na kterém má poslouchat - parametr při spuštění
+poslouchám
+přijde žádost o identifikaci
+identifikuju se - přepočet z binárky na čísla (32 767 = 200 A), identifikátor hardware a firmware, počet kanálů
+    buď U+I nebo U+U+I - řekni jak jsou data po sobě (počítám od jedničky)
+    označení že jde o identifikační packet (0)
+
+poslouchám, přijde žádost (UDP packet) o data 
+začínám vysílat data
+
+generuje signál sinusoidy a posílá protokolem UDP jako binárku v rozsahu int 16 (=32 767)
+possílání dat na dotaz z plotteru
+identifikařní packet s udaji o signálu zaslaný na požádání
+typ generovaného signálu a podoba packetu: 
+dva nebo 3 signály - sin (+sin posunutý) a triangel 
+zadám počet kanálů a rozsahy (maximální hodnoty)
+jeden packet obsahuje 200 hodnoto od každého signálu, prvně jeden signál, pak druhý
+začátek paketu:
+    - označení že jde o datový packet (1) číslo o velikosti 16b
+    - pořadové číslo - pakety nemají čas, ale jsou očíslované, počítám od 0 (16b číslo)
+    - informační číslo kolik vzorků se nepovedlo přečíst (bude tam 0 nebo zapínatelný generátor náhodných čísel) 8b
+        pro každý kanál zvlášť
+    - CRC - kontrola kopletnosti přenosu dat (jakoby kontrolní součet) 32b 
+        celkový počet B %4 = 0, volné B před CRC
+na paremetru můžeš nastavít - náhodně zahoď občas nějaký packet
+
 """
