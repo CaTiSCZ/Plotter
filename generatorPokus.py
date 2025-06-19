@@ -31,6 +31,9 @@ class MultiSignalTestGenerator:
         self.packet_id = 0
         self.num_packets_to_send = 0  # 0 = continuous
         self.receivers = []  # ← seznam (IP, port)
+        self.packets_sent = 0
+        self.sampling = False
+        self.sender_thread = None
 
     def start(self):
         self.running = True 
@@ -50,45 +53,73 @@ class MultiSignalTestGenerator:
                 cmd_data, addr = self.sock.recvfrom(1024)
             except socket.timeout:
                 continue
-            if len(cmd_data) >= 4:
-                command_type = struct.unpack('<I', cmd_data[:4])[0]
 
-                if command_type == 0:
-                    print("Přijat ping.")
-                    response = struct.pack('<HHI', 0, 0, 0)  # Packet type, error, CMD
-                    self.sock.sendto(response, addr)
-                elif command_type == 1:
-                    print("Přijat požadavek na identifikační paket.")
-                    self._send_identification_packet(addr)
-                elif command_type == 2:
-                    self._register_receiver(cmd_data, addr)
-                elif command_type == 3:
-                    self._remove_receiver(cmd_data, addr)
-                elif command_type == 4:
-                    self._send_receivers_list(addr)
-                elif command_type == 5:
-                    if len(cmd_data) < 12:
-                        print("⚠️ CMD 5 má nedostatečnou délku.")
-                        continue
-                    _, num_packets = struct.unpack('<IQ', cmd_data)
-                    print(f"Přijat příkaz: typ={command_type}, počet paketů={num_packets}")
-                    self.num_packets_to_send = num_packets
+            if len(cmd_data) < 4:
+                continue  # Příliš krátký paket, ignoruj
 
-                    if self.num_packets_to_send == 0:
-                        print("[INFO] Sampling spuštěn v nekonečném režimu.")
-                    else:
-                        print(f"[INFO] Sampling: bude odesláno {self.num_packets_to_send} paketů.")
+            command_type = struct.unpack('<I', cmd_data[:4])[0]
 
-                    # Potvrzení na stejný port, odkud přišlo
-                    response = struct.pack('<HHIQ', 0, 0, command_type, num_packets)
-                    self.sock.sendto(response, addr)
+            if command_type == 0:
+                print("Přijat ping.")
+                response = struct.pack('<HHI', 0, 0, 0)  # Packet type, error, CMD
+                self.sock.sendto(response, addr)
 
-                    # Odesílání dat na všechny zaregistrované příjemce
-                    self._send_data_to_all_receivers()
+            elif command_type == 1:
+                self._send_identification_packet(addr)
+
+            elif command_type == 2:
+                self._register_receiver(cmd_data, addr)
+
+            elif command_type == 3:
+                self._remove_receiver(cmd_data, addr)
+
+            elif command_type == 4:
+                self._send_receivers_list(addr)
+
+            elif command_type == 5 or command_type == 6:
+                if len(cmd_data) < 12:
+                    print(f"⚠️ CMD {command_type} má nedostatečnou délku.")
+                    continue
+
+                _, num_packets = struct.unpack('<IQ', cmd_data)
+                print(f"Přijat příkaz: typ={command_type}, počet paketů={num_packets}")
+
+                self.num_packets_to_send = num_packets
+                self.packets_sent = 0  # reset počítadla
+                self.sampling = True  # flag spuštění samplingu
+
+                if command_type == 6:
+                    print("[INFO] Sampling spuštěn na trigger (simulováno okamžitě).")
+                    # TODO: zde může být logika pro trigger, nyní spustíme rovnou
 
                 else:
-                    print(f"Neznámý příkaz typu {command_type}")
-    
+                    print("[INFO] Sampling spuštěn.")
+
+                # Odpověď: ACK + CMD + počet paketů
+                response = struct.pack('<HHIQ', 0, 0, command_type, num_packets)
+                self.sock.sendto(response, addr)
+
+                # Spustit odesílání dat v samostatném vlákně, pokud ještě neběží
+                if self.sender_thread is None or not self.sender_thread.is_alive():
+                    self.sender_thread = threading.Thread(target=self._send_data_to_all_receivers, daemon=True)
+                    self.sender_thread.start()
+
+            elif command_type == 7:
+                # Stop sampling
+                self.sampling = False
+                print(f"[INFO] Sampling zastaven, odesláno paketů: {self.packets_sent}")
+
+                # Odpověď: ACK + CMD + počet odeslaných paketů
+                response = struct.pack('<HHIQ', 0, 0, 7, self.packets_sent)
+                self.sock.sendto(response, addr)
+
+            elif command_type == 8:
+                # Trigger ACK - potvrzení triggeru, nemusí nic dělat
+                print("[INFO] Přijat Trigger ACK (CMD 8)")
+
+            else:
+                print(f"Neznámý příkaz typu {command_type}")
+       
     def _send_identification_packet(self, addr):
         # TODO: Nahraď tyto hodnoty reálnými podle potřeby
         packet_type = 1
@@ -203,9 +234,19 @@ class MultiSignalTestGenerator:
 
     def _send_data_to_all_receivers(self):
         base_signal = np.linspace(-32768, 32767, 200, dtype=np.int16)
-        packets_sent = 0
+
+        print("[INFO] Zahájeno odesílání dat...")
 
         while self.running:
+            if not self.sampling:
+                time.sleep(0.1)
+                continue
+
+            if not self.receivers:
+                print("[WAIT] Žádní příjemci. Čekám...")
+                time.sleep(1)
+                continue
+
             signals = []
             for i in range(self.num_signals):
                 shift = (i * 200) // self.num_signals
@@ -226,16 +267,15 @@ class MultiSignalTestGenerator:
             for receiver in self.receivers:
                 self.sock.sendto(packet, receiver)
 
-            print(f"[SEND] Paket #{self.packet_id} odeslán na {len(self.receivers)} příjemců.")
-
-
             self.packet_id += 1
-            packets_sent += 1
+            self.packets_sent += 1
 
-            if self.num_packets_to_send != 0 and packets_sent >= self.num_packets_to_send:
-                break
+            if self.num_packets_to_send != 0 and self.packets_sent >= self.num_packets_to_send:
+                print("[INFO] Všechny požadované pakety odeslány.")
+                self.sampling = False  # automaticky zastavit sampling
 
             time.sleep(self.interval)
+
 
 
 if __name__ == '__main__':
