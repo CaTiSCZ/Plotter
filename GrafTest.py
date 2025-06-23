@@ -18,8 +18,8 @@ NUM_PACKETS = 10      # počet vzorků (požadavek v CMD 5)
 RECV_TIMEOUT = 2.0
 SAMPLES_PER_PACKET = 200
 PACKET_RATE_HZ = 1000     # 1 paket/ms (1000 za s)
-sampling_period_ms = 1/200 # 1 packet/ms, 200 vzorků/packet = 200 vzorků/ms
-BUFFER_LENGTH_S = 1   # délka bufferu v s
+SAMPLING_PERIOD_MS = 1/SAMPLES_PER_PACKET # 1 packet/ms, 200 vzorků/packet = 200 vzorků/ms
+BUFFER_LENGTH_S = 10   # délka bufferu v s
 BUFFER_SIZE = int ( BUFFER_LENGTH_S * SAMPLES_PER_PACKET * PACKET_RATE_HZ )
 SIGNAL_TYPE = np.int16
 
@@ -207,18 +207,15 @@ class SignalClient(QWidget):
         # Skupina pro nastavení rozsahu osy X
         self.auto_x_range = True
         self.channels_counteckbox_auto_range = QCheckBox("Automatický rozsah X")
-        self.channels_counteckbox_auto_range.setChecked(True)
+        self.channels_counteckbox_auto_range.setChecked(False)
         self.channels_counteckbox_auto_range.stateChanged.connect(self.on_auto_range_changed)
 
-        self.x_min_spinbox = QDoubleSpinBox()
-        self.x_min_spinbox.setRange(-10000, 10000)
-        self.x_min_spinbox.setValue(0)
-        self.x_min_spinbox.setSuffix(" ms")
+        self.x_range_spinbox = QDoubleSpinBox()
+        self.x_range_spinbox.setRange(0, BUFFER_SIZE/SAMPLES_PER_PACKET)
+        self.x_range_spinbox.setValue(200)
+        self.x_range_spinbox.setSuffix(" ms")
 
-        self.x_max_spinbox = QDoubleSpinBox()
-        self.x_max_spinbox.setRange(-10000, 10000)
-        self.x_max_spinbox.setValue(200)
-        self.x_max_spinbox.setSuffix(" ms")
+
 
         # Skupina pro Y osu
         self.y_min_spinbox = QDoubleSpinBox()
@@ -230,18 +227,17 @@ class SignalClient(QWidget):
         self.y_max_spinbox.setValue(33000.0)
 
         # Přidání do layoutu
-        self.layout.addWidget(QLabel("X min:"))
-        self.layout.addWidget(self.x_min_spinbox)
-        self.layout.addWidget(QLabel("X max:"))
-        self.layout.addWidget(self.x_max_spinbox)
+        self.layout.addWidget(QLabel("X range:"))
+        self.layout.addWidget(self.x_range_spinbox)
+        
         self.layout.addWidget(QLabel("Y min:"))
         self.layout.addWidget(self.y_min_spinbox)
         self.layout.addWidget(QLabel("Y max:"))
         self.layout.addWidget(self.y_max_spinbox)
 
         # Připojení událostí
-        self.x_min_spinbox.valueChanged.connect(self.update_plot_range)
-        self.x_max_spinbox.valueChanged.connect(self.update_plot_range)
+        self.x_range_spinbox.valueChanged.connect(self.update_plot_range)
+        
         self.y_min_spinbox.valueChanged.connect(self.update_plot_range)
         self.y_max_spinbox.valueChanged.connect(self.update_plot_range)
 
@@ -317,14 +313,14 @@ class SignalClient(QWidget):
         self.curves = [self.plot.plot(pen=pg.intColor(i, hues=self.channels_count)) for i in range(self.channels_count)]
     
     def update_plot_range(self):
-        x_min = self.x_min_spinbox.value()
-        x_max = self.x_max_spinbox.value()
+        x_range = self.x_range_spinbox.value()
+        
         y_min = self.y_min_spinbox.value()
         y_max = self.y_max_spinbox.value()
 
         # Získání pohledu (ViewBox) ze samotného plottovacího objektu
         vb = self.plot.getViewBox()
-        vb.setXRange(x_min, x_max)
+        vb.setXRange(0, x_range)
         vb.setYRange(y_min, y_max)
 
     def on_auto_range_changed(self, state):
@@ -335,39 +331,31 @@ class SignalClient(QWidget):
 
         if not auto_x:
             self.update_plot_range()
+        self.auto_x_range = auto_x
     
-    def update_plot_buffered(self, signals=None, errors=None, *args):
+    def update_plot_buffered(self, *args):
         with self.buffer_lock:
             if self.channels_count == 0 or not self.signal_buffer or not self.signal_buffer[0]:
                 return
-            if signals is None or errors is None:
-                # fallback - použij buffery v self
-                signals = self.signal_buffer
-                errors = self.error_buffer
+         
             # Vykreslíme posledních N vzorků
-            N = min(BUFFER_SIZE, min(len(buf) for buf in self.signal_buffer))
+            N = min(int(self.x_range_spinbox.value()*SAMPLES_PER_PACKET), min(len(buf) for buf in self.signal_buffer))
             if N == 0:
                 return
-
             
-            x = np.linspace(-N * sampling_period_ms, 0, N, endpoint=False)
+            x = np.linspace(0, N * SAMPLING_PERIOD_MS, N, endpoint=False)
 
             if len(self.curves) != self.channels_count:
                 self.plot.clear()
                 self.curves = [self.plot.plot(pen=pg.intColor(i, hues=self.channels_count)) for i in range(self.channels_count)]
 
-            OFFSET = 1000
             for i in range(self.channels_count):
-                data = np.array(list(self.signal_buffer[i])[-N:])
-                shifted = data + i * OFFSET
-                self.curves[i].setData(x, shifted)
+                self.curves[i].setData(x, np.array(list(self.signal_buffer[i])[-N:]))
 
             if self.auto_x_range:
                 # Automaticky podle dat
-                self.plot.setXRange(-N * sampling_period_ms, 0)
-            else:
-                # Manuální rozsah
-                self.plot.setXRange(self.x_min_spinbox.value(), self.x_max_spinbox.value())
+                self.plot.setXRange(0, N * SAMPLING_PERIOD_MS)
+            
 
             channel_errors = [sum(1 for val in list(self.error_buffer[i])[-N:] if val != 0) for i in range(self.channels_count)]
             error_text = "Chyby (posledních vzorků):\n" + "\n".join(f"Kanál {i}: {count}" for i, count in enumerate(channel_errors))
@@ -544,7 +532,6 @@ class SignalClient(QWidget):
         # Vymazat text chyb / info
         self.update_plot_buffered()
         self.log_message("Graf vyčištěn.")
-
 
     def closeEvent(self, event):
         print("Ukončuji aplikaci...")
