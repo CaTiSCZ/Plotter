@@ -233,8 +233,11 @@ class MultiSignalTestGenerator:
         self.sock.sendto(response, addr)
 
     def _send_data_to_all_receivers(self):
-        base_signal = np.linspace(-32768, 32767, 200, dtype=np.int16)
-
+        
+        period_length = 200000
+        packet_size = 200
+        base_signal = np.linspace(-32768, 32767, period_length, dtype=np.int16)
+        
         print("[INFO] Zahájeno odesílání dat...")
 
         while self.running:
@@ -249,9 +252,16 @@ class MultiSignalTestGenerator:
 
             signals = []
             for i in range(self.num_signals):
-                shift = (i * 200) // self.num_signals
-                signal = np.roll(base_signal + self.packet_id, shift)
-                signals.append(signal.astype(np.int16))
+                shift = (i * period_length) // self.num_signals
+                start_index = (self.packet_id*packet_size + shift) % period_length
+                if start_index + packet_size <= period_length:
+                    chunk = base_signal[start_index:start_index + packet_size]
+                else:
+                    part1 = base_signal[start_index:]
+                    part2 = base_signal[:packet_size - len(part1)]
+                    chunk = np.concatenate((part1, part2))
+
+                signals.append(chunk.astype(np.int16))
 
             signal_bytes = b''.join(s.tobytes() for s in signals)
             error_counts = struct.pack('<' + 'B' * self.num_signals, *([0] * self.num_signals))

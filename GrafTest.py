@@ -42,18 +42,13 @@ def verify_crc(pkt):
         return None
     return data
 
-def send_cmd5(sock, NUM_PACKETS: int):
-    CMD = 5
-    pkt = struct.pack('<I', CMD) + struct.pack('<Q', NUM_PACKETS)
-    sock.sendto(pkt, (UDP_IP, UDP_PORT_SEND))
-    # print(f"[SEND CMD5] NUM_PACKETS={NUM_PACKETS}, pkt={pkt.hex()}")
 
 # ----------------------Vlákno na čtení dat ----------------
 class SamplingThread(QThread):
     data_ready = pyqtSignal()
     def __init__(self, ch, sock, buffer_lock, signal_buffer, error_buffer):
         super().__init__()
-        self.ch = ch
+        self.channels_count = ch
         self.sock = sock
         self.buffer_lock = buffer_lock
         self.signal_buffer = signal_buffer
@@ -75,28 +70,28 @@ class SamplingThread(QThread):
                     continue  # jen datové pakety
 
                 offset = 4
-                signals = [[] for _ in range(self.ch)]
+                signals = [[] for _ in range(self.channels_count)]
                 errors = []
 
                 # Čteme data 200 vzorků na kanál
-                for ch_i in range(self.ch):
+                for ch_i in range(self.channels_count):
                     sig = struct.unpack('<' + 'h'*SAMPLES_PER_PACKET, data[offset:offset + 2*SAMPLES_PER_PACKET])
                     signals[ch_i].extend(sig)
                     offset += 2 * SAMPLES_PER_PACKET
 
                 # Čteme parity error pro každý kanál (1 byte)
-                for ch_i in range(self.ch):
+                for ch_i in range(self.channels_count):
                     errors.append(data[offset])
                     offset += 1
 
                 # Padding (když je počet kanálů lichý, přidá se 1 byte)
-                if self.ch % 2 != 0:
+                if self.channels_count % 2 != 0:
                     offset += 1
 
                 # CRC 2B už jsme ověřili výše
 
                 with self.buffer_lock:
-                    for i in range(self.ch):
+                    for i in range(self.channels_count):
                         self.signal_buffer[i].extend(signals[i])
                         self.error_buffer[i].extend([errors[i]] * SAMPLES_PER_PACKET)
                 self.data_ready.emit()
@@ -173,7 +168,9 @@ class SignalClient(QWidget):
     def __init__(self):
         super().__init__()
         self.sampling_thread = None
-        
+        self.received_packets = 0
+        self.num_packets = 0
+
         self.buffer_lock = threading.Lock()
         self.signal_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(32)]  # max 32 kanálů
         self.error_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(32)]
@@ -182,7 +179,7 @@ class SignalClient(QWidget):
         self.setWindowTitle("UDP Signálový klient")
         self.resize(1600, 1200)
 
-        self.ch = 0  # počet kanálů
+        self.channels_count = 0  # počet kanálů
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
 
@@ -211,9 +208,9 @@ class SignalClient(QWidget):
        
         # Skupina pro nastavení rozsahu osy X
         self.auto_x_range = True
-        self.checkbox_auto_range = QCheckBox("Automatický rozsah X")
-        self.checkbox_auto_range.setChecked(True)
-        self.checkbox_auto_range.stateChanged.connect(self.on_auto_range_changed)
+        self.channels_counteckbox_auto_range = QCheckBox("Automatický rozsah X")
+        self.channels_counteckbox_auto_range.setChecked(True)
+        self.channels_counteckbox_auto_range.stateChanged.connect(self.on_auto_range_changed)
 
         self.x_min_spinbox = QDoubleSpinBox()
         self.x_min_spinbox.setRange(-10000, 10000)
@@ -285,11 +282,11 @@ class SignalClient(QWidget):
         self.clear_button.clicked.connect(self.clear_plot)
         self.buttons_layout.addWidget(self.clear_button, 3, 0)
 
-        self.NUM_PACKETS_spinbox = QSpinBox()
-        self.NUM_PACKETS_spinbox.setRange(0, 10000)
-        self.NUM_PACKETS_spinbox.setValue(NUM_PACKETS)
-        self.NUM_PACKETS_spinbox.setSuffix(" paketů (0 = kontinuálně)")
-        self.buttons_layout.addWidget(self.NUM_PACKETS_spinbox, 3, 1)
+        self.num_packets_spinbox = QSpinBox()
+        self.num_packets_spinbox.setRange(0, 10000)
+        self.num_packets_spinbox.setValue(NUM_PACKETS)
+        self.num_packets_spinbox.setSuffix(" paketů (0 = kontinuálně)")
+        self.buttons_layout.addWidget(self.num_packets_spinbox, 3, 1)
 
         self.auto_x_range_checkbox = QCheckBox("Auto rozsah osy X")
         self.auto_x_range_checkbox.setChecked(True)
@@ -304,14 +301,14 @@ class SignalClient(QWidget):
         
     def update_plot_continuous(self, signals, errors):
         self.plot.clear()
-        self.curves = [self.plot.plot(pen=pg.intColor(i, hues=self.ch)) for i in range(self.ch)]
+        self.curves = [self.plot.plot(pen=pg.intColor(i, hues=self.channels_count)) for i in range(self.channels_count)]
 
         
         min_len = min(len(sig) for sig in signals)
         x = np.linspace(0, min_len * sampling_period_ms, min_len, endpoint=False)
 
         OFFSET = 1000
-        for i in range(self.ch):
+        for i in range(self.channels_count):
             shifted = np.array(signals[i][:min_len]) + i * OFFSET
             self.curves[i].setData(x, shifted)
 
@@ -321,7 +318,7 @@ class SignalClient(QWidget):
 
     def init_curves(self):
         self.plot.clear()
-        self.curves = [self.plot.plot(pen=pg.intColor(i, hues=self.ch)) for i in range(self.ch)]
+        self.curves = [self.plot.plot(pen=pg.intColor(i, hues=self.channels_count)) for i in range(self.channels_count)]
     
     def update_plot_range(self):
         x_min = self.x_min_spinbox.value()
@@ -345,7 +342,7 @@ class SignalClient(QWidget):
     
     def update_plot_buffered(self, signals=None, errors=None, *args):
         with self.buffer_lock:
-            if self.ch == 0 or not self.signal_buffer or not self.signal_buffer[0]:
+            if self.channels_count == 0 or not self.signal_buffer or not self.signal_buffer[0]:
                 return
             if signals is None or errors is None:
                 # fallback - použij buffery v self
@@ -359,12 +356,12 @@ class SignalClient(QWidget):
             
             x = np.linspace(-N * sampling_period_ms, 0, N, endpoint=False)
 
-            if len(self.curves) != self.ch:
+            if len(self.curves) != self.channels_count:
                 self.plot.clear()
-                self.curves = [self.plot.plot(pen=pg.intColor(i, hues=self.ch)) for i in range(self.ch)]
+                self.curves = [self.plot.plot(pen=pg.intColor(i, hues=self.channels_count)) for i in range(self.channels_count)]
 
             OFFSET = 1000
-            for i in range(self.ch):
+            for i in range(self.channels_count):
                 data = np.array(list(self.signal_buffer[i])[-N:])
                 shifted = data + i * OFFSET
                 self.curves[i].setData(x, shifted)
@@ -376,9 +373,16 @@ class SignalClient(QWidget):
                 # Manuální rozsah
                 self.plot.setXRange(self.x_min_spinbox.value(), self.x_max_spinbox.value())
 
-            channel_errors = [sum(1 for val in list(self.error_buffer[i])[-N:] if val != 0) for i in range(self.ch)]
+            channel_errors = [sum(1 for val in list(self.error_buffer[i])[-N:] if val != 0) for i in range(self.channels_count)]
             error_text = "Chyby (posledních vzorků):\n" + "\n".join(f"Kanál {i}: {count}" for i, count in enumerate(channel_errors))
             self.error_label.setText(error_text)
+
+    def packet_counter (self):
+        self.received_packets +=1
+
+        if self.received_packets == self.num_packets:
+            self.stop_sampling()
+    
 
     def ping(self):
         try:
@@ -401,11 +405,11 @@ class SignalClient(QWidget):
                 self.error_label.setText("[ERR] Get ID: CRC selhalo")
                 return
             parsed = parse_id_packet(data)
-            self.ch = parsed['channels_count']
+            self.channels_count = parsed['channels_count']
             txt = (
                 f"Firmware: v{parsed['fw_ver_major']}.{parsed['fw_ver_minor']}\n"
                 f"Build time: {parsed['build_time']}\n"
-                f"Počet kanálů: {self.ch}"
+                f"Počet kanálů: {self.channels_count}"
             )
             self.error_label.setText(txt)
         except Exception as e:
@@ -461,101 +465,45 @@ class SignalClient(QWidget):
             self.error_label.setText(f"[ERR] Get receivers: {e}")
     
     def start_sampling(self):
-        NUM_PACKETS = self.NUM_PACKETS_spinbox.value()
-        if self.ch == 0:
+        self.received_packets = 0
+        self.num_packets = self.num_packets_spinbox.value()
+        data = struct.pack('<Q', self.num_packets)
+        if self.channels_count == 0:
             self.error_label.setText("Nejdřív zavolej Get ID")
             return
 
-        if NUM_PACKETS == 0:
-            # Nekonečné sampling
-            if self.sampling_thread and self.sampling_thread.isRunning():
-                self.error_label.setText("[INFO] Kontinuální příjem již běží")
-                return
+        # Nekonečné sampling
+        if self.sampling_thread and self.sampling_thread.isRunning():
+            self.error_label.setText("[INFO] Kontinuální příjem již běží")
+            return
 
-            # Odeslat CMD 5 s NUM_PACKETS = 0 (start endless sampling)
-            send_cmd5(sock, 0)
+        # Odeslat CMD 5 
+        resp = send_command(5, data)
 
-            # Vyčistit buffery
-            self.signal_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.ch)]
-            self.error_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.ch)]
-            self.init_curves()
+        # Vyčistit buffery
+        self.signal_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count)]
+        self.error_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count)]
+        self.init_curves()
 
-            #self.plot.setXRange(-BUFFER_SIZE * sampling_period_ms, 0)
+        #self.plot.setXRange(-BUFFER_SIZE * sampling_period_ms, 0)
 
-            self.sampling_thread = SamplingThread(self.ch, sock, self.buffer_lock, self.signal_buffer, self.error_buffer)
-            self.sampling_thread.data_ready.connect(self.update_plot_buffered)  
-            self.sampling_thread.start()
+        self.sampling_thread = SamplingThread(self.channels_count, sock, self.buffer_lock, self.signal_buffer, self.error_buffer)
+        self.sampling_thread.data_ready.connect(self.packet_counter)  
+        self.sampling_thread.start()
 
-            self.timer = QTimer()
-            self.timer.setInterval(33)  # cca 30 FPS
-            self.timer.timeout.connect(self.update_plot_buffered)
-            self.timer.start()
+        self.timer = QTimer()
+        self.timer.setInterval(33)  # cca 30 FPS
+        self.timer.timeout.connect(self.update_plot_buffered)
+        self.timer.start()
 
-            self.error_label.setText("[OK] Spuštěn kontinuální příjem a vykreslování")
-
-        else:
-            # Jednorázový příjem
-            try:
-                # Odeslat CMD 5 s NUM_PACKETS > 0
-                send_cmd5(sock, NUM_PACKETS)
-
-                responses = []
-                expected_packets = NUM_PACKETS + 1  # +1 pro ACK
-
-                sock.settimeout(5)  # nastavit timeout na příjem
-                for _ in range(expected_packets):
-                    resp, _ = sock.recvfrom(4096)
-                    responses.append(resp)
-                sock.settimeout(None)  # zrušit timeout
-
-                if len(responses) < expected_packets:
-                    self.error_label.setText(f"[ERR] Sampling: přišlo {len(responses)} paketů, očekáváno {expected_packets}")
-                    return
-
-                signals = [[] for _ in range(self.ch)]
-                errors = [[] for _ in range(self.ch)]
-
-                for i, pkt in enumerate(responses[1:], start=1):  # první paket je ACK
-                    verified = verify_crc(pkt)
-                    if not verified:
-                        print(f"[WARN] CRC selhalo u paketu č.{i}")
-                        continue
-                    offset = 4
-                    for ch_i in range(self.ch):
-                        sig = struct.unpack('<' + 'h' * SAMPLES_PER_PACKET, verified[offset:offset + 400])
-                        signals[ch_i].extend(sig)
-                        offset += 400
-                    for ch_i in range(self.ch):
-                        errors[ch_i].append(verified[offset])
-                        offset += 1
-
-                self.plot.clear()
-                self.curves = [self.plot.plot(pen=pg.intColor(i, hues=self.ch)) for i in range(self.ch)]
-
-                min_len = min(len(sig) for sig in signals)
-                x = np.linspace(0, min_len * sampling_period_ms, min_len, endpoint=False)
-
-                OFFSET = 1000
-                for i in range(self.ch):
-                    shifted = np.array(signals[i][:min_len]) + i * OFFSET
-                    self.curves[i].setData(x, shifted)
-
-                self.plot.setLabel('bottom', 'Čas', units='ms')
-                self.plot.enableAutoRange(True)
-
-                channel_errors = [sum(1 for val in err if val != 0) for err in errors]
-                error_text = "Chyby:\n" + "\n".join(f"Kanál {i}: {count}" for i, count in enumerate(channel_errors))
-                self.error_label.setText(error_text + f"\n[INFO] Přijato paketů: {len(responses)}")
-
-            except Exception as e:
-                self.error_label.setText(f"[ERR] Sampling: {e}")
-
+        self.error_label.setText("[OK] Spuštěn kontinuální příjem a vykreslování")
 
     def stop_sampling(self):
         if self.sampling_thread and self.sampling_thread.isRunning():
             self.sampling_thread.stop()
             self.timer.stop()
-            self.error_label.setText("[OK] Kontinuální příjem zastaven")
+            self.error_label.setText("[OK] Stop sampling")
+            self.update_plot_buffered()
         else:
             self.error_label.setText("[INFO] Kontinuální příjem neběží")
 
