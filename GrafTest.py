@@ -120,7 +120,7 @@ class SamplingThread(QThread):
         self.wait()
 
 # ---------------------- Get ID ----------------------
-ID_HEADER_STRUCT = struct.Struct('<HHHHBBIIHBB30sH')
+ID_HEADER_STRUCT = struct.Struct('<HHHBBI3I HBB I HBB 8s 30s H')
 
 def parse_id_packet(data):
     if len(data) < ID_HEADER_STRUCT.size:
@@ -132,13 +132,18 @@ def parse_id_packet(data):
         'hw_id': unpacked[2],
         'hw_ver_major': unpacked[3],
         'hw_ver_minor': unpacked[4],
-        'hw_mcu_serial': unpacked[6],
-        'hw_adc_serial': unpacked[7],
-        'fw_id': unpacked[8],
-        'fw_ver_major': unpacked[9],
-        'fw_ver_minor': unpacked[10],
-        'build_time': unpacked[11].decode('ascii').strip('\x00'),
-        'channels_count': unpacked[12]
+        'mcu_serial': unpacked[5],
+        'cpu_uid': (unpacked[6], unpacked[7], unpacked[8]),
+        'adc_hw_id': unpacked[9],
+        'adc_ver_major': unpacked[10],
+        'adc_ver_minor': unpacked[11],
+        'adc_serial': unpacked[12],
+        'fw_id': unpacked[13],
+        'fw_ver_major': unpacked[14],
+        'fw_ver_minor': unpacked[15],
+        'fw_config': unpacked[16].decode('ascii').rstrip('\x00'),
+        'build_time': unpacked[17].decode('ascii').rstrip('\x00'),
+        'channels_count': unpacked[18],
     }
 
 

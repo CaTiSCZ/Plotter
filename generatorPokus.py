@@ -121,21 +121,48 @@ class MultiSignalTestGenerator:
                 print(f"Neznámý příkaz typu {command_type}")
        
     def _send_identification_packet(self, addr):
-        # TODO: Nahraď tyto hodnoty reálnými podle potřeby
         packet_type = 1
         state = 0
         hw_id = 0x1234
         hw_ver_major = 1
         hw_ver_minor = 0
         hw_mcu_serial = 0x11223344
-        hw_adc_serial = 0x55667788
+        cpu_uid = (0xAABBCCDD, 0xEEFF0011, 0x22334455)
+        adc_hw_id = 0x5678
+        adc_ver_major = 1
+        adc_ver_minor = 1
+        adc_serial = 0x99AABBCC
         fw_id = 0xABCD
         fw_ver_major = 2
         fw_ver_minor = 3
+        fw_config = b"RELEASE\0"  # 8 bajtů, včetně ukončovací nuly
         build_time = b"2025-05-13T12:43:13\0".ljust(30, b'\x00')
         channels_count = self.num_signals
-        units_and_gains = b''
 
+        # Hlavička
+        header = struct.pack(
+            '<HHHBBI3I HBB I HBB 8s 30s H',
+            packet_type,
+            state,
+            hw_id,
+            hw_ver_major,
+            hw_ver_minor,
+            hw_mcu_serial,
+            *cpu_uid,
+            adc_hw_id,
+            adc_ver_major,
+            adc_ver_minor,
+            adc_serial,
+            fw_id,
+            fw_ver_major,
+            fw_ver_minor,
+            fw_config,
+            build_time,
+            channels_count
+        )
+
+        # Jednotky, offsety, zisky (12 bajtů na kanál)
+        units_and_gains = b''
         for i in range(channels_count):
             if i == 0:
                 unit = b"mV\0".ljust(4, b'\x00')
@@ -151,29 +178,15 @@ class MultiSignalTestGenerator:
                 gain = 1.0
             units_and_gains += struct.pack('<4sff', unit, offset, gain)
 
-        header = struct.pack(
-            '<HHHHBBIIHBB30sH',
-            packet_type,
-            state,
-            hw_id,
-            hw_ver_major,
-            hw_ver_minor,
-            0,  # padding
-            hw_mcu_serial,
-            hw_adc_serial,
-            fw_id,
-            fw_ver_major,
-            fw_ver_minor,
-            build_time,
-            channels_count
-        )
-
+        # Spojení hlavičky a dat
         full_packet = header + units_and_gains
+
+        # CRC
         crc = crc16_ccitt(full_packet)
         full_packet += struct.pack('<H', crc)
 
-        data_addr = addr
-        self.sock.sendto(full_packet, data_addr)
+        self.sock.sendto(full_packet, addr)
+
 
     def _register_receiver(self, cmd_data, addr):
         ip_bytes = cmd_data[4:8]
