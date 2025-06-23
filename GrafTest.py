@@ -2,16 +2,18 @@ import socket
 import struct
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget, QPushButton, QGridLayout, QApplication, QSpinBox, QDoubleSpinBox, QCheckBox
+from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget, QPushButton, QGridLayout, QApplication, QSpinBox, QDoubleSpinBox, QCheckBox, QTextEdit, QScrollArea
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from collections import deque
 import threading
+import time
 
 
 # ---------------------- Parametry ----------------------
 UDP_IP = "127.0.0.1"
 UDP_PORT_SEND = 9999  # generátor
-UDP_PORT_RECV = 9998  # tento klient
+UDP_PORT_RECV = 9998  # tento klient - port pro příjem ACK +
+UDP_PORT_DATA = 9997  # port pro příjem dat 
 NUM_PACKETS = 10      # počet vzorků (požadavek v CMD 5)
 RECV_TIMEOUT = 2.0
 SAMPLES_PER_PACKET = 200
@@ -46,16 +48,21 @@ def verify_crc(pkt):
 # ----------------------Vlákno na čtení dat ----------------
 class SamplingThread(QThread):
     data_ready = pyqtSignal()
-    def __init__(self, ch, sock, buffer_lock, signal_buffer, error_buffer):
+    def __init__(self, ch, buffer_lock, signal_buffer, error_buffer):
         super().__init__()
         self.channels_count = ch
-        self.sock = sock
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((UDP_IP, UDP_PORT_DATA))
+        self.sock.settimeout(RECV_TIMEOUT)
         self.buffer_lock = buffer_lock
         self.signal_buffer = signal_buffer
         self.error_buffer = error_buffer
         self.running = True
         self.sock.settimeout(0.3)
-
+        self.lock = threading.Lock() 
+    def set_channels_count(self, new_count):
+        with self.lock:
+            self.channels_count = new_count
     def run(self):
         while self.running:
             try:
@@ -68,74 +75,46 @@ class SamplingThread(QThread):
                 packet_type, packet_num = struct.unpack('<HH', data[0:4])
                 if packet_type != 2:
                     continue  # jen datové pakety
-
+                
                 offset = 4
-                signals = [[] for _ in range(self.channels_count)]
+
+                with self.lock:
+                    ch_count = self.channels_count
+                signals = [[] for _ in range(ch_count)]
                 errors = []
 
                 # Čteme data 200 vzorků na kanál
-                for ch_i in range(self.channels_count):
+                for ch_i in range(ch_count):
                     sig = struct.unpack('<' + 'h'*SAMPLES_PER_PACKET, data[offset:offset + 2*SAMPLES_PER_PACKET])
                     signals[ch_i].extend(sig)
                     offset += 2 * SAMPLES_PER_PACKET
 
                 # Čteme parity error pro každý kanál (1 byte)
-                for ch_i in range(self.channels_count):
+                for ch_i in range(ch_count):
                     errors.append(data[offset])
                     offset += 1
 
                 # Padding (když je počet kanálů lichý, přidá se 1 byte)
-                if self.channels_count % 2 != 0:
+                if ch_count % 2 != 0:
                     offset += 1
 
                 # CRC 2B už jsme ověřili výše
 
                 with self.buffer_lock:
-                    for i in range(self.channels_count):
+                    for i in range(ch_count):
                         self.signal_buffer[i].extend(signals[i])
                         self.error_buffer[i].extend([errors[i]] * SAMPLES_PER_PACKET)
                 self.data_ready.emit()
             except socket.timeout:
                 pass
-
+        if self.sock:
+            self.sock.close()
+            print("Data socket uzavřen.")        
 
     def stop(self):
         self.running = False
         self.quit()
         self.wait()
-
-
-# ---------------------- Socket Setup ----------------------
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind((UDP_IP, UDP_PORT_RECV))
-sock.settimeout(RECV_TIMEOUT)
-
-# ---------------------- Odesílání příkazů ----------------------
-def send_command(cmd: int, data: bytes = b'', expect_response: bool = True, expected_packets: int = 1):
-    pkt = struct.pack('<I', cmd) + data
-    sock.sendto(pkt, (UDP_IP, UDP_PORT_SEND))
-    
-
-    if not expect_response:
-        return None
-
-    responses = []
-    sock.settimeout(0.3)
-    try:
-        for _ in range(expected_packets):
-            resp, _ = sock.recvfrom(1024)
-            responses.append(resp)
-            #print(f"[RECV] {resp.hex()}")
-    except socket.timeout:
-        if not responses:
-            print(f"[TIMEOUT] CMD {cmd} – žádná odpověď")
-        else:
-            print(f"[INFO] CMD {cmd} – přijato {len(responses)} / {expected_packets} paketů")
-    finally:
-        sock.settimeout(None)
-
-    return responses if expected_packets > 1 else (responses[0] if responses else None)
-
 
 # ---------------------- Get ID ----------------------
 ID_HEADER_STRUCT = struct.Struct('<HHHHBBIIHBB30sH')
@@ -167,6 +146,11 @@ class SignalClient(QWidget):
     
     def __init__(self):
         super().__init__()
+        # ---------------------- Socket Setup ----------------------
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((UDP_IP, UDP_PORT_RECV))
+        self.sock.settimeout(RECV_TIMEOUT)
+
         self.sampling_thread = None
         self.received_packets = 0
         self.num_packets = 0
@@ -201,9 +185,23 @@ class SignalClient(QWidget):
         self.plot.getAxis('left').setGrid(255)
         self.plot.getAxis('bottom').setGrid(255)
 
-        self.error_label = QLabel("Chyby:\n")
-        self.error_label.setStyleSheet("font-family: monospace; padding: 6px;")
-        self.layout.addWidget(self.error_label)
+        # Výpis chyb z datových paketů (např. CRC)
+        self.data_error_label = QLabel("Chyby datových paketů:\n")
+        self.data_error_label.setStyleSheet("font-family: monospace; padding: 6px;")
+        self.layout.addWidget(self.data_error_label)
+
+        # Výpis ostatních hlášek ve scrollovacím poli
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setLineWrapMode(QTextEdit.NoWrap)
+        self.log_output.setStyleSheet("font-family: monospace; background-color: #f8f8f8;")
+        log_scroll_area = QScrollArea()
+        log_scroll_area.setWidgetResizable(True)
+        log_scroll_area.setWidget(self.log_output)
+        log_scroll_area.setFixedHeight(200)
+        self.layout.addWidget(QLabel("Systémové zprávy / logy:"))
+        self.layout.addWidget(log_scroll_area)
+
         # ------------ osy ------------- 
        
         # Skupina pro nastavení rozsahu osy X
@@ -298,23 +296,21 @@ class SignalClient(QWidget):
 
         self.curves = []
         
-        
-    def update_plot_continuous(self, signals, errors):
-        self.plot.clear()
-        self.curves = [self.plot.plot(pen=pg.intColor(i, hues=self.channels_count)) for i in range(self.channels_count)]
+        # Vytvoření buffery
+        self.signal_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count)]
+        self.error_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count)]
+        self.init_curves()
 
         
-        min_len = min(len(sig) for sig in signals)
-        x = np.linspace(0, min_len * sampling_period_ms, min_len, endpoint=False)
+        self.sampling_thread = SamplingThread(self.channels_count, self.buffer_lock, self.signal_buffer, self.error_buffer)
+        self.sampling_thread.data_ready.connect(self.packet_counter)  
+        self.sampling_thread.start()
 
-        OFFSET = 1000
-        for i in range(self.channels_count):
-            shifted = np.array(signals[i][:min_len]) + i * OFFSET
-            self.curves[i].setData(x, shifted)
+        self.timer = QTimer()
+        self.timer.setInterval(33)  # cca 30 FPS
+        self.timer.timeout.connect(self.update_plot_buffered)
+        self.timer.start()
 
-        channel_errors = [sum(1 for val in err if val != 0) for err in errors]
-        error_text = "Chyby:\n" + "\n".join(f"Kanál {i}: {count}" for i, count in enumerate(channel_errors))
-        self.error_label.setText(error_text)
 
     def init_curves(self):
         self.plot.clear()
@@ -375,7 +371,7 @@ class SignalClient(QWidget):
 
             channel_errors = [sum(1 for val in list(self.error_buffer[i])[-N:] if val != 0) for i in range(self.channels_count)]
             error_text = "Chyby (posledních vzorků):\n" + "\n".join(f"Kanál {i}: {count}" for i, count in enumerate(channel_errors))
-            self.error_label.setText(error_text)
+            self.data_error_label.setText(error_text)
 
     def packet_counter (self):
         self.received_packets +=1
@@ -383,69 +379,113 @@ class SignalClient(QWidget):
         if self.received_packets == self.num_packets:
             self.stop_sampling()
     
+    def log_message(self, msg: str):
+        timestamp = time.strftime("%H:%M:%S")
+        self.log_output.append(f"[{timestamp}] {msg}")
+
+    # ------------------- Odesílání příkazů ----------------------
+    def send_command(self, cmd: int, data: bytes = b'', expect_response: bool = True, expected_packets: int = 1):
+        pkt = struct.pack('<I', cmd) + data
+        self.sock.sendto(pkt, (UDP_IP, UDP_PORT_SEND))
+        
+
+        if not expect_response:
+            return None
+
+        responses = []
+        self.sock.settimeout(0.3)
+        try:
+            for _ in range(expected_packets):
+                resp, _ = self.sock.recvfrom(1024)
+                responses.append(resp)
+                #print(f"[RECV] {resp.hex()}")
+        except socket.timeout:
+            if not responses:
+                print(f"[TIMEOUT] CMD {cmd} – žádná odpověď")
+            else:
+                print(f"[INFO] CMD {cmd} – přijato {len(responses)} / {expected_packets} paketů")
+        finally:
+            self.sock.settimeout(None)
+
+        return responses if expected_packets > 1 else (responses[0] if responses else None)
 
     def ping(self):
         try:
-            responses = send_command(0)
+            responses = self.send_command(0)
             if responses:
-                self.error_label.setText(f"[OK] Ping úspěšný")
+                self.log_message(f"[OK] Ping úspěšný")
             else:
-                self.error_label.setText("[WARN] Ping bez odpovědi")
+                self.log_message("[WARN] Ping bez odpovědi")
         except Exception as e:
-            self.error_label.setText(f"[ERR] Ping: {e}")
+            self.log_message(f"[ERR] Ping: {e}")
 
     def get_id(self):
         try:
-            resp = send_command(1)
+            resp = self.send_command(1)
             if not resp:
-                self.error_label.setText("[ERR] Get ID: žádná odpověď")
+                self.log_message("[ERR] Get ID: žádná odpověď")
                 return
             data = verify_crc(resp)
             if not data:
-                self.error_label.setText("[ERR] Get ID: CRC selhalo")
+                self.log_message("[ERR] Get ID: CRC selhalo")
                 return
             parsed = parse_id_packet(data)
             self.channels_count = parsed['channels_count']
-            txt = (
+
+            # Změnit velikost již existujících bufferů
+            with self.buffer_lock:
+                # Smazat původní obsah
+                self.signal_buffer.clear()
+                self.error_buffer.clear()
+                # Přidat nové prázdné dequey podle nového počtu kanálů
+                self.signal_buffer.extend(deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count))
+                self.error_buffer.extend(deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count))
+
+            # Předat nový počet kanálů do vlákna
+            if self.sampling_thread:
+                self.sampling_thread.set_channels_count(self.channels_count)
+
+            self.init_curves()
+
+            self.log_message(
                 f"Firmware: v{parsed['fw_ver_major']}.{parsed['fw_ver_minor']}\n"
                 f"Build time: {parsed['build_time']}\n"
                 f"Počet kanálů: {self.channels_count}"
             )
-            self.error_label.setText(txt)
         except Exception as e:
-            self.error_label.setText(f"[ERR] Get ID: {e}")
+            self.log_message(f"[ERR] Get ID: {e}")
 
     def register_receiver(self):
         try:
-            data = socket.inet_aton(UDP_IP) + struct.pack('<H', UDP_PORT_RECV)
-            resp = send_command(2, data, expect_response=True)
+            data = socket.inet_aton(UDP_IP) + struct.pack('<H', UDP_PORT_DATA)
+            resp = self.send_command(2, data, expect_response=True)
 
             if not resp:
-                self.error_label.setText("[WARN] Registrace - žádná odpověď")
+                self.log_message("[WARN] Registrace - žádná odpověď")
                 return
             
             if len(resp) < 15:
-                self.error_label.setText(f"[ERR] Registrace - odpověď příliš krátká ({len(resp)} bajtů)")
+                self.log_message(f"[ERR] Registrace - odpověď příliš krátká ({len(resp)} bajtů)")
                 return   
                 
             ip = socket.inet_ntoa(resp[8:12])
             port = struct.unpack('<H', resp[12:14])[0]
             order = resp[14]
 
-            self.error_label.setText(
+            self.log_message(
                 f"[OK] Registrován jako příjemce:\n"
                 f"IP: {ip}\n"
                 f"Port: {port}\n"
                 f"Pořadí registrace: {order}"
             )
         except Exception as e:
-            self.error_label.setText(f"[ERR] Registrace: {e}")
+            self.log_message(f"[ERR] Registrace: {e}")
     
     def get_receivers(self):
         try:
-            resp = send_command(4, expect_response=True, expected_packets=1)
+            resp = self.send_command(4, expect_response=True, expected_packets=1)
             if not resp:
-                self.error_label.setText("[ERR] Get receivers: žádná odpověď")
+                self.log_message("[ERR] Get receivers: žádná odpověď")
                 return
             data = resp
             receivers = []
@@ -460,61 +500,35 @@ class SignalClient(QWidget):
                 txt = "Registrovaní příjemci:\n" + "\n".join(receivers)
             else:
                 txt = "Žádní registrovaní příjemci"
-            self.error_label.setText(txt)
+            self.log_message(txt)
         except Exception as e:
-            self.error_label.setText(f"[ERR] Get receivers: {e}")
+            self.log_message(f"[ERR] Get receivers: {e}")
     
     def start_sampling(self):
         self.received_packets = 0
         self.num_packets = self.num_packets_spinbox.value()
         data = struct.pack('<Q', self.num_packets)
         if self.channels_count == 0:
-            self.error_label.setText("Nejdřív zavolej Get ID")
-            return
-
-        # Nekonečné sampling
-        if self.sampling_thread and self.sampling_thread.isRunning():
-            self.error_label.setText("[INFO] Kontinuální příjem již běží")
+            self.log_message("Nejdřív zavolej Get ID")
             return
 
         # Odeslat CMD 5 
-        resp = send_command(5, data)
+        resp = self.send_command(5, data)
 
-        # Vyčistit buffery
-        self.signal_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count)]
-        self.error_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count)]
-        self.init_curves()
 
-        #self.plot.setXRange(-BUFFER_SIZE * sampling_period_ms, 0)
-
-        self.sampling_thread = SamplingThread(self.channels_count, sock, self.buffer_lock, self.signal_buffer, self.error_buffer)
-        self.sampling_thread.data_ready.connect(self.packet_counter)  
-        self.sampling_thread.start()
-
-        self.timer = QTimer()
-        self.timer.setInterval(33)  # cca 30 FPS
-        self.timer.timeout.connect(self.update_plot_buffered)
-        self.timer.start()
-
-        self.error_label.setText("[OK] Spuštěn kontinuální příjem a vykreslování")
+        self.log_message("[OK] Spuštěn kontinuální příjem a vykreslování")
 
     def stop_sampling(self):
         if self.sampling_thread and self.sampling_thread.isRunning():
-            self.sampling_thread.stop()
-            self.timer.stop()
-            self.error_label.setText("[OK] Stop sampling")
+            resp = self.send_command(7)
+                       
+            self.log_message("[OK] Stop sampling")
             self.update_plot_buffered()
         else:
-            self.error_label.setText("[INFO] Kontinuální příjem neběží")
+            self.log_message("[INFO] Kontinuální příjem neběží")
 
     def clear_plot(self):
-        # Zastavit průběžné vykreslování, pokud běží
-        if hasattr(self, 'timer') and self.timer.isActive():
-            self.timer.stop()
-
-        # Zastavit vlákno, pokud běží
-        if self.sampling_thread and self.sampling_thread.isRunning():
-            self.sampling_thread.stop()
+            
 
         # Vyčistit buffery
         with self.buffer_lock:
@@ -528,8 +542,23 @@ class SignalClient(QWidget):
         self.curves = []
 
         # Vymazat text chyb / info
-        self.error_label.setText("Graf vyčištěn.")
+        self.update_plot_buffered()
+        self.log_message("Graf vyčištěn.")
 
+
+    def closeEvent(self, event):
+        print("Ukončuji aplikaci...")
+
+        if self.sampling_thread and self.sampling_thread.isRunning():
+            print("Zastavuji příjem dat...")
+            self.sampling_thread.stop()
+
+        if self.sock:
+            self.sock.close()
+            print("Socket uzavřen.")
+
+        self.timer.stop()
+        event.accept()
 
 
 
