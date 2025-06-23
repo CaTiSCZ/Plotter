@@ -18,7 +18,7 @@ NUM_PACKETS = 10      # počet vzorků (požadavek v CMD 5)
 RECV_TIMEOUT = 2.0
 SAMPLES_PER_PACKET = 200
 PACKET_RATE_HZ = 1000     # 1 paket/ms (1000 za s)
-SAMPLING_PERIOD_MS = 1/SAMPLES_PER_PACKET # 1 packet/ms, 200 vzorků/packet = 200 vzorků/ms
+SAMPLING_PERIOD = 1/SAMPLES_PER_PACKET/PACKET_RATE_HZ # 1 packet/s, 200 vzorků/packet = 200 vzorků/ms
 BUFFER_LENGTH_S = 10   # délka bufferu v s
 BUFFER_SIZE = int ( BUFFER_LENGTH_S * SAMPLES_PER_PACKET * PACKET_RATE_HZ )
 SIGNAL_TYPE = np.int16
@@ -72,7 +72,7 @@ class SamplingThread(QThread):
                     continue
 
                 # Parsování hlavičky (2B type + 2B číslo paketu)
-                packet_type, packet_num = struct.unpack('<HH', data[0:4])
+                packet_type, packet_order = struct.unpack('<HH', data[0:4])
                 if packet_type != 2:
                     continue  # jen datové pakety
                 
@@ -80,13 +80,15 @@ class SamplingThread(QThread):
 
                 with self.lock:
                     ch_count = self.channels_count
-                signals = [[] for _ in range(ch_count)]
+                signals = [[] for _ in range(ch_count+1)]
                 errors = []
 
+                x = [packet_order * SAMPLES_PER_PACKET + k for k in range (SAMPLES_PER_PACKET) ]
+                signals[0].extend(x)
                 # Čteme data 200 vzorků na kanál
                 for ch_i in range(ch_count):
                     sig = struct.unpack('<' + 'h'*SAMPLES_PER_PACKET, data[offset:offset + 2*SAMPLES_PER_PACKET])
-                    signals[ch_i].extend(sig)
+                    signals[ch_i + 1].extend(sig)
                     offset += 2 * SAMPLES_PER_PACKET
 
                 # Čteme parity error pro každý kanál (1 byte)
@@ -101,8 +103,9 @@ class SamplingThread(QThread):
                 # CRC 2B už jsme ověřili výše
 
                 with self.buffer_lock:
+                    self.signal_buffer[0].extend(signals[0])
                     for i in range(ch_count):
-                        self.signal_buffer[i].extend(signals[i])
+                        self.signal_buffer[i+1].extend(signals[i+1])
                         self.error_buffer[i].extend([errors[i]] * SAMPLES_PER_PACKET)
                 self.data_ready.emit()
             except socket.timeout:
@@ -156,9 +159,6 @@ class SignalClient(QWidget):
         self.num_packets = 0
 
         self.buffer_lock = threading.Lock()
-        self.signal_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(32)]  # max 32 kanálů
-        self.error_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(32)]
-
 
         self.setWindowTitle("UDP Signálový klient")
         self.resize(1600, 1200)
@@ -171,7 +171,7 @@ class SignalClient(QWidget):
         self.plot_widget = pg.GraphicsLayoutWidget(title="Signály")
         self.plot = self.plot_widget.addPlot(title="Signály ze všech kanálů")
    
-        self.plot.setLabel('bottom', 'Čas', units='ms')
+        self.plot.setLabel('bottom', 'Čas', units='s')
         self.plot.setLabel('left', 'Amplituda + offset', units='')
         self.plot.showAxis('bottom', show=True)
         self.plot.showAxis('left', show=True)
@@ -293,7 +293,7 @@ class SignalClient(QWidget):
         self.curves = []
         
         # Vytvoření buffery
-        self.signal_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count)]
+        self.signal_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count+1)]
         self.error_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count)]
         self.init_curves()
 
@@ -343,18 +343,21 @@ class SignalClient(QWidget):
             if N == 0:
                 return
             
-            x = np.linspace(0, N * SAMPLING_PERIOD_MS, N, endpoint=False)
 
+            xmin = self.signal_buffer[0][-N] * SAMPLING_PERIOD
+            xmax = self.signal_buffer[0][-1] * SAMPLING_PERIOD
+            x = np.linspace(xmin, xmax, N, endpoint=False)
             if len(self.curves) != self.channels_count:
                 self.plot.clear()
                 self.curves = [self.plot.plot(pen=pg.intColor(i, hues=self.channels_count)) for i in range(self.channels_count)]
 
             for i in range(self.channels_count):
-                self.curves[i].setData(x, np.array(list(self.signal_buffer[i])[-N:]))
+                
+                self.curves[i].setData(x,np.array(list(self.signal_buffer[i + 1])[-N:]))
 
             if self.auto_x_range:
                 # Automaticky podle dat
-                self.plot.setXRange(0, N * SAMPLING_PERIOD_MS)
+                self.plot.setXRange(xmin, xmax)
             
 
             channel_errors = [sum(1 for val in list(self.error_buffer[i])[-N:] if val != 0) for i in range(self.channels_count)]
@@ -426,7 +429,7 @@ class SignalClient(QWidget):
                 self.signal_buffer.clear()
                 self.error_buffer.clear()
                 # Přidat nové prázdné dequey podle nového počtu kanálů
-                self.signal_buffer.extend(deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count))
+                self.signal_buffer.extend(deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count + 1))
                 self.error_buffer.extend(deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count))
 
             # Předat nový počet kanálů do vlákna
