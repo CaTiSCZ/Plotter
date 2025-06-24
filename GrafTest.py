@@ -10,11 +10,14 @@ import time
 
 
 # ---------------------- Parametry ----------------------
-UDP_IP_SEND = "127.0.0.1"
-UDP_IP_RECV = "127.0.0.1"
-UDP_PORT_SEND = 9999  # generátor
-UDP_PORT_RECV = 9998  # tento klient - port pro příjem ACK +
-UDP_PORT_DATA = 9997  # port pro příjem dat 
+
+UDP_IP_SEND = "192.168.2.10" # "127.0.0.1"
+UDP_IP_RECV = "192.168.2.10" # "127.0.0.1"
+
+UDP_PORT_SEND = 10578  # generátor
+UDP_PORT_RECV = 10579  # tento klient - port pro příjem ACK +
+UDP_PORT_DATA = 10577  # port pro příjem dat 
+
 NUM_PACKETS = 10      # počet vzorků (požadavek v CMD 5)
 RECV_TIMEOUT = 2.0
 SAMPLES_PER_PACKET = 200
@@ -49,11 +52,11 @@ def verify_crc(pkt):
 # ----------------------Vlákno na čtení dat ----------------
 class SamplingThread(QThread):
     data_ready = pyqtSignal()
-    def __init__(self, ch, buffer_lock, signal_buffer, error_buffer):
+    def __init__(self, addr, port, ch, buffer_lock, signal_buffer, error_buffer):
         super().__init__()
         self.channels_count = ch
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((UDP_IP_RECV, UDP_PORT_DATA))
+        self.sock.bind((addr, port))
         self.sock.settimeout(RECV_TIMEOUT)
         self.buffer_lock = buffer_lock
         self.signal_buffer = signal_buffer
@@ -157,7 +160,7 @@ class SignalClient(QWidget):
         super().__init__()
         
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((UDP_IP_RECV, UDP_PORT_RECV))
+        self.sock.connect((UDP_IP_RECV, UDP_PORT_RECV))
         self.sock.settimeout(RECV_TIMEOUT)
 
         self.buffer_lock = threading.Lock()
@@ -373,9 +376,15 @@ class SignalClient(QWidget):
         self.error_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count)]
         self.init_curves()
 
-        self.sampling_thread = SamplingThread(self.channels_count, self.buffer_lock, self.signal_buffer, self.error_buffer)
-        self.sampling_thread.data_ready.connect(self.packet_counter)
+        addr = self.sock.getpeername()
+        self.log_message(f"Connecter to {addr}")
+        addr = self.sock.getsockname()
+        self.sampling_thread = SamplingThread(addr[0], UDP_PORT_DATA, self.channels_count, self.buffer_lock, self.signal_buffer, self.error_buffer)
+        self.sampling_thread.data_ready.connect(self.packet_counter)  
+
         self.sampling_thread.start()
+        addr = self.sampling_thread.sock.getsockname()
+        self.log_message(f"Listening for data on {addr}")
 
         self.timer = QTimer()
         self.timer.setInterval(33)
@@ -463,9 +472,8 @@ class SignalClient(QWidget):
     # ------------------- Odesílání příkazů ----------------------
     def send_command(self, cmd: int, data: bytes = b'', expect_response: bool = True, expected_packets: int = 1):
         pkt = struct.pack('<I', cmd) + data
-        self.sock.sendto(pkt, (UDP_IP_SEND, UDP_PORT_SEND))
+        self.sock.send(pkt)
         
-
         if not expect_response:
             return None
 
