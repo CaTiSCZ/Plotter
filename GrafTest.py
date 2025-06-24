@@ -11,8 +11,7 @@ import time
 
 # ---------------------- Parametry ----------------------
 
-UDP_IP_SEND = "192.168.2.10" # "127.0.0.1"
-UDP_IP_RECV = "192.168.2.10" # "127.0.0.1"
+UDP_DEVICE_IP = "192.168.2.10" # "127.0.0.1"
 
 UDP_PORT_SEND = 10578  # generátor
 UDP_PORT_RECV = 10579  # tento klient - port pro příjem ACK +
@@ -159,9 +158,13 @@ class SignalClient(QWidget):
     def __init__(self):
         super().__init__()
         
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.connect((UDP_IP_RECV, UDP_PORT_RECV))
-        self.sock.settimeout(RECV_TIMEOUT)
+        self.udp_cmd_port  = UDP_PORT_SEND
+        self.udp_ack_port  = UDP_PORT_RECV
+        self.udp_data_port = UDP_PORT_DATA
+
+        self.udp_device_addr = UDP_DEVICE_IP
+
+        self.sock = None
 
         self.buffer_lock = threading.Lock()
         
@@ -170,7 +173,6 @@ class SignalClient(QWidget):
         self.num_packets = 0
         self.channels_count = 0
 
-        
         # === Inicializace okna ===
         self.setWindowTitle("UDP Signal Client")
         screen_geometry = QDesktopWidget().availableGeometry()
@@ -259,12 +261,13 @@ class SignalClient(QWidget):
         grid = QGridLayout()
 
         # === Sloupec 0: GENERÁTOR & KLIENT IP ===
-        self.generator_ip_edit = QLineEdit(f"{UDP_IP_SEND}:{UDP_PORT_SEND}")
+        self.generator_ip_edit = QLineEdit(f"{self.udp_device_addr}:{self.udp_cmd_port}")
         grid.addWidget(QLabel("Device address:"), 0, 0)
         grid.addWidget(self.generator_ip_edit, 1, 0)
         self.confirm_generator_button = QPushButton("Overwrite")
         grid.addWidget(self.confirm_generator_button, 2, 0)
-    
+        self.generator_ip_edit.returnPressed.connect(self.init_sockets)
+        self.confirm_generator_button.clicked.connect(self.init_sockets)
 
         # Label přes celý řádek
         grid.addWidget(QLabel("Plotter ports:"), 3, 0)
@@ -279,16 +282,18 @@ class SignalClient(QWidget):
         # CMD port: label + QLineEdit
         cmd_label = QLabel("CMD:")
         cmd_label.setAlignment(Qt.AlignCenter)
-        self.command_port_edit = QLineEdit(str(UDP_PORT_RECV))
+        self.command_port_edit = QLineEdit(str(self.udp_ack_port))
         self.command_port_edit.setMaximumWidth(80)
         self.command_port_edit.setAlignment(Qt.AlignCenter)
+        self.command_port_edit.returnPressed.connect(self.init_sockets)
 
         # DATA port: label + QLineEdit
         data_label = QLabel("DATA:")
         data_label.setAlignment(Qt.AlignCenter)
-        self.data_port_edit = QLineEdit(str(UDP_PORT_DATA))
+        self.data_port_edit = QLineEdit(str(self.udp_data_port))
         self.data_port_edit.setMaximumWidth(80)
         self.data_port_edit.setAlignment(Qt.AlignCenter)
+        self.data_port_edit.returnPressed.connect(self.init_sockets)
 
         # Přidat všechny prvky do jednoho řádku
         client_ports_layout.addWidget(cmd_label)
@@ -303,7 +308,7 @@ class SignalClient(QWidget):
         # Tlačítko pod tím zůstává
         self.confirm_client_button = QPushButton("Overwrite")
         grid.addWidget(self.confirm_client_button, 5, 0)
-
+        self.confirm_client_button.clicked.connect(self.init_sockets)
 
         self.ping_button = QPushButton("Ping (CMD 0)")
         self.ping_button.clicked.connect(self.ping)
@@ -314,7 +319,8 @@ class SignalClient(QWidget):
         self.get_id_button.clicked.connect(self.get_id)
         grid.addWidget(self.get_id_button, 0, 1)
 
-        self.register_text_edit = QLineEdit(f"{UDP_IP_RECV}:{UDP_PORT_DATA}")
+        self.register_text_edit = QLineEdit("IP:PORT") # vlastní adresa doplněna po volání self.init_sockets()
+        self.register_text_edit.returnPressed.connect(self.register_receiver)
         grid.addWidget(QLabel("Register receiver:"), 1, 1)
         grid.addWidget(self.register_text_edit, 2, 1)
         self.register_button = QPushButton("Register (CMD 2)")
@@ -376,15 +382,8 @@ class SignalClient(QWidget):
         self.error_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count)]
         self.init_curves()
 
-        addr = self.sock.getpeername()
-        self.log_message(f"Connecter to {addr}")
-        addr = self.sock.getsockname()
-        self.sampling_thread = SamplingThread(addr[0], UDP_PORT_DATA, self.channels_count, self.buffer_lock, self.signal_buffer, self.error_buffer)
-        self.sampling_thread.data_ready.connect(self.packet_counter)  
-
-        self.sampling_thread.start()
-        addr = self.sampling_thread.sock.getsockname()
-        self.log_message(f"Listening for data on {addr}")
+        self.init_sockets()
+        self.register_text_edit.setText(f"{self.udp_my_addr}:{self.udp_data_port}")
 
         self.timer = QTimer()
         self.timer.setInterval(33)
@@ -400,7 +399,30 @@ class SignalClient(QWidget):
     def init_curves(self):
         self.plot.clear()
         self.curves = [self.plot.plot(pen=pg.intColor(i, hues=self.channels_count)) for i in range(self.channels_count)]
- 
+
+    def init_sockets(self):
+        self.udp_data_port = int(self.data_port_edit.text())
+        self.udp_ack_port = int(self.command_port_edit.text())
+        self.udp_device_addr, self.udp_cmd_port = self.generator_ip_edit.text().split(':', 1)
+        self.udp_cmd_port = int(self.udp_cmd_port)
+        if self.sock:
+            self.sock.close()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.connect((self.udp_device_addr, self.udp_cmd_port)) # abych mohl zjistit svou adresu, potřebuji se připojit na zařízení
+        self.udp_my_addr = self.sock.getsockname()[0]
+        self.sock.close()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((self.udp_my_addr, self.udp_ack_port))
+        self.sock.connect((self.udp_device_addr, self.udp_cmd_port))
+        self.sock.settimeout(RECV_TIMEOUT)
+        self.log_message(f"Connected to {self.sock.getpeername()} from {self.sock.getsockname()}")
+
+        if self.sampling_thread and self.sampling_thread.isRunning():
+            self.sampling_thread.stop()
+        self.sampling_thread = SamplingThread(self.udp_my_addr, self.udp_data_port, self.channels_count, self.buffer_lock, self.signal_buffer, self.error_buffer)
+        self.sampling_thread.data_ready.connect(self.packet_counter)
+        self.sampling_thread.start()
+        self.log_message(f"Listening for data on {self.sampling_thread.sock.getsockname()}")
   
     def on_auto_range_changed(self, state):
         self.auto_x_range = self.auto_x_range_checkbox.isChecked()
@@ -542,7 +564,8 @@ class SignalClient(QWidget):
 
     def register_receiver(self):
         try:
-            data = socket.inet_aton(UDP_IP_RECV) + struct.pack('<H', UDP_PORT_DATA)
+            addr, port = self.register_text_edit.text().split(':', 1)
+            data = socket.inet_aton(addr) + struct.pack('<H', int(port))
             resp = self.send_command(2, data, expect_response=True)
 
             if not resp:
