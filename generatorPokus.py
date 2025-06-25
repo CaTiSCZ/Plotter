@@ -77,11 +77,11 @@ class MultiSignalTestGenerator:
                 self._send_receivers_list(addr)
 
             elif command_type == 5 or command_type == 6:
-                if len(cmd_data) < 12:
+                if len(cmd_data) < 8:
                     print(f"⚠️ CMD {command_type} má nedostatečnou délku.")
                     continue
 
-                _, num_packets = struct.unpack('<IQ', cmd_data)
+                _, num_packets = struct.unpack('<II', cmd_data)
                 print(f"Přijat příkaz: typ={command_type}, počet paketů={num_packets}")
 
                 self.num_packets_to_send = num_packets

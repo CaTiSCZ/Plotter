@@ -43,7 +43,8 @@ def verify_crc(pkt):
         return None
     data = pkt[:-2]
     received_crc = struct.unpack('<H', pkt[-2:])[0]
-    if crc16_ccitt(data) != received_crc:
+    if (crc:=crc16_ccitt(data)) != received_crc:
+        print(f"CRC mismatch: expected 0x{crc:04X}, received 0x{received_crc:04X}")
         return None
     return data
 
@@ -70,12 +71,17 @@ class SamplingThread(QThread):
         while self.running:
             try:
                 pkt, _ = self.sock.recvfrom(4096)
-                data = verify_crc(pkt)
-                if not data:
-                    continue
+                if len(pkt) < 4:
+                    print("Received too short packet")
 
                 # Parsování hlavičky (2B type + 2B číslo paketu)
-                packet_type, packet_order = struct.unpack('<HH', data[0:4])
+                packet_type, packet_order = struct.unpack('<HH', pkt[0:4])
+                
+                data = verify_crc(pkt)
+                if not data:
+                    print(f"Invalid packet[{len(pkt)}] {packet_type:04X} {packet_order:5}")
+                    continue
+
                 if packet_type != 2:
                     continue  # jen datové pakety
                 
@@ -485,8 +491,9 @@ class SignalClient(QWidget):
     def packet_counter (self):
         self.received_packets +=1
 
-        if self.received_packets == self.num_packets:
-            self.stop_sampling()
+        # this crashes hw
+        # if self.received_packets == self.num_packets:
+        #     self.stop_sampling()
     
     def log_message(self, msg: str):
         timestamp = time.strftime("%H:%M:%S")
@@ -641,7 +648,7 @@ class SignalClient(QWidget):
     def start_sampling(self):
         self.received_packets = 0
         self.num_packets = self.num_packets_spinbox.value()
-        data = struct.pack('<Q', self.num_packets)
+        data = struct.pack('<I', self.num_packets)
         if self.channels_count == 0:
             self.log_message("[ERR] Need Get ID at first")
             return
