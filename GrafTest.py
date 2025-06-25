@@ -319,7 +319,7 @@ class SignalClient(QWidget):
         self.get_id_button.clicked.connect(self.get_id)
         grid.addWidget(self.get_id_button, 0, 1)
 
-        self.register_text_edit = QLineEdit("IP:PORT") # vlastní adresa doplněna po volání self.init_sockets()
+        self.register_text_edit = QLineEdit(f"0.0.0.0:{self.udp_data_port}")
         self.register_text_edit.returnPressed.connect(self.register_receiver)
         grid.addWidget(QLabel("Register receiver:"), 1, 1)
         grid.addWidget(self.register_text_edit, 2, 1)
@@ -327,10 +327,12 @@ class SignalClient(QWidget):
         self.register_button.clicked.connect(self.register_receiver)
         grid.addWidget(self.register_button, 3, 1)
 
-        self.remove_text_edit = QLineEdit("IP:PORT")
+        self.remove_text_edit = QLineEdit(f"0.0.0.0:{self.udp_data_port}")
+        self.remove_text_edit.returnPressed.connect(self.remove_receiver)
         grid.addWidget(QLabel("Remove receiver:"), 4, 1)
         grid.addWidget(self.remove_text_edit, 5, 1)
         self.remove_button = QPushButton("Remove (CMD 3)")
+        self.remove_button.clicked.connect(self.remove_receiver)
         grid.addWidget(self.remove_button, 6, 1)
 
         self.get_receivers_button = QPushButton("Get receivers CMD 4")
@@ -383,7 +385,6 @@ class SignalClient(QWidget):
         self.init_curves()
 
         self.init_sockets()
-        self.register_text_edit.setText(f"{self.udp_my_addr}:{self.udp_data_port}")
 
         self.timer = QTimer()
         self.timer.setInterval(33)
@@ -573,7 +574,7 @@ class SignalClient(QWidget):
                 return
             
             if len(resp) < 15:
-                self.log_message(f"[ERR] Register receiver: ACK to short ({len(resp)} bajts)")
+                self.log_message(f"[ERR] Register receiver: ACK to short ({len(resp)} bytes)")
                 return   
                 
             ip = socket.inet_ntoa(resp[8:12])
@@ -588,6 +589,31 @@ class SignalClient(QWidget):
             )
         except Exception as e:
             self.log_message(f"[ERR] Registr: {e}")
+
+    def remove_receiver(self):
+        try:
+            addr, port = self.remove_text_edit.text().split(':', 1)
+            data = socket.inet_aton(addr) + struct.pack('<H', int(port))
+            resp = self.send_command(3, data, expect_response=True)
+
+            if not resp:
+                self.log_message("[WARN] Remove receiver: no response")
+                return
+            
+            if len(resp) < 14:
+                self.log_message(f"[ERR] Remove receiver: ACK to short ({len(resp)} bytes)")
+                return   
+                
+            ip = socket.inet_ntoa(resp[8:12])
+            port = struct.unpack('<H', resp[12:14])[0]
+
+            self.log_message(
+                f"[OK] Remove receiver:\n"
+                f"IP: {ip}\n"
+                f"Port: {port}"
+            )
+        except Exception as e:
+            self.log_message(f"[ERR] Remove: {e}")
     
     def get_receivers(self):
         try:
