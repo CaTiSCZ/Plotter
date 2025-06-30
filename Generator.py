@@ -34,6 +34,8 @@ class MultiSignalTestGenerator:
         self.packets_sent = 0
         self.sampling = False
         self.sender_thread = None
+        self.wait_for_trigger = False
+        self.wait_for_response = False
 
     def start(self):
         self.running = True 
@@ -52,6 +54,7 @@ class MultiSignalTestGenerator:
             try:
                 cmd_data, addr = self.sock.recvfrom(1024)
             except socket.timeout:
+                self._response() #TODO: dořešit umístění pro edge case neustlého přijmu cmd
                 continue
 
             if len(cmd_data) < 4:
@@ -66,7 +69,7 @@ class MultiSignalTestGenerator:
 
             elif command_type == 1:
                 self._send_identification_packet(addr)
-
+                
             elif command_type == 2:
                 self._register_receiver(cmd_data, addr)
 
@@ -76,34 +79,25 @@ class MultiSignalTestGenerator:
             elif command_type == 4:
                 self._send_receivers_list(addr)
 
-            elif command_type == 5 or command_type == 6:
+            elif command_type == 5 or command_type == 6: 
+                command_type = struct.unpack('<I', cmd_data[:4])[0]
                 if len(cmd_data) < 8:
                     print(f"⚠️ CMD {command_type} má nedostatečnou délku.")
-                    continue
-
+                    
                 _, num_packets = struct.unpack('<II', cmd_data)
                 print(f"Přijat příkaz: typ={command_type}, počet paketů={num_packets}")
 
                 self.num_packets_to_send = num_packets
-                self.packets_sent = 0  # reset počítadla
-                self.sampling = True  # flag spuštění samplingu
-
-                if command_type == 6:
-                    print("[INFO] Sampling spuštěn na trigger (simulováno okamžitě).")
-                    # TODO: zde může být logika pro trigger, nyní spustíme rovnou
-
+                
+                if command_type == 5:
+                    self._start_sampling()
                 else:
-                    print("[INFO] Sampling spuštěn.")
-
-                # Odpověď: ACK + CMD + počet paketů
-                response = struct.pack('<HHIQ', 0, 0, command_type, num_packets)
+                    print("[INFO] Sampling spuštěn na trigger.")   
+                    self.wait_for_trigger = True
+             
+                response = struct.pack('<HHIQ', 0, 0, command_type, self.num_packets_to_send)
                 self.sock.sendto(response, addr)
-
-                # Spustit odesílání dat v samostatném vlákně, pokud ještě neběží
-                if self.sender_thread is None or not self.sender_thread.is_alive():
-                    self.sender_thread = threading.Thread(target=self._send_data_to_all_receivers, daemon=True)
-                    self.sender_thread.start()
-
+            
             elif command_type == 7:
                 # Stop sampling
                 self.sampling = False
@@ -114,12 +108,22 @@ class MultiSignalTestGenerator:
                 self.sock.sendto(response, addr)
 
             elif command_type == 8:
-                # Trigger ACK - potvrzení triggeru, nemusí nic dělat
-                print("[INFO] Přijat Trigger ACK (CMD 8)")
+                print("[INFO] Přijat Trigger ACK(CMD 8)")
+                self.wait_for_response = False
+
+            elif command_type == 9:
+                self.wait_for_trigger == False
+                self._trigger()
 
             else:
                 print(f"Neznámý příkaz typu {command_type}")
-       
+
+
+
+
+
+
+
     def _send_identification_packet(self, addr):
         packet_type = 1
         state = 0
@@ -187,7 +191,6 @@ class MultiSignalTestGenerator:
 
         self.sock.sendto(full_packet, addr)
 
-
     def _register_receiver(self, cmd_data, addr):
         ip_bytes = cmd_data[4:8]
         port = struct.unpack('<H', cmd_data[8:10])[0]
@@ -245,6 +248,46 @@ class MultiSignalTestGenerator:
 
         self.sock.sendto(response, addr)
 
+    def _start_sampling(self):
+        
+        self.packets_sent = 0  # reset počítadla
+        self.sampling = True  # flag spuštění samplingu
+
+        # Spustit odesílání dat v samostatném vlákně, pokud ještě neběží
+        if self.sender_thread is None or not self.sender_thread.is_alive():
+            self.sender_thread = threading.Thread(target=self._send_data_to_all_receivers, daemon=True)
+            self.sender_thread.start()
+
+    def _trigger(self):
+        print("Přijat trigger")
+        if self.sampling == True:
+            self._trigger_packet()
+            
+        elif self.wait_for_trigger == True:
+            self._start_sampling()
+            self._trigger_packet()
+        
+        else:
+            self._trigger_packet()
+
+
+    def _trigger_packet(self):
+        self.wait_for_response = True
+        self.response_count = 0
+        
+        self.trigger_packet = struct.pack('<HHB', 3, self.packet_id, 0)
+        for receiver in self.receivers:
+            self.sock.sendto(self.trigger_packet, receiver)
+
+    def _response(self):
+        if self.wait_for_response == True:
+            for receiver in self.receivers:
+                self.sock.sendto(self.trigger_packet, receiver)
+            self.response_count += 1
+            if self.response_count == 10:
+                self.wait_for_response == False
+        
+
     def _send_data_to_all_receivers(self):
         
         period_length = 200000
@@ -253,7 +296,8 @@ class MultiSignalTestGenerator:
         
         print("[INFO] Zahájeno odesílání dat...")
 
-        while self.running:
+        while self.running:         
+            
             if not self.sampling:
                 time.sleep(0.1)
                 continue

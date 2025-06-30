@@ -366,6 +366,7 @@ class SignalClient(QWidget):
         grid.addWidget(self.start_sampling_button, 4, 2)
 
         self.trigger_sampling_button = QPushButton("Start sampling on trigger (CMD 6)")
+        self.trigger_sampling_button.clicked.connect(self.start_on_trigger)
         grid.addWidget(self.trigger_sampling_button, 5, 2)
 
         self.stop_sampling_button = QPushButton("Stop sampling (CMD 7)")
@@ -485,9 +486,6 @@ class SignalClient(QWidget):
                 f"Channel {i}: {count}" for i, count in enumerate(channel_errors))
             self.data_error_label.setText(error_text)
 
-
-    
-  
     def packet_counter (self):
         self.received_packets +=1
 
@@ -653,11 +651,22 @@ class SignalClient(QWidget):
             self.log_message("[ERR] Need Get ID at first")
             return
 
-        # Odeslat CMD 5 
         resp = self.send_command(5, data)
 
-
         self.log_message(f"[OK] Start sampling, {self.num_packets} packets")
+
+    def start_on_trigger(self):
+            self.received_packets = 0
+            self.num_packets = self.num_packets_spinbox.value()
+            data = struct.pack('<I', self.num_packets)
+            if self.channels_count == 0:
+                self.log_message("[ERR] Need Get ID at first")
+                return
+
+            resp = self.send_command(6, data)
+
+            self.log_message(f"[OK] Waiting on trigger, {self.num_packets} packets")
+
 
     def stop_sampling(self):
         if self.sampling_thread and self.sampling_thread.isRunning():
