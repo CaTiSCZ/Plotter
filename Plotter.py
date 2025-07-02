@@ -2,8 +2,9 @@ import socket
 import struct
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget, QPushButton, QGridLayout, QApplication, QSpinBox, QDoubleSpinBox, QCheckBox, QTextEdit, QScrollArea, QLineEdit, QDesktopWidget, QHBoxLayout
+from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget, QPushButton, QGridLayout, QApplication, QSpinBox, QDoubleSpinBox, QCheckBox, QTextEdit, QScrollArea, QLineEdit, QDesktopWidget, QHBoxLayout 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+
 from collections import deque
 import threading
 import time
@@ -11,7 +12,7 @@ import time
 
 # ---------------------- Parametry ----------------------
 
-UDP_DEVICE_IP = "192.168.2.10" # "127.0.0.1"
+UDP_DEVICE_IP =  "127.0.0.1" # "192.168.2.10"
 
 UDP_PORT_SEND = 10578  # generátor
 UDP_PORT_RECV = 10579  # tento klient - port pro příjem ACK +
@@ -26,6 +27,23 @@ BUFFER_LENGTH_S = 10   # délka bufferu v s
 BUFFER_SIZE = int ( BUFFER_LENGTH_S * SAMPLES_PER_PACKET * PACKET_RATE_HZ )
 SIGNAL_TYPE = np.int16
 
+# ---------------------- CMD a packety -------------------
+ACK_packet = 0
+ID_packet = 1
+DATA_packet = 2
+TRIGGER_packet = 3
+
+#CMD
+PING = 0
+GET_ID = 1
+REGISTER_RECEIVER = 2
+REMOVE_RECEIVER = 3
+GET_RECEIVERS =	4
+START_SAMPLING = 5
+START_ON_TRIGGER = 6
+STOP_SAMPLING = 7
+TRIGGER_ACK = 8
+FORSE_TRIGGER =	9
 # ---------------------- CRC CCITT ----------------------
 def crc16_ccitt(data: bytes, poly=0x1021, crc=0xFFFF):
     for b in data:
@@ -52,7 +70,8 @@ def verify_crc(pkt):
 # ----------------------Vlákno na čtení dat ----------------
 class SamplingThread(QThread):
     data_ready = pyqtSignal()
-    def __init__(self, addr, port, ch, buffer_lock, signal_buffer, error_buffer):
+    log_signal = pyqtSignal(str)
+    def __init__(self, addr, port, ch, buffer_lock, signal_buffer, error_buffer, cmd_sock):
         super().__init__()
         self.channels_count = ch
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -64,6 +83,7 @@ class SamplingThread(QThread):
         self.running = True
         self.sock.settimeout(0.3)
         self.lock = threading.Lock() 
+        self.cmd_sock = cmd_sock
     def set_channels_count(self, new_count):
         with self.lock:
             self.channels_count = new_count
@@ -71,57 +91,80 @@ class SamplingThread(QThread):
         while self.running:
             try:
                 pkt, _ = self.sock.recvfrom(4096)
-                if len(pkt) < 4:
-                    print("Received too short packet")
+                if len(pkt) >= 2:
+                    packet_type, packet_order = struct.unpack('<HH', pkt[0:4])
 
-                # Parsování hlavičky (2B type + 2B číslo paketu)
-                packet_type, packet_order = struct.unpack('<HH', pkt[0:4])
-                
-                data = verify_crc(pkt)
-                if not data:
-                    print(f"Invalid packet[{len(pkt)}] {packet_type:04X} {packet_order:5}")
-                    continue
+                    if packet_type == DATA_packet:
+                        if len(pkt) < 4:
+                            self.log_signal.emit("[ERR] Received too short packet")
 
-                if packet_type != 2:
-                    continue  # jen datové pakety
-                
-                offset = 4
+                        # Parsování hlavičky (2B type + 2B číslo paketu)
+                        
+                        
+                        data = verify_crc(pkt)
+                        if not data:
+                            self.log_signal.emit(f" [ERR] Invalid packet[{len(pkt)}] {packet_type:04X} {packet_order:5}")
+                            continue
 
-                with self.lock:
-                    ch_count = self.channels_count
-                signals = [[] for _ in range(ch_count+1)]
-                errors = []
+                        offset = 4
 
-                x = [packet_order * SAMPLES_PER_PACKET + k for k in range (SAMPLES_PER_PACKET) ]
-                signals[0].extend(x)
-                # Čteme data 200 vzorků na kanál
-                for ch_i in range(ch_count):
-                    sig = struct.unpack('<' + 'h'*SAMPLES_PER_PACKET, data[offset:offset + 2*SAMPLES_PER_PACKET])
-                    signals[ch_i + 1].extend(sig)
-                    offset += 2 * SAMPLES_PER_PACKET
+                        with self.lock:
+                            ch_count = self.channels_count
+                        signals = [[] for _ in range(ch_count+1)]
+                        errors = []
 
-                # Čteme parity error pro každý kanál (1 byte)
-                for ch_i in range(ch_count):
-                    errors.append(data[offset])
-                    offset += 1
+                        x = [packet_order * SAMPLES_PER_PACKET + k for k in range (SAMPLES_PER_PACKET) ]
+                        signals[0].extend(x)
+                        # Čteme data 200 vzorků na kanál
+                        for ch_i in range(ch_count):
+                            sig = struct.unpack('<' + 'h'*SAMPLES_PER_PACKET, data[offset:offset + 2*SAMPLES_PER_PACKET])
+                            signals[ch_i + 1].extend(sig)
+                            offset += 2 * SAMPLES_PER_PACKET
 
-                # Padding (když je počet kanálů lichý, přidá se 1 byte)
-                if ch_count % 2 != 0:
-                    offset += 1
+                        # Čteme parity error pro každý kanál (1 byte)
+                        for ch_i in range(ch_count):
+                            errors.append(data[offset])
+                            offset += 1
 
-                # CRC 2B už jsme ověřili výše
+                        # Padding (když je počet kanálů lichý, přidá se 1 byte)
+                        if ch_count % 2 != 0:
+                            offset += 1
 
-                with self.buffer_lock:
-                    self.signal_buffer[0].extend(signals[0])
-                    for i in range(ch_count):
-                        self.signal_buffer[i+1].extend(signals[i+1])
-                        self.error_buffer[i].extend([errors[i]] * SAMPLES_PER_PACKET)
-                self.data_ready.emit()
+                        # CRC 2B už jsme ověřili výše
+
+                        with self.buffer_lock:
+                            self.signal_buffer[0].extend(signals[0])
+                            for i in range(ch_count):
+                                self.signal_buffer[i+1].extend(signals[i+1])
+                                self.error_buffer[i].extend([errors[i]] * SAMPLES_PER_PACKET)
+                        self.data_ready.emit()
+
+
+                    elif packet_type == TRIGGER_packet and len(pkt) >= 5:
+                        # Trigger packet
+                        packet_num, sample_num = struct.unpack('<HB', pkt[2:5])
+                        self.log_signal.emit(f"[TRIGGER] Trigger packet received (packet_num={packet_num}, sample_num={sample_num})")
+                        self.send_trigger_ack()  
+
+                    else:
+                        print(f"[ERR] wrong packet, {pkt}")
+                        
+                         
             except socket.timeout:
                 pass
         if self.sock:
             self.sock.close()
             print("Data socket closed.")        
+
+    def send_trigger_ack(self):
+        try:
+            packet = struct.pack('<I', TRIGGER_ACK)
+            self.cmd_sock.sendto(packet, (UDP_DEVICE_IP, UDP_PORT_SEND))
+            self.log_signal.emit("[ACK] Trigger ACK send")
+        except Exception as e:
+            print(f"[ERR] Sendind Trigger ACK failed: {e}")
+            
+
 
     def stop(self):
         self.running = False
@@ -201,6 +244,8 @@ class SignalClient(QWidget):
         self.plot.setMouseEnabled(x=True, y=True)
         self.layout.addWidget(self.plot_widget)
 
+        
+
         # === 2. řádek ===
         row2 = QGridLayout()
 
@@ -261,6 +306,8 @@ class SignalClient(QWidget):
         self.clear_button.clicked.connect(self.clear_plot)
         row2.addWidget(self.clear_button, 0, 5)
 
+
+
         self.layout.addLayout(row2)
         
         # === 3. a další řádky: 4 SLOUPCE ===
@@ -319,6 +366,11 @@ class SignalClient(QWidget):
         self.ping_button = QPushButton("Ping (CMD 0)")
         self.ping_button.clicked.connect(self.ping)
         grid.addWidget(self.ping_button, 6, 0)
+
+        self.send_trigger_button = QPushButton("ForseTrigger (CMD 9)")
+        self.send_trigger_button.clicked.connect(self.send_trigger)
+        grid.addWidget(self.send_trigger_button, 7,0)
+      
 
         # === Sloupec 1: ID & Registrace ===
         self.get_id_button = QPushButton("Get ID(CMD 1)")
@@ -427,7 +479,8 @@ class SignalClient(QWidget):
 
         if self.sampling_thread and self.sampling_thread.isRunning():
             self.sampling_thread.stop()
-        self.sampling_thread = SamplingThread(self.udp_my_addr, self.udp_data_port, self.channels_count, self.buffer_lock, self.signal_buffer, self.error_buffer)
+        self.sampling_thread = SamplingThread(self.udp_my_addr, self.udp_data_port, self.channels_count, self.buffer_lock, self.signal_buffer, self.error_buffer, self.sock)
+        self.sampling_thread.log_signal.connect(self.log_message)
         self.sampling_thread.data_ready.connect(self.packet_counter)
         self.sampling_thread.start()
         self.log_message(f"Listening for data on {self.sampling_thread.sock.getsockname()}")
@@ -497,8 +550,7 @@ class SignalClient(QWidget):
         timestamp = time.strftime("%H:%M:%S")
         self.log_output.append(f"[{timestamp}] {msg}")
 
-    # ------------------- Odesílání příkazů ----------------------
-    def send_command(self, cmd: int, data: bytes = b'', expect_response: bool = True, expected_packets: int = 1):
+    def send_command(self, cmd: int, data: bytes = b'', expect_response: bool = False, expected_packets: int = 1):
         pkt = struct.pack('<I', cmd) + data
         self.sock.send(pkt)
         
@@ -511,8 +563,10 @@ class SignalClient(QWidget):
             for _ in range(expected_packets):
                 resp, _ = self.sock.recvfrom(1024)
                 responses.append(resp)
-                #print(f"[RECV] {resp.hex()}")
         except socket.timeout:
+
+
+# je tam tohle na místě??
             if not responses:
                 print(f"[TIMEOUT] CMD {cmd}: no response")
             else:
@@ -524,7 +578,7 @@ class SignalClient(QWidget):
 
     def ping(self):
         try:
-            responses = self.send_command(0)
+            responses = self.send_command(PING,expect_response=True)
             if responses:
                 self.log_message(f"[OK] Ping: ok")
             else:
@@ -534,7 +588,7 @@ class SignalClient(QWidget):
 
     def get_id(self):
         try:
-            resp = self.send_command(1)
+            resp = self.send_command(GET_ID, expect_response=True)
             if not resp:
                 self.log_message("[ERR] Get ID: no response")
                 return
@@ -572,7 +626,7 @@ class SignalClient(QWidget):
         try:
             addr, port = self.register_text_edit.text().split(':', 1)
             data = socket.inet_aton(addr) + struct.pack('<H', int(port))
-            resp = self.send_command(2, data, expect_response=True)
+            resp = self.send_command(REGISTER_RECEIVER, data, expect_response=True)
 
             if not resp:
                 self.log_message("[WARN] Register receiver: no response")
@@ -599,7 +653,7 @@ class SignalClient(QWidget):
         try:
             addr, port = self.remove_text_edit.text().split(':', 1)
             data = socket.inet_aton(addr) + struct.pack('<H', int(port))
-            resp = self.send_command(3, data, expect_response=True)
+            resp = self.send_command(REMOVE_RECEIVER, data, expect_response=True)
 
             if not resp:
                 self.log_message("[WARN] Remove receiver: no response")
@@ -622,7 +676,7 @@ class SignalClient(QWidget):
     
     def get_receivers(self):
         try:
-            resp = self.send_command(4, expect_response=True, expected_packets=1)
+            resp = self.send_command(GET_RECEIVERS, expect_response=True, expected_packets=1)
             if not resp:
                 self.log_message("[ERR] Get receivers - no respond")
                 return
@@ -651,7 +705,7 @@ class SignalClient(QWidget):
             self.log_message("[ERR] Need Get ID at first")
             return
 
-        resp = self.send_command(5, data)
+        resp = self.send_command(START_SAMPLING, data, expect_response=True)
 
         self.log_message(f"[OK] Start sampling, {self.num_packets} packets")
 
@@ -663,20 +717,40 @@ class SignalClient(QWidget):
                 self.log_message("[ERR] Need Get ID at first")
                 return
 
-            resp = self.send_command(6, data)
+            resp = self.send_command(START_ON_TRIGGER, data, expect_response=True)
 
             self.log_message(f"[OK] Waiting on trigger, {self.num_packets} packets")
 
-
     def stop_sampling(self):
         if self.sampling_thread and self.sampling_thread.isRunning():
-            resp = self.send_command(7)
-                       
-            self.log_message(f"[OK] Stop sampling, {self.received_packets} packets")
+            self.log_message(f"[OK] Stop sampling, received packets: {self.received_packets}")
+            resp = self.send_command(STOP_SAMPLING, expect_response=True)
+            
+            if resp and len(resp) >= 16:  # 2+2+4+8 = 16 bajtů
+                packet_type, error_state, cmd_type, packets_sent = struct.unpack('<HHIQ', resp[:16])
+                
+                if packet_type == ACK_packet and cmd_type == STOP_SAMPLING:
+                    self.log_message(f"[OK] Stop sampling confirmed, packets sent by divice: {packets_sent}")
+                else:
+                    self.log_message(f"[WARN] Stop sampling: unexpected ACK structure or CMD")
+            else:
+                self.log_message(f"[WARN] Stop sampling: no or invalid ACK response")
+            
+            
             self.update_plot_buffered()
         else:
             self.log_message("[INFO] Sampling is already stopped")
 
+        
+    
+    def send_trigger(self):
+        try:
+            resp = self.send_command(FORSE_TRIGGER)
+            self.log_message("[OK] Sent trigger (CMD 9)")
+        
+        except Exception as e:
+            self.log_message(f"[ERR] Trigger send: {e}")
+    
     def clear_plot(self):
             
 

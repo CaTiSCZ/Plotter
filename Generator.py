@@ -17,9 +17,26 @@ def crc16_ccitt(data: bytes, poly=0x1021, crc=0xFFFF):
             crc &= 0xFFFF
     return crc
 
+ACK_packet = 0
+ID_packet = 1
+DATA_packet = 2
+TRIGGER_packet = 3
+
+#CMD
+PING = 0
+GET_ID = 1
+REGISTER_RECEIVER = 2
+REMOVE_RECEIVER = 3
+GET_RECEIVERS =	4
+START_SAMPLING = 5
+START_ON_TRIGGER = 6
+STOP_SAMPLING = 7
+TRIGGER_ACK = 8
+FORSE_TRIGGER =	9
+#127.0.0.1:9999
 
 class MultiSignalTestGenerator:
-    def __init__(self, ip='127.0.0.1', port=9999, interval=0.001, num_signals = 1):
+    def __init__(self, ip='127.0.0.1', port=10578, interval=0.001, num_signals = 1):
         self.ip = ip
         self.port = port
         self.interval = interval
@@ -62,24 +79,24 @@ class MultiSignalTestGenerator:
 
             command_type = struct.unpack('<I', cmd_data[:4])[0]
 
-            if command_type == 0:
+            if command_type == PING:
                 print("Přijat ping.")
-                response = struct.pack('<HHI', 0, 0, 0)  # Packet type, error, CMD
+                response = struct.pack('<HHI', ACK_packet, 0, command_type)  # Packet type, error, CMD
                 self.sock.sendto(response, addr)
 
-            elif command_type == 1:
+            elif command_type == GET_ID:
                 self._send_identification_packet(addr)
                 
-            elif command_type == 2:
+            elif command_type == REGISTER_RECEIVER:
                 self._register_receiver(cmd_data, addr)
 
-            elif command_type == 3:
+            elif command_type == REMOVE_RECEIVER:
                 self._remove_receiver(cmd_data, addr)
 
-            elif command_type == 4:
+            elif command_type == GET_RECEIVERS:
                 self._send_receivers_list(addr)
 
-            elif command_type == 5 or command_type == 6: 
+            elif command_type == START_SAMPLING or command_type == START_ON_TRIGGER: 
                 command_type = struct.unpack('<I', cmd_data[:4])[0]
                 if len(cmd_data) < 8:
                     print(f"⚠️ CMD {command_type} má nedostatečnou délku.")
@@ -89,43 +106,37 @@ class MultiSignalTestGenerator:
 
                 self.num_packets_to_send = num_packets
                 
-                if command_type == 5:
+                if command_type == START_SAMPLING:
                     self._start_sampling()
                 else:
                     print("[INFO] Sampling spuštěn na trigger.")   
                     self.wait_for_trigger = True
              
-                response = struct.pack('<HHIQ', 0, 0, command_type, self.num_packets_to_send)
+                response = struct.pack('<HHIQ', ACK_packet, 0, command_type, self.num_packets_to_send)
                 self.sock.sendto(response, addr)
             
-            elif command_type == 7:
+            elif command_type == STOP_SAMPLING:
                 # Stop sampling
                 self.sampling = False
                 print(f"[INFO] Sampling zastaven, odesláno paketů: {self.packets_sent}")
 
                 # Odpověď: ACK + CMD + počet odeslaných paketů
-                response = struct.pack('<HHIQ', 0, 0, 7, self.packets_sent)
+                response = struct.pack('<HHIQ', ACK_packet, 0, command_type, self.packets_sent)
                 self.sock.sendto(response, addr)
 
-            elif command_type == 8:
+            elif command_type == TRIGGER_ACK:
                 print("[INFO] Přijat Trigger ACK(CMD 8)")
                 self.wait_for_response = False
 
-            elif command_type == 9:
+            elif command_type == FORSE_TRIGGER:
                 self.wait_for_trigger == False
                 self._trigger()
 
             else:
                 print(f"Neznámý příkaz typu {command_type}")
 
-
-
-
-
-
-
     def _send_identification_packet(self, addr):
-        packet_type = 1
+        packet_type = ID_packet
         state = 0
         hw_id = 0x1234
         hw_ver_major = 1
@@ -214,9 +225,9 @@ class MultiSignalTestGenerator:
 
         # Odpověď: ACK + CMD + IP + Port + index
         response = struct.pack('<HHI4sHB',
-            0,                # packet type (ACK)
-            0,                # error/state
-            2,                # CMD
+            ACK_packet,         # packet type (ACK)
+            0,                  # error/state
+            REGISTER_RECEIVER,  # CMD
             socket.inet_aton(ip),
             port,
             index             # pořadí v seznamu
@@ -235,7 +246,7 @@ class MultiSignalTestGenerator:
         else:
             print(f"Přijímač nenalezen: {receiver}")
 
-        response = struct.pack('<HHI', 0, 0, 3)
+        response = struct.pack('<HHI', ACK_packet, 0, REMOVE_RECEIVER)
         self.sock.sendto(response, addr)
 
     def _send_receivers_list(self, addr):
@@ -275,9 +286,10 @@ class MultiSignalTestGenerator:
         self.wait_for_response = True
         self.response_count = 0
         
-        self.trigger_packet = struct.pack('<HHB', 3, self.packet_id, 0)
+        self.trigger_packet = struct.pack('<HHB', TRIGGER_packet, self.packet_id, 0)
         for receiver in self.receivers:
             self.sock.sendto(self.trigger_packet, receiver)
+            print("odeslán trigger packet")
 
     def _response(self):
         if self.wait_for_response == True:
@@ -286,6 +298,7 @@ class MultiSignalTestGenerator:
             self.response_count += 1
             if self.response_count == 10:
                 self.wait_for_response == False
+                print("odesílání trigger packet selhalo")
         
 
     def _send_data_to_all_receivers(self):
@@ -322,7 +335,7 @@ class MultiSignalTestGenerator:
 
             signal_bytes = b''.join(s.tobytes() for s in signals)
             error_counts = struct.pack('<' + 'B' * self.num_signals, *([0] * self.num_signals))
-            header = struct.pack('<HH', 2, self.packet_id % 65536)
+            header = struct.pack('<HH', DATA_packet, self.packet_id % 65536)
             packet = header + signal_bytes + error_counts
 
             if self.num_signals % 2 != 0:
