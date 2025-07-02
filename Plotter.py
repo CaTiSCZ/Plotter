@@ -2,7 +2,7 @@ import socket
 import struct
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget, QPushButton, QGridLayout, QApplication, QSpinBox, QDoubleSpinBox, QCheckBox, QTextEdit, QScrollArea, QLineEdit, QDesktopWidget, QHBoxLayout 
+from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget, QPushButton, QGridLayout, QApplication, QSpinBox, QDoubleSpinBox, QCheckBox, QTextEdit, QScrollArea, QLineEdit, QDesktopWidget, QHBoxLayout, QSizePolicy 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 
 from collections import deque
@@ -221,6 +221,8 @@ class SignalClient(QWidget):
         self.received_packets = 0
         self.num_packets = 0
         self.channels_count = 0
+        self.lost_packets = 0
+        self.err_packets = 0
 
         # === Inicializace okna ===
         self.setWindowTitle("UDP Signal Client")
@@ -249,10 +251,30 @@ class SignalClient(QWidget):
         # === 2. řádek ===
         row2 = QGridLayout()
 
-        self.data_error_label = QLabel("ERR packets\n")
+        self.data_error_label = QLabel("ERR samples\n")
         self.data_error_label.setStyleSheet("font-family: monospace; padding: 6px;")
         self.layout.addWidget(self.data_error_label)
-        row2.addWidget(self.data_error_label, 0, 0)
+        row2.addWidget(self.data_error_label, 0, 0, 2, 1)
+        
+        # Packet counters
+        self.lost_packets_label = QLabel("Lost packets:")
+        self.lost_packets_value = QLabel("0")
+        row2.addWidget(self.lost_packets_label, 0, 1)
+        row2.addWidget(self.lost_packets_value, 0, 2)
+
+        self.err_packets_label = QLabel("ERR packets:")
+        self.err_packets_value = QLabel("0")
+        row2.addWidget(self.err_packets_label, 1, 1)
+        row2.addWidget(self.err_packets_value, 1, 2)
+
+        self.recv_packets_label = QLabel("Recv packets:")
+        self.recv_packets_value = QLabel("0")
+        row2.addWidget(self.recv_packets_label, 2, 1)
+        row2.addWidget(self.recv_packets_value, 2, 2)
+
+        self.clear_err_button = QPushButton("Clear error stats")
+        #self.clear_err_button.clicked.connect(self.clear_error_stats)
+        row2.addWidget(self.clear_err_button, 0, 3)
 
         # --- X Range ---
         x_range_widget = QWidget()
@@ -266,7 +288,7 @@ class SignalClient(QWidget):
         x_range_layout.addWidget(x_range_label)
         x_range_layout.addWidget(self.x_range_spinbox)
         x_range_widget.setLayout(x_range_layout)
-        row2.addWidget(x_range_widget, 0, 1, alignment=Qt.AlignCenter)
+        row2.addWidget(x_range_widget, 0, 4, alignment=Qt.AlignCenter)
 
         # --- Y Min ---
         y_min_widget = QWidget()
@@ -279,7 +301,7 @@ class SignalClient(QWidget):
         y_min_layout.addWidget(y_min_label)
         y_min_layout.addWidget(self.y_min_spinbox)
         y_min_widget.setLayout(y_min_layout)
-        row2.addWidget(y_min_widget, 0, 2, alignment=Qt.AlignCenter)
+        row2.addWidget(y_min_widget, 0, 5, alignment=Qt.AlignCenter)
 
         # --- Y Max ---
         y_max_widget = QWidget()
@@ -292,7 +314,7 @@ class SignalClient(QWidget):
         y_max_layout.addWidget(y_max_label)
         y_max_layout.addWidget(self.y_max_spinbox)
         y_max_widget.setLayout(y_max_layout)
-        row2.addWidget(y_max_widget, 0, 3, alignment=Qt.AlignCenter)
+        row2.addWidget(y_max_widget, 0, 6, alignment=Qt.AlignCenter)
         
         
 
@@ -300,13 +322,37 @@ class SignalClient(QWidget):
         self.auto_x_range_checkbox = QCheckBox("Auto range")
         self.auto_x_range_checkbox.setChecked(True)
         self.auto_x_range_checkbox.stateChanged.connect(self.on_auto_range_changed)
-        row2.addWidget(self.auto_x_range_checkbox, 0, 4, alignment=Qt.AlignCenter)
-       
+        row2.addWidget(self.auto_x_range_checkbox, 0, 7, alignment=Qt.AlignCenter)
+
+        # Buffer size
+        self.buffer_size_label = QLabel("Buffer size [s]:")
+        self.buffer_size_spinbox = QDoubleSpinBox()
+        self.buffer_size_spinbox.setRange(0.1, 60.0)
+        self.buffer_size_spinbox.setValue(BUFFER_SIZE * SAMPLING_PERIOD)
+        row2.addWidget(self.buffer_size_label, 0, 8)
+        row2.addWidget(self.buffer_size_spinbox, 0, 9)
+
+
+
         self.clear_button = QPushButton("Clean graf")
         self.clear_button.clicked.connect(self.clear_plot)
-        row2.addWidget(self.clear_button, 0, 5)
+        row2.addWidget(self.clear_button, 0, 10)
 
+        # Path display (full width)
 
+        self.path_label = QLabel("Path:")
+        self.path_display = QLineEdit("C://future_path" + 40 * "/něco" + "konec")
+        self.path_display.setReadOnly(True)
+        self.path_display.setStyleSheet("font-family: monospace; padding: 4px;")
+        self.path_display.setFrame(False)
+        self.path_display.setCursorPosition(len(self.path_display.text()))
+        self.path_display.setAlignment(Qt.AlignLeft)  
+
+        self.path_display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        row2.addWidget(self.path_label, 1, 3, alignment=Qt.AlignRight)
+        row2.addWidget(self.path_display, 1, 4, 1, 7)
+        
 
         self.layout.addLayout(row2)
         
