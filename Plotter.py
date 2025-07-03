@@ -250,13 +250,13 @@ class SignalClient(QWidget):
 
         # === 2. řádek ===
         row2 = QGridLayout()
-
+# err samples
         self.data_error_label = QLabel("ERR samples\n")
         self.data_error_label.setStyleSheet("font-family: monospace; padding: 6px;")
         self.layout.addWidget(self.data_error_label)
-        row2.addWidget(self.data_error_label, 0, 0, 2, 1)
+        row2.addWidget(self.data_error_label, 0, 0, 4, 1)
         
-        # Packet counters
+# Packet counters
         self.lost_packets_label = QLabel("Lost packets:")
         self.lost_packets_value = QLabel("0")
         row2.addWidget(self.lost_packets_label, 0, 1)
@@ -275,71 +275,55 @@ class SignalClient(QWidget):
         self.clear_err_button = QPushButton("Clear error stats")
         #self.clear_err_button.clicked.connect(self.clear_error_stats)
         row2.addWidget(self.clear_err_button, 0, 3)
-
-        # --- X Range ---
-        x_range_widget = QWidget()
-        x_range_layout = QHBoxLayout()
-        x_range_layout.setContentsMargins(0, 0, 0, 0)  # bez okrajů
-        x_range_label = QLabel("X range:")
+# X range
+        self.x_range_label = QLabel("X range:")
         self.x_range_spinbox = QDoubleSpinBox()
         self.x_range_spinbox.setRange(0, BUFFER_SIZE/SAMPLES_PER_PACKET)
         self.x_range_spinbox.setValue(200)
         self.x_range_spinbox.setSuffix(" ms")
-        x_range_layout.addWidget(x_range_label)
-        x_range_layout.addWidget(self.x_range_spinbox)
-        x_range_widget.setLayout(x_range_layout)
-        row2.addWidget(x_range_widget, 0, 4, alignment=Qt.AlignCenter)
+        row2.addWidget(self.x_range_label, 0, 4, alignment=Qt.AlignRight)
+        row2.addWidget(self.x_range_spinbox, 0, 5, alignment=Qt.AlignLeft)
 
-        # --- Y Min ---
-        y_min_widget = QWidget()
-        y_min_layout = QHBoxLayout()
-        y_min_layout.setContentsMargins(0, 0, 0, 0)
-        y_min_label = QLabel("Y min:")
+
+# --- Y Min ---
+        self.y_min_label = QLabel("Y min:")
         self.y_min_spinbox = QDoubleSpinBox()
         self.y_min_spinbox.setRange(-1000000, 0)
         self.y_min_spinbox.setValue(-33000.0)
-        y_min_layout.addWidget(y_min_label)
-        y_min_layout.addWidget(self.y_min_spinbox)
-        y_min_widget.setLayout(y_min_layout)
-        row2.addWidget(y_min_widget, 0, 5, alignment=Qt.AlignCenter)
 
-        # --- Y Max ---
-        y_max_widget = QWidget()
-        y_max_layout = QHBoxLayout()
-        y_max_layout.setContentsMargins(0, 0, 0, 0)
-        y_max_label = QLabel("Y max:")
+        row2.addWidget(self.y_min_label, 0, 6, alignment=Qt.AlignRight)
+        row2.addWidget(self.y_min_spinbox, 0, 7, alignment=Qt.AlignLeft)
+# --- Y Max ---
+        self.y_max_label = QLabel("Y max:")
         self.y_max_spinbox = QDoubleSpinBox()
         self.y_max_spinbox.setRange(0, 1000000)
         self.y_max_spinbox.setValue(33000.0)
-        y_max_layout.addWidget(y_max_label)
-        y_max_layout.addWidget(self.y_max_spinbox)
-        y_max_widget.setLayout(y_max_layout)
-        row2.addWidget(y_max_widget, 0, 6, alignment=Qt.AlignCenter)
+
+        row2.addWidget(self.y_max_label, 0, 8, alignment=Qt.AlignRight)
+        row2.addWidget(self.y_max_spinbox, 0, 9, alignment=Qt.AlignLeft)
         
-        
+# x auto range        
 
         self.auto_x_range = True
         self.auto_x_range_checkbox = QCheckBox("Auto range")
         self.auto_x_range_checkbox.setChecked(True)
         self.auto_x_range_checkbox.stateChanged.connect(self.on_auto_range_changed)
-        row2.addWidget(self.auto_x_range_checkbox, 0, 7, alignment=Qt.AlignCenter)
+        row2.addWidget(self.auto_x_range_checkbox, 0, 10, alignment=Qt.AlignCenter)
 
-        # Buffer size
+# Buffer size
         self.buffer_size_label = QLabel("Buffer size [s]:")
         self.buffer_size_spinbox = QDoubleSpinBox()
         self.buffer_size_spinbox.setRange(0.1, 60.0)
         self.buffer_size_spinbox.setValue(BUFFER_SIZE * SAMPLING_PERIOD)
-        row2.addWidget(self.buffer_size_label, 0, 8)
-        row2.addWidget(self.buffer_size_spinbox, 0, 9)
+        row2.addWidget(self.buffer_size_label, 0, 11, alignment=Qt.AlignRight)
+        row2.addWidget(self.buffer_size_spinbox, 0, 12, alignment=Qt.AlignLeft)
 
-
-
+# clear graf
         self.clear_button = QPushButton("Clean graf")
         self.clear_button.clicked.connect(self.clear_plot)
-        row2.addWidget(self.clear_button, 0, 10)
-
-        # Path display (full width)
-
+        row2.addWidget(self.clear_button, 0, 13)
+        # ------ 3. řádek -----
+# Path display (full width)
         self.path_label = QLabel("Path:")
         self.path_display = QLineEdit("C://future_path" + 40 * "/něco" + "konec")
         self.path_display.setReadOnly(True)
@@ -349,10 +333,18 @@ class SignalClient(QWidget):
         self.path_display.setAlignment(Qt.AlignLeft)  
 
         self.path_display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-
+# save buttons
         row2.addWidget(self.path_label, 1, 3, alignment=Qt.AlignRight)
-        row2.addWidget(self.path_display, 1, 4, 1, 7)
+        row2.addWidget(self.path_display, 1, 4, 1, 10)
         
+        self.set_path_button = QPushButton("Set path")
+        row2.addWidget(self.set_path_button, 2, 4)
+        
+        self.save_data_button = QPushButton("Save buffer")
+        row2.addWidget(self.save_data_button, 2, 5)
+
+        self.AdHoc_safe_button = QPushButton("Ad Hoc save")
+        row2.addWidget(self.AdHoc_safe_button, 2, 6)
 
         self.layout.addLayout(row2)
         
@@ -361,115 +353,104 @@ class SignalClient(QWidget):
 
         # === Sloupec 0: GENERÁTOR & KLIENT IP ===
         self.generator_ip_edit = QLineEdit(f"{self.udp_device_addr}:{self.udp_cmd_port}")
-        grid.addWidget(QLabel("Device address:"), 0, 0)
-        grid.addWidget(self.generator_ip_edit, 1, 0)
-        self.confirm_generator_button = QPushButton("Overwrite")
-        grid.addWidget(self.confirm_generator_button, 2, 0)
+        grid.addWidget(QLabel("Device address:"), 0, 0, 1, 5)
+        grid.addWidget(self.generator_ip_edit, 1, 0, 1, 2)
+        self.confirm_generator_button = QPushButton("Use")
+        grid.addWidget(self.confirm_generator_button, 1, 2)
         self.generator_ip_edit.returnPressed.connect(self.init_sockets)
         self.confirm_generator_button.clicked.connect(self.init_sockets)
 
-        # Label přes celý řádek
-        grid.addWidget(QLabel("Plotter ports:"), 3, 0)
+        self.connect_generator_button = QPushButton("Connect")
+        grid.addWidget(self.connect_generator_button, 1, 3,1,2)
+ 
+#ploter ports
+        grid.addWidget(QLabel("Plotter ports:"), 2, 0, 1, 5)
 
-        # Vnitřní widget a layout pro dva porty vedle sebe
-        client_ports_widget = QWidget()
-        client_ports_layout = QHBoxLayout()
-        client_ports_layout.setContentsMargins(0, 0, 0, 0)
-        client_ports_layout.setSpacing(10)
-        client_ports_layout.setAlignment(Qt.AlignCenter)
-
-        # CMD port: label + QLineEdit
-        cmd_label = QLabel("CMD:")
-        cmd_label.setAlignment(Qt.AlignCenter)
+        self.cmd_label = QLabel("CMD:")
         self.command_port_edit = QLineEdit(str(self.udp_ack_port))
-        self.command_port_edit.setMaximumWidth(80)
-        self.command_port_edit.setAlignment(Qt.AlignCenter)
         self.command_port_edit.returnPressed.connect(self.init_sockets)
+        grid.addWidget(self.cmd_label, 3, 0, alignment=Qt.AlignRight)
+        grid.addWidget(self.command_port_edit, 3, 1, alignment=Qt.AlignLeft)
 
-        # DATA port: label + QLineEdit
-        data_label = QLabel("DATA:")
-        data_label.setAlignment(Qt.AlignCenter)
+        self.data_label = QLabel("DATA:")
         self.data_port_edit = QLineEdit(str(self.udp_data_port))
-        self.data_port_edit.setMaximumWidth(80)
-        self.data_port_edit.setAlignment(Qt.AlignCenter)
         self.data_port_edit.returnPressed.connect(self.init_sockets)
+        grid.addWidget(self.data_label, 3,2, alignment=Qt.AlignRight)
+        grid.addWidget(self.data_port_edit, 3, 3, alignment=Qt.AlignLeft)
 
-        # Přidat všechny prvky do jednoho řádku
-        client_ports_layout.addWidget(cmd_label)
-        client_ports_layout.addWidget(self.command_port_edit)
-        client_ports_layout.addSpacing(20)  # mezera mezi CMD a DATA
-        client_ports_layout.addWidget(data_label)
-        client_ports_layout.addWidget(self.data_port_edit)
 
-        client_ports_widget.setLayout(client_ports_layout)
-        grid.addWidget(client_ports_widget, 4, 0)
-
-        # Tlačítko pod tím zůstává
-        self.confirm_client_button = QPushButton("Overwrite")
-        grid.addWidget(self.confirm_client_button, 5, 0)
+        self.confirm_client_button = QPushButton("Use")
+        grid.addWidget(self.confirm_client_button, 3,4)
         self.confirm_client_button.clicked.connect(self.init_sockets)
 
-        self.ping_button = QPushButton("Ping (CMD 0)")
-        self.ping_button.clicked.connect(self.ping)
-        grid.addWidget(self.ping_button, 6, 0)
 
-        self.send_trigger_button = QPushButton("ForseTrigger (CMD 9)")
+#forse trigger
+        self.send_trigger_button = QPushButton("Force Trigger")
         self.send_trigger_button.clicked.connect(self.send_trigger)
-        grid.addWidget(self.send_trigger_button, 7,0)
-      
+        grid.addWidget(self.send_trigger_button, 4,0, 1, 2)
+
+        self.save_on_trigger = False
+        self.save_on_trigger_checkbox = QCheckBox("Save on triger")
+        self.save_on_trigger_checkbox.setChecked(True)
+        #self.save_on_trigger_checkbox.stateChanged.connect(dopsat funkci)
+        grid.addWidget(self.save_on_trigger_checkbox, 4, 2, 1, 3,  alignment=Qt.AlignLeft)      
+
+
+        #doplnit do dalšího řádku trigger position, label a text edit
 
         # === Sloupec 1: ID & Registrace ===
-        self.get_id_button = QPushButton("Get ID(CMD 1)")
+
+#ping
+        self.ping_button = QPushButton("Ping")
+        self.ping_button.clicked.connect(self.ping)
+        grid.addWidget(self.ping_button, 1, 5, 1, 2)
+
+        self.get_id_button = QPushButton("Get ID")
         self.get_id_button.clicked.connect(self.get_id)
-        grid.addWidget(self.get_id_button, 0, 1)
+        grid.addWidget(self.get_id_button, 1, 7, 1, 2)
+
+        self.get_receivers_button = QPushButton("Get receivers")
+        self.get_receivers_button.clicked.connect(self.get_receivers)
+        grid.addWidget(self.get_receivers_button, 1, 9, 1, 2)
 
         self.register_text_edit = QLineEdit(f"0.0.0.0:{self.udp_data_port}")
         self.register_text_edit.returnPressed.connect(self.register_receiver)
-        grid.addWidget(QLabel("Register receiver:"), 1, 1)
-        grid.addWidget(self.register_text_edit, 2, 1)
-        self.register_button = QPushButton("Register (CMD 2)")
+        grid.addWidget(QLabel("Register receiver:"), 3, 5, 1, 3)
+        grid.addWidget(self.register_text_edit, 4, 5, 1, 2)
+        self.register_button = QPushButton("Register")
         self.register_button.clicked.connect(self.register_receiver)
-        grid.addWidget(self.register_button, 3, 1)
+        grid.addWidget(self.register_button, 4, 7)
 
         self.remove_text_edit = QLineEdit(f"0.0.0.0:{self.udp_data_port}")
         self.remove_text_edit.returnPressed.connect(self.remove_receiver)
-        grid.addWidget(QLabel("Remove receiver:"), 4, 1)
-        grid.addWidget(self.remove_text_edit, 5, 1)
-        self.remove_button = QPushButton("Remove (CMD 3)")
+        grid.addWidget(QLabel("Remove receiver:"), 3, 8, 1, 3)
+        grid.addWidget(self.remove_text_edit, 4, 8, 1, 2)
+        self.remove_button = QPushButton("Remove")
         self.remove_button.clicked.connect(self.remove_receiver)
-        grid.addWidget(self.remove_button, 6, 1)
+        grid.addWidget(self.remove_button, 4, 10)
 
-        self.get_receivers_button = QPushButton("Get receivers CMD 4")
-        self.get_receivers_button.clicked.connect(self.get_receivers)
-        grid.addWidget(self.get_receivers_button, 7, 1)
+
 
         # === Sloupec 2: Sampling & Cesta ===
-        self.save_data_button = QPushButton("Save data")
-        grid.addWidget(self.save_data_button, 0, 2)
-
-        self.save_path_label = QLabel("path:")
-        grid.addWidget(self.save_path_label, 1, 2)
-
         self.num_packets_label = QLabel("Number of packets (0 = continue):")
         self.num_packets_spinbox = QSpinBox()
         self.num_packets_spinbox.setRange(0, 10000)
         self.num_packets_spinbox.setValue(NUM_PACKETS)
 
-        # Oba widgety do stejného sloupce
-        grid.addWidget(self.num_packets_label, 2, 2)
-        grid.addWidget(self.num_packets_spinbox, 3, 2)
+        grid.addWidget(self.num_packets_label, 0, 11)
+        grid.addWidget(self.num_packets_spinbox, 0, 12)
 
-        self.start_sampling_button = QPushButton("Start sampling (CMD 5)")
+        self.start_sampling_button = QPushButton("Start sampling")
         self.start_sampling_button.clicked.connect(self.start_sampling)
-        grid.addWidget(self.start_sampling_button, 4, 2)
+        grid.addWidget(self.start_sampling_button, 1, 11, 1, 2)
 
-        self.trigger_sampling_button = QPushButton("Start sampling on trigger (CMD 6)")
+        self.trigger_sampling_button = QPushButton("Start sampling on trigger")
         self.trigger_sampling_button.clicked.connect(self.start_on_trigger)
-        grid.addWidget(self.trigger_sampling_button, 5, 2)
+        grid.addWidget(self.trigger_sampling_button, 2, 11, 1, 2)
 
-        self.stop_sampling_button = QPushButton("Stop sampling (CMD 7)")
+        self.stop_sampling_button = QPushButton("Stop sampling")
         self.stop_sampling_button.clicked.connect(self.stop_sampling)
-        grid.addWidget(self.stop_sampling_button, 6, 2)
+        grid.addWidget(self.stop_sampling_button, 3, 11, 1, 2)
 
         # === Sloupec 3: LOG ===
         self.log_output = QTextEdit("Log messenge:")
@@ -479,7 +460,7 @@ class SignalClient(QWidget):
         log_scroll_area = QScrollArea()
         log_scroll_area.setWidgetResizable(True)
         log_scroll_area.setWidget(self.log_output)
-        grid.addWidget(log_scroll_area, 0, 3, 8, 1)  # výška přes všechny řádky
+        grid.addWidget(log_scroll_area, 0, 13, 6, 1)  # výška přes všechny řádky
 
         self.layout.addLayout(grid)
 
