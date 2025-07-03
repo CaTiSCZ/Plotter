@@ -431,7 +431,7 @@ class SignalClient(QWidget):
 
 
 
-        # === Sloupec 2: Sampling & Cesta ===
+        # === Sloupec 2: Sampling  ===
         self.num_packets_label = QLabel("Number of packets (0 = continue):")
         self.num_packets_spinbox = QSpinBox()
         self.num_packets_spinbox.setRange(0, 10000)
@@ -451,6 +451,8 @@ class SignalClient(QWidget):
         self.stop_sampling_button = QPushButton("Stop sampling")
         self.stop_sampling_button.clicked.connect(self.stop_sampling)
         grid.addWidget(self.stop_sampling_button, 3, 11, 1, 2)
+
+        # cute packets dopsat
 
         # === Sloupec 3: LOG ===
         self.log_output = QTextEdit("Log messenge:")
