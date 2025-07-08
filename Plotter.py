@@ -5,7 +5,7 @@ import pyqtgraph as pg
 from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget, QPushButton, QGridLayout, QApplication, QSpinBox, QDoubleSpinBox, QCheckBox, QTextEdit, QScrollArea, QLineEdit, QDesktopWidget, QHBoxLayout, QSizePolicy 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 
-from collections import deque
+from collections import deque, OrderedDict
 import threading
 import time
 
@@ -84,6 +84,16 @@ class SamplingThread(QThread):
         self.sock.settimeout(0.3)
         self.lock = threading.Lock() 
         self.cmd_sock = cmd_sock
+
+        # === Nový mezibuffer pro seřazené packety ===
+        self.packet_buffer = {}
+        self.min_buffer_size = 90
+        self.chunk_size = 30
+        self.last_flushed_order = -1
+        self.lost_packets_counter = 0
+        self.crc_error_counter = 0
+        self.received_packets = 0
+        
     def set_channels_count(self, new_count):
         with self.lock:
             self.channels_count = new_count
@@ -91,10 +101,12 @@ class SamplingThread(QThread):
         while self.running:
             try:
                 pkt, _ = self.sock.recvfrom(4096)
+                
                 if len(pkt) >= 2:
                     packet_type, packet_order = struct.unpack('<HH', pkt[0:4])
 
                     if packet_type == DATA_packet:
+                        self.received_packets += 1
                         if len(pkt) < 4:
                             self.log_signal.emit("[ERR] Received too short packet")
 
@@ -103,41 +115,62 @@ class SamplingThread(QThread):
                         
                         data = verify_crc(pkt)
                         if not data:
+                            self.crc_error_counter += 1
                             self.log_signal.emit(f" [ERR] Invalid packet[{len(pkt)}] {packet_type:04X} {packet_order:5}")
                             continue
 
-                        offset = 4
+                        # === Zahoď packet, pokud je menší než všechny již uložené ===
+                        if self.packet_buffer and packet_order < min(self.packet_buffer.keys()):
+                            self.log_signal.emit(f"[DROP] Packet {packet_order} is older than buffer range, dropped.")
+                            continue
 
-                        with self.lock:
-                            ch_count = self.channels_count
-                        signals = [[] for _ in range(ch_count+1)]
-                        errors = []
+                        # === Přidání do packet_buffer ===
+                        self.packet_buffer[packet_order] = data #možná data
 
-                        x = [packet_order * SAMPLES_PER_PACKET + k for k in range (SAMPLES_PER_PACKET) ]
-                        signals[0].extend(x)
-                        # Čteme data 200 vzorků na kanál
-                        for ch_i in range(ch_count):
-                            sig = struct.unpack('<' + 'h'*SAMPLES_PER_PACKET, data[offset:offset + 2*SAMPLES_PER_PACKET])
-                            signals[ch_i + 1].extend(sig)
-                            offset += 2 * SAMPLES_PER_PACKET
+                        # === Pokud máme alespoň 90, odešleme 30 nejstarších ===
+                        if len(self.packet_buffer) >= self.min_buffer_size:
+                            sorted_keys = sorted(self.packet_buffer.keys())
+                            
+                            to_flush = sorted_keys[:self.chunk_size]
 
-                        # Čteme parity error pro každý kanál (1 byte)
-                        for ch_i in range(ch_count):
-                            errors.append(data[offset])
-                            offset += 1
+                            self.lost_packets_counter += to_flush[-1] - (to_flush[0] + self.chunk_size -1)
+                            
+                            with self.lock:
+                                ch_count = self.channels_count
 
-                        # Padding (když je počet kanálů lichý, přidá se 1 byte)
-                        if ch_count % 2 != 0:
-                            offset += 1
+                            # === Dekódování a přesun dat ===
+                            for order in to_flush:
+                                data = self.packet_buffer.pop(order)
+                    
+                                offset = 4
 
-                        # CRC 2B už jsme ověřili výše
+                                signals = [[] for _ in range(ch_count+1)]
+                                errors = []
 
-                        with self.buffer_lock:
-                            self.signal_buffer[0].extend(signals[0])
-                            for i in range(ch_count):
-                                self.signal_buffer[i+1].extend(signals[i+1])
-                                self.error_buffer[i].extend([errors[i]] * SAMPLES_PER_PACKET)
-                        self.data_ready.emit()
+                                x = [order * SAMPLES_PER_PACKET + k for k in range (SAMPLES_PER_PACKET) ]
+                                signals[0].extend(x)
+                                # Čteme data 200 vzorků na kanál
+                                for ch_i in range(ch_count):
+                                    sig = struct.unpack('<' + 'h'*SAMPLES_PER_PACKET, data[offset:offset + 2*SAMPLES_PER_PACKET])
+                                    signals[ch_i + 1].extend(sig)
+                                    offset += 2 * SAMPLES_PER_PACKET
+
+                                # Čteme parity error pro každý kanál (1 byte)
+                                for ch_i in range(ch_count):
+                                    errors.append(data[offset])
+                                    offset += 1
+
+                                # Padding (když je počet kanálů lichý, přidá se 1 byte)
+                                if ch_count % 2 != 0:
+                                    offset += 1
+
+                                with self.buffer_lock:
+                                    self.signal_buffer[0].extend(signals[0])
+                                    for i in range(ch_count):
+                                        self.signal_buffer[i+1].extend(signals[i+1])
+                                        self.error_buffer[i].extend([errors[i]] * SAMPLES_PER_PACKET)
+                            
+                            self.data_ready.emit()
 
 
                     elif packet_type == TRIGGER_packet and len(pkt) >= 5:
@@ -273,7 +306,7 @@ class SignalClient(QWidget):
         row2.addWidget(self.recv_packets_value, 2, 2)
 
         self.clear_err_button = QPushButton("Clear error stats")
-        #self.clear_err_button.clicked.connect(self.clear_error_stats)
+        self.clear_err_button.clicked.connect(self.clear_error_stats)
         row2.addWidget(self.clear_err_button, 0, 3)
 # X range
         self.x_range_label = QLabel("X range:")
@@ -580,6 +613,12 @@ class SignalClient(QWidget):
                 f"Channel {i}: {count}" for i, count in enumerate(channel_errors))
             self.data_error_label.setText(error_text)
 
+            # === Aktualizace hodnot ztracených a CRC chybných paketů ===
+            if self.sampling_thread:
+                self.lost_packets_value.setText(str(self.sampling_thread.lost_packets_counter))
+                self.err_packets_value.setText(str(self.sampling_thread.crc_error_counter))
+                self.recv_packets_value.setText(str(self.sampling_thread.received_packets))
+
     def packet_counter (self):
         self.received_packets +=1
 
@@ -587,6 +626,16 @@ class SignalClient(QWidget):
         # if self.received_packets == self.num_packets:
         #     self.stop_sampling()
     
+    def clear_error_stats(self):
+        if self.sampling_thread:
+            self.sampling_thread.lost_packets_counter = 0
+            self.sampling_thread.crc_error_counter = 0
+            self.sampling_thread.received_packets = 0
+            self.lost_packets_value.setText("0")
+            self.err_packets_value.setText("0")
+            self.recv_packets_value.setText("0")
+        self.log_message("Error counters reset.")
+          
     def log_message(self, msg: str):
         timestamp = time.strftime("%H:%M:%S")
         self.log_output.append(f"[{timestamp}] {msg}")
