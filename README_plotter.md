@@ -9,9 +9,9 @@ GUI
 	GRAF
 		dvě osy XX
 		Nastavování os podle ID packetu XX
-	zaplnění bufferu (buffer sítě - buffer jedna) XX 
-	ERR chybné packety XX
-	ERR chybějící packety XX
+	zaplnění bufferu (buffer sítě - buffer jedna)(zobrazení hotovo) XX 
+	ERR chybné packety (zobrazení hotovo) XX
+	ERR chybějící packety (zobrazení hotovo) XX
 	ERR chybné vzorky
 	počítadlo celkově přijatých packetů XX
 	reset errorových počítadel
@@ -22,14 +22,14 @@ GUI
 	
 	
 	Tlačítka: PING, ID Packet, Register receiver (pole pro zadání adresy), Remove receiver (pole pro zadání adresy), Get receiver
-	Automatizační tlačítko conect provede: get ID, register receiver s adresou plotteru a vypíše connect při úspěškosti obou. XX
-	Tlačítka pro data: Start, start on trigger a stop (dořešit trigger)
+	Automatizační tlačítko conect provede: get ID, register receiver s adresou plotteru a vypíše connect při úspěškosti obou. (zobrazení hotovo) XX
+	Tlačítka pro data: Start, start on trigger a stop 
 	možnost zadat požadovaný počet packetů (0=kontinualnmí)
-	set path a save buffer, pole safe before trigger [čas] XX
-	Ad Hoc Save tlačítko pro jednorázové uložení bufferu jinam
-	výpis path - i s jménem následujícího souboru
-	pole pro nastavení velikosti bufferu v s
-	trigger tlačítko, zatržítko safe on trigger
+	set path a save buffer, pole safe before trigger [čas] (zobrazení hotovo) XX
+	Ad Hoc Save tlačítko pro jednorázové uložení bufferu jinam (zobrazení hotovo) XX
+	výpis path - i s jménem následujícího souboru (zobrazení hotovo) XX
+	pole pro nastavení velikosti bufferu v s (zobrazení hotovo) XX
+	trigger tlačítko, zatržítko safe on trigger (zobrazení hotovo) XX
 
 
 
@@ -38,5 +38,12 @@ vyřešit mechanismy čtení dat z více zařízení
 	
 
 		
+postup práce:
+
+
+buffer
+err count
+ukládání
+různé osy a čtení offsetu dat
 
 		
