@@ -396,7 +396,14 @@ class SignalClient(QWidget):
         grid.addWidget(self.save_on_trigger_checkbox, 4, 2, 1, 3,  alignment=Qt.AlignLeft)      
 
 
-        #doplnit do dalšího řádku trigger position, label a text edit
+#trigger position
+        self.num_packets_label = QLabel("Trigger position:")
+        self.num_packets_spinbox = QSpinBox()
+        self.num_packets_spinbox.setRange(0, BUFFER_SIZE)
+        #self.num_packets_spinbox.setValue(TRIGGER_POSITION)
+
+        grid.addWidget(self.num_packets_label, 5, 0, 1, 2, alignment=Qt.AlignRight)
+        grid.addWidget(self.num_packets_spinbox, 5, 2, 1, 3)
 
         # === Sloupec 1: ID & Registrace ===
 
@@ -452,7 +459,12 @@ class SignalClient(QWidget):
         self.stop_sampling_button.clicked.connect(self.stop_sampling)
         grid.addWidget(self.stop_sampling_button, 3, 11, 1, 2)
 
-        # cute packets dopsat
+        # cute packets dopsat ester egg
+        self.queued_packets = QLabel("Queued packets:")
+        self.queued_packets_value = QLabel("0")
+        grid.addWidget(self.queued_packets, 4, 11)
+        grid.addWidget(self.queued_packets_value, 5, 11, alignment=Qt.AlignCenter)
+
 
         # === Sloupec 3: LOG ===
         self.log_output = QTextEdit("Log messenge:")
