@@ -97,6 +97,11 @@ class SamplingThread(QThread):
     def set_channels_count(self, new_count):
         with self.lock:
             self.channels_count = new_count
+
+    def get_packet_buffer_size(self):
+        with self.lock:
+            return len(self.packet_buffer)
+        
     def run(self):
         while self.running:
             try:
@@ -139,36 +144,8 @@ class SamplingThread(QThread):
                                 ch_count = self.channels_count
 
                             # === Dekódování a přesun dat ===
-                            for order in to_flush:
-                                data = self.packet_buffer.pop(order)
-                    
-                                offset = 4
+                            self.process_packets(to_flush)
 
-                                signals = [[] for _ in range(ch_count+1)]
-                                errors = []
-
-                                x = [order * SAMPLES_PER_PACKET + k for k in range (SAMPLES_PER_PACKET) ]
-                                signals[0].extend(x)
-                                # Čteme data 200 vzorků na kanál
-                                for ch_i in range(ch_count):
-                                    sig = struct.unpack('<' + 'h'*SAMPLES_PER_PACKET, data[offset:offset + 2*SAMPLES_PER_PACKET])
-                                    signals[ch_i + 1].extend(sig)
-                                    offset += 2 * SAMPLES_PER_PACKET
-
-                                # Čteme parity error pro každý kanál (1 byte)
-                                for ch_i in range(ch_count):
-                                    errors.append(data[offset])
-                                    offset += 1
-
-                                # Padding (když je počet kanálů lichý, přidá se 1 byte)
-                                if ch_count % 2 != 0:
-                                    offset += 1
-
-                                with self.buffer_lock:
-                                    self.signal_buffer[0].extend(signals[0])
-                                    for i in range(ch_count):
-                                        self.signal_buffer[i+1].extend(signals[i+1])
-                                        self.error_buffer[i].extend([errors[i]] * SAMPLES_PER_PACKET)
                             
                             self.data_ready.emit()
 
@@ -188,6 +165,44 @@ class SamplingThread(QThread):
         if self.sock:
             self.sock.close()
             print("Data socket closed.")        
+
+    def process_packets(self, orders: list):
+        with self.lock:
+            ch_count = self.channels_count
+
+        for order in orders:
+            data = self.packet_buffer.pop(order)
+            offset = 4
+
+            signals = [[] for _ in range(ch_count+1)]
+            errors = []
+
+            x = [order * SAMPLES_PER_PACKET + k for k in range(SAMPLES_PER_PACKET)]
+            signals[0].extend(x)
+
+            for ch_i in range(ch_count):
+                sig = struct.unpack('<' + 'h'*SAMPLES_PER_PACKET, data[offset:offset + 2*SAMPLES_PER_PACKET])
+                signals[ch_i + 1].extend(sig)
+                offset += 2 * SAMPLES_PER_PACKET
+
+            for ch_i in range(ch_count):
+                errors.append(data[offset])
+                offset += 1
+
+            if ch_count % 2 != 0:
+                offset += 1
+
+            with self.buffer_lock:
+                self.signal_buffer[0].extend(signals[0])
+                for i in range(ch_count):
+                    self.signal_buffer[i+1].extend(signals[i+1])
+                    self.error_buffer[i].extend([errors[i]] * SAMPLES_PER_PACKET)
+    def flush_packet_buffer(self):
+        if not self.packet_buffer:
+            return
+        sorted_keys = sorted(self.packet_buffer.keys())
+        self.process_packets(sorted_keys)
+        self.data_ready.emit()
 
     def send_trigger_ack(self):
         try:
@@ -251,7 +266,7 @@ class SignalClient(QWidget):
         self.buffer_lock = threading.Lock()
         
         self.sampling_thread = None
-        self.received_packets = 0
+        
         self.num_packets = 0
         self.channels_count = 0
         self.lost_packets = 0
@@ -555,7 +570,7 @@ class SignalClient(QWidget):
             self.sampling_thread.stop()
         self.sampling_thread = SamplingThread(self.udp_my_addr, self.udp_data_port, self.channels_count, self.buffer_lock, self.signal_buffer, self.error_buffer, self.sock)
         self.sampling_thread.log_signal.connect(self.log_message)
-        self.sampling_thread.data_ready.connect(self.packet_counter)
+        #self.sampling_thread.data_ready.connect(self.packet_counter)
         self.sampling_thread.start()
         self.log_message(f"Listening for data on {self.sampling_thread.sock.getsockname()}")
   
@@ -618,13 +633,18 @@ class SignalClient(QWidget):
                 self.lost_packets_value.setText(str(self.sampling_thread.lost_packets_counter))
                 self.err_packets_value.setText(str(self.sampling_thread.crc_error_counter))
                 self.recv_packets_value.setText(str(self.sampling_thread.received_packets))
-
+                queued = self.sampling_thread.get_packet_buffer_size()
+                self.queued_packets_value.setText(str(queued))
+            if self.sampling_thread.received_packets == self.num_packets:
+                self.stop_sampling()
+    
+    
     def packet_counter (self):
         self.received_packets +=1
 
         # this crashes hw
-        # if self.received_packets == self.num_packets:
-        #     self.stop_sampling()
+        if self.received_packets == self.num_packets:
+            self.stop_sampling()
     
     def clear_error_stats(self):
         if self.sampling_thread:
@@ -635,7 +655,7 @@ class SignalClient(QWidget):
             self.err_packets_value.setText("0")
             self.recv_packets_value.setText("0")
         self.log_message("Error counters reset.")
-          
+
     def log_message(self, msg: str):
         timestamp = time.strftime("%H:%M:%S")
         self.log_output.append(f"[{timestamp}] {msg}")
@@ -826,7 +846,7 @@ class SignalClient(QWidget):
             else:
                 self.log_message(f"[WARN] Stop sampling: no or invalid ACK response")
             
-            
+            self.sampling_thread.flush_packet_buffer()
             self.update_plot_buffered()
         else:
             self.log_message("[INFO] Sampling is already stopped")
