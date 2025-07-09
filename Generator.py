@@ -5,6 +5,7 @@ import struct
 import numpy as np
 import argparse
 from collections import deque
+from queue import Queue, Empty
 
 def crc16_ccitt(data: bytes, poly=0x1021, crc=0xFFFF):
     for b in data:
@@ -36,10 +37,11 @@ FORSE_TRIGGER =	9
 #127.0.0.1:9999
 
 class MultiSignalTestGenerator:
-    def __init__(self, ip='127.0.0.1', port=10578, interval=0.001, num_signals = 1):
+    def __init__(self, ip='127.0.0.1', port=10578, interval=0.001, num_signals = 1, print_interval = 1):
         self.ip = ip
         self.port = port
         self.interval = interval
+        self.print_interval = print_interval
         self.num_signals = num_signals
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.ip, self.port))
@@ -53,6 +55,7 @@ class MultiSignalTestGenerator:
         self.sender_thread = None
         self.wait_for_trigger = False
         self.wait_for_response = False
+        self.print_queue = Queue()
 
     def start(self):
         self.running = True 
@@ -64,9 +67,19 @@ class MultiSignalTestGenerator:
         if hasattr(self, 'listener_thread'):
             self.listener_thread.join()
         self.sock.close()
+        while not self.print_queue.empty():
+            print(*self.print_queue.get())
+
+    def print(self, *msg):
+        self.print_queue.put(msg)
+
+    def pop_msg(self, timeout=None):
+        item = self.print_queue.get(timeout=timeout)
+        self.print_queue.task_done()
+        return item
 
     def _listen_for_command(self):
-        print("Čekám na příkazový paket...")
+        self.print("Čekám na příkazový paket...")
         while self.running:
             try:
                 cmd_data, addr = self.sock.recvfrom(1024)
@@ -80,7 +93,7 @@ class MultiSignalTestGenerator:
             command_type = struct.unpack('<I', cmd_data[:4])[0]
 
             if command_type == PING:
-                print("Přijat ping.")
+                self.print("Přijat ping.")
                 response = struct.pack('<HHI', ACK_packet, 0, command_type)  # Packet type, error, CMD
                 self.sock.sendto(response, addr)
 
@@ -99,17 +112,17 @@ class MultiSignalTestGenerator:
             elif command_type == START_SAMPLING or command_type == START_ON_TRIGGER: 
                 command_type = struct.unpack('<I', cmd_data[:4])[0]
                 if len(cmd_data) < 8:
-                    print(f"⚠️ CMD {command_type} má nedostatečnou délku.")
+                    self.print(f"⚠️ CMD {command_type} má nedostatečnou délku.")
                     
                 _, num_packets = struct.unpack('<II', cmd_data)
-                print(f"Přijat příkaz: typ={command_type}, počet paketů={num_packets}")
+                self.print(f"Přijat příkaz: typ={command_type}, počet paketů={num_packets}")
 
                 self.num_packets_to_send = num_packets
                 
                 if command_type == START_SAMPLING:
                     self._start_sampling()
                 else:
-                    print("[INFO] Sampling spuštěn na trigger.")   
+                    self.print("[INFO] Sampling spuštěn na trigger.")   
                     self.wait_for_trigger = True
              
                 response = struct.pack('<HHIQ', ACK_packet, 0, command_type, self.num_packets_to_send)
@@ -118,14 +131,14 @@ class MultiSignalTestGenerator:
             elif command_type == STOP_SAMPLING:
                 # Stop sampling
                 self.sampling = False
-                print(f"[INFO] Sampling zastaven, odesláno paketů: {self.packets_sent}")
+                self.print(f"[INFO] Sampling zastaven, odesláno paketů: {self.packets_sent}")
 
                 # Odpověď: ACK + CMD + počet odeslaných paketů
                 response = struct.pack('<HHIQ', ACK_packet, 0, command_type, self.packets_sent)
                 self.sock.sendto(response, addr)
 
             elif command_type == TRIGGER_ACK:
-                print("[INFO] Přijat Trigger ACK(CMD 8)")
+                self.print("[INFO] Přijat Trigger ACK(CMD 8)")
                 self.wait_for_response = False
 
             elif command_type == FORSE_TRIGGER:
@@ -133,7 +146,7 @@ class MultiSignalTestGenerator:
                 self._trigger()
 
             else:
-                print(f"Neznámý příkaz typu {command_type}")
+                self.print(f"Neznámý příkaz typu {command_type}")
 
     def _send_identification_packet(self, addr):
         packet_type = ID_packet
@@ -217,9 +230,9 @@ class MultiSignalTestGenerator:
         receiver = (ip, port)
         if receiver not in self.receivers:
             self.receivers.append(receiver)
-            print(f"Registrován nový přijímač: {receiver}")
+            self.print(f"Registrován nový přijímač: {receiver}")
         else:
-            print(f"Přijímač už existuje: {receiver}")
+            self.print(f"Přijímač už existuje: {receiver}")
 
         index = self.receivers.index(receiver)
 
@@ -242,9 +255,9 @@ class MultiSignalTestGenerator:
 
         if receiver in self.receivers:
             self.receivers.remove(receiver)
-            print(f"Odstraněn přijímač: {receiver}")
+            self.print(f"Odstraněn přijímač: {receiver}")
         else:
-            print(f"Přijímač nenalezen: {receiver}")
+            self.print(f"Přijímač nenalezen: {receiver}")
 
         response = struct.pack('<HHI', ACK_packet, 0, REMOVE_RECEIVER)
         self.sock.sendto(response, addr)
@@ -270,7 +283,7 @@ class MultiSignalTestGenerator:
             self.sender_thread.start()
 
     def _trigger(self):
-        print("Přijat trigger")
+        self.print("Přijat trigger")
         if self.sampling == True:
             self._trigger_packet()
             
@@ -289,7 +302,7 @@ class MultiSignalTestGenerator:
         self.trigger_packet = struct.pack('<HHB', TRIGGER_packet, self.packet_id, 0)
         for receiver in self.receivers:
             self.sock.sendto(self.trigger_packet, receiver)
-            print("odeslán trigger packet")
+            self.print("odeslán trigger packet")
 
     def _response(self):
         if self.wait_for_response == True:
@@ -298,7 +311,7 @@ class MultiSignalTestGenerator:
             self.response_count += 1
             if self.response_count == 10:
                 self.wait_for_response == False
-                print("odesílání trigger packet selhalo")
+                self.print("odesílání trigger packet selhalo")
         
 
     def _send_data_to_all_receivers(self):
@@ -307,17 +320,30 @@ class MultiSignalTestGenerator:
         packet_size = 200
         base_signal = np.linspace(-32768, 32767, period_length, dtype=np.int16)
         
-        print("[INFO] Zahájeno odesílání dat...")
+        self.print("[INFO] Zahájeno odesílání dat...")
+
+        t0 = time.monotonic()
+        t_send = t0
+        t_print = t0
+        last_sent = 0
 
         while self.running:         
             
             if not self.sampling:
                 time.sleep(0.1)
+                t0 = time.monotonic()
+                t_send = t0
+                t_print = t0
+                last_sent = 0
                 continue
 
             if not self.receivers:
-                print("[WAIT] Žádní příjemci. Čekám...")
+                self.print("[WAIT] Žádní příjemci. Čekám...")
                 time.sleep(1)
+                t0 = time.monotonic()
+                t_send = t0
+                t_print = t0
+                last_sent = 0
                 continue
 
             signals = []
@@ -351,10 +377,18 @@ class MultiSignalTestGenerator:
             self.packets_sent += 1
 
             if self.num_packets_to_send != 0 and self.packets_sent >= self.num_packets_to_send:
-                print("[INFO] Všechny požadované pakety odeslány.")
+                self.print(f"[INFO] Všechny požadované pakety odeslány ({self.packets_sent} / {self.num_packets_to_send}).")
                 self.sampling = False  # automaticky zastavit sampling
 
-            time.sleep(self.interval)
+            t = time.monotonic()
+            t_send += self.interval
+            pause = t_send - t
+            if t >= t_print:
+                t_print += self.print_interval
+                self.print(f"{t-t0:10.3f}: sent {self.packets_sent:12} packets ({(self.packets_sent - last_sent) // self.print_interval} packets / s), delay is {pause:9.6f} seconds")
+                last_sent = self.packets_sent
+            if pause > 0:
+                time.sleep(pause)
 
 
 
@@ -367,9 +401,12 @@ if __name__ == '__main__':
     gen.start()
     print(f"Generátor připraven (signálů: {args.signals}). Čekám na příkaz.")
 
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\nUkončuji...")
-        gen.stop()
+    while True:
+        try:
+            print(*gen.pop_msg(0.1))
+        except Empty:
+            pass
+        except KeyboardInterrupt:
+            print("\nUkončuji...")
+            gen.stop()
+            break

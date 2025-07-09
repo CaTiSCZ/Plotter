@@ -106,12 +106,12 @@ class SamplingThread(QThread):
         while self.running:
             try:
                 pkt, _ = self.sock.recvfrom(4096)
-                
+                self.received_packets += 1
                 if len(pkt) >= 2:
                     packet_type, packet_order = struct.unpack('<HH', pkt[0:4])
 
                     if packet_type == DATA_packet:
-                        self.received_packets += 1
+                        #self.received_packets += 1
                         if len(pkt) < 4:
                             self.log_signal.emit("[ERR] Received too short packet")
 
@@ -152,6 +152,7 @@ class SamplingThread(QThread):
 
                     elif packet_type == TRIGGER_packet and len(pkt) >= 5:
                         # Trigger packet
+                        self.received_packets -= 1
                         packet_num, sample_num = struct.unpack('<HB', pkt[2:5])
                         self.log_signal.emit(f"[TRIGGER] Trigger packet received (packet_num={packet_num}, sample_num={sample_num})")
                         self.send_trigger_ack()  
