@@ -396,6 +396,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Testovací UDP generátor více signálů")
     parser.add_argument('--signals', type=int, default=2, help="Počet signálů v jednom packetu")
     args = parser.parse_args()
+    
 
     gen = MultiSignalTestGenerator(num_signals=args.signals)
     gen.start()
