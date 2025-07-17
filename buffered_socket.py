@@ -10,7 +10,7 @@ class UDPRelay:
         self.sock = None
         self.sock_lock = threading.Lock()
 
-        self.receive_buffer = queue.Queue(maxsize=1000)
+        self.receive_buffer = queue.Queue()
         self.send_buffer = queue.Queue(maxsize=1000)
 
         self.running = False
@@ -115,7 +115,7 @@ class UDPRelay:
             raise socket.timeout("recvfrom timeout vypršel")
 
     def get_received_count(self):
-        return self._received_count
+        return self.receive_buffer.qsize()
 
     def close(self):
         self.stop()

@@ -27,6 +27,8 @@ SAMPLING_PERIOD = 1/SAMPLES_PER_PACKET/PACKET_RATE_HZ # 1 packet/s, 200 vzorků/
 BUFFER_LENGTH_S = 10   # délka bufferu v s
 BUFFER_SIZE = int ( BUFFER_LENGTH_S * SAMPLES_PER_PACKET * PACKET_RATE_HZ )
 SIGNAL_TYPE = np.int16
+MAX_ORDER = 65536
+OVERFLOW_THRESHOLD = 50
 
 # ---------------------- CMD a packety -------------------
 ACK_packet = 0
@@ -45,6 +47,7 @@ START_ON_TRIGGER = 6
 STOP_SAMPLING = 7
 TRIGGER_ACK = 8
 FORSE_TRIGGER =	9
+
 # ---------------------- CRC CCITT ----------------------
 def crc16_ccitt(data: bytes, poly=0x1021, crc=0xFFFF):
     for b in data:
@@ -82,6 +85,7 @@ class SamplingThread(QThread):
         self.udp_device_addr = udp_device_addr
         self.udp_device_port = udp_device_port
         self.udp_data_port = udp_data_port
+        self.last_packet_order = None
         
         self.udprelay = UDPRelay()
         self.udprelay.bind(port=self.udp_data_port, use_my_ip=use_my_ip, device_ip=self.udp_device_addr, device_port=self.udp_device_port)
@@ -131,28 +135,38 @@ class SamplingThread(QThread):
                             self.log_signal.emit(f" [ERR] Invalid packet[{len(pkt)}] {packet_type:04X} {packet_order:5}")
                             continue
 
-                        # === Zahoď packet, pokud je menší než všechny již uložené ===
-                        if self.packet_buffer and packet_order < min(self.packet_buffer.keys()):
-                            self.log_signal.emit(f"[DROP] Packet {packet_order} is older than buffer range, dropped.")
-                            continue
+                        # === Detekce přetečení packet_order ===
+                        if self.last_packet_order is not None:
+                            if self.last_packet_order > (MAX_ORDER - OVERFLOW_THRESHOLD) and packet_order < OVERFLOW_THRESHOLD:
+                                self.log_signal.emit(
+                                    f"[INFO] Overflow detected: {self.last_packet_order} → {packet_order}, flushing buffer and starting new cycle."
+                                )
+                                self.flush_packet_buffer()
+                                self.packet_buffer.clear()
+                                self.last_flushed_order = -1
+                            elif self.last_flushed_order > packet_order:
+                                self.log_signal.emit(f"[DROP] Packet {packet_order} is older than last flushed {self.last_flushed_order}, dropping.")
+                                continue
+
 
                         # === Přidání do packet_buffer ===
-                        self.packet_buffer[packet_order] = data #možná data
+                        self.packet_buffer[packet_order] = data 
+                        self.last_packet_order = packet_order
 
                         # === Pokud máme alespoň 90, odešleme 30 nejstarších ===
                         if len(self.packet_buffer) >= self.min_buffer_size:
                             sorted_keys = sorted(self.packet_buffer.keys())
                             
                             to_flush = sorted_keys[:self.chunk_size]
-
+ 
                             self.lost_packets_counter += to_flush[-1] - (to_flush[0] + self.chunk_size -1)
-                            
+                                                       
                             with self.lock:
                                 ch_count = self.channels_count
 
                             # === Dekódování a přesun dat ===
                             self.process_packets(to_flush)
-                          
+                            self.last_flushed_order = to_flush[-1]
                             self.data_ready.emit()
 
 
@@ -201,6 +215,7 @@ class SamplingThread(QThread):
                 for i in range(ch_count):
                     self.signal_buffer[i+1].extend(signals[i+1])
                     self.error_buffer[i].extend([errors[i]] * SAMPLES_PER_PACKET)
+    
     def flush_packet_buffer(self):
         if not self.packet_buffer:
             return
@@ -268,6 +283,7 @@ class SignalClient(QWidget):
         self.channels_count = 0
         self.lost_packets = 0
         self.err_packets = 0
+        
 
         # === Inicializace okna ===
         self.setWindowTitle("UDP Signal Client")
@@ -510,7 +526,7 @@ class SignalClient(QWidget):
 
         # cute packets dopsat ester egg
         self.queued_packets = QLabel("Queued packets:")
-        self.queued_packets_value = QLabel("0")
+        self.queued_packets_value = QLabel("0 ; 0")
         grid.addWidget(self.queued_packets, 4, 11)
         grid.addWidget(self.queued_packets_value, 5, 11, alignment=Qt.AlignCenter)
 
@@ -628,8 +644,9 @@ class SignalClient(QWidget):
                 self.lost_packets_value.setText(str(self.sampling_thread.lost_packets_counter))
                 self.err_packets_value.setText(str(self.sampling_thread.crc_error_counter))
                 self.recv_packets_value.setText(str(self.sampling_thread.received_packets))
-                queued = self.udp_relay.get_received_count()
-                self.queued_packets_value.setText(str(queued))
+                queued = self.sampling_thread.udprelay.get_received_count()
+                buffered = self.sampling_thread.get_packet_buffer_size()
+                self.queued_packets_value.setText(f" buf socket: {queued} ; sequencing buffer: {buffered}")
             if self.sampling_thread.received_packets == self.num_packets:
                 self.stop_sampling()
     
@@ -791,7 +808,7 @@ class SignalClient(QWidget):
             self.log_message(f"[ERR] Get receivers: {e}")
     
     def start_sampling(self):
-        self.received_packets = 0
+        self.sampling_thread.received_packets = 0
         self.num_packets = self.num_packets_spinbox.value()
         data = struct.pack('<I', self.num_packets)
         if self.channels_count == 0:
@@ -803,7 +820,7 @@ class SignalClient(QWidget):
         self.log_message(f"[OK] Start sampling, {self.num_packets} packets")
 
     def start_on_trigger(self):
-            self.received_packets = 0
+            self.sampling_thread.received_packets = 0
             self.num_packets = self.num_packets_spinbox.value()
             data = struct.pack('<I', self.num_packets)
             if self.channels_count == 0:
@@ -816,7 +833,7 @@ class SignalClient(QWidget):
 
     def stop_sampling(self):
         if self.sampling_thread and self.sampling_thread.isRunning():
-            self.log_message(f"[OK] Stop sampling, received packets: {self.received_packets}")
+            self.log_message(f"[OK] Stop sampling, received packets: {self.sampling_thread.received_packets}")
             resp = self.send_command(STOP_SAMPLING, expect_response=True)
             
             if resp and len(resp) >= 16:  # 2+2+4+8 = 16 bajtů
@@ -824,8 +841,8 @@ class SignalClient(QWidget):
                 
                 if packet_type == ACK_packet and cmd_type == STOP_SAMPLING:
                     #self.log_message(f"[OK] Stop sampling confirmed, packets sent by divice: {packets_sent}")
-                    if packets_sent != self.received_packets:
-                        self.log_message(f"[WORNING] packet from device ({packets_sent}) not equal to recv packets ({self.received_packets}) ")
+                    if packets_sent != self.sampling_thread.received_packets:
+                        self.log_message(f"[WARN] packet from device ({packets_sent}) not equal to recv packets ({self.sampling_thread.received_packets}) ")
                 else:
                     self.log_message(f"[WARN] Stop sampling: unexpected ACK structure or CMD")
             else:
