@@ -17,12 +17,11 @@ class UDPRelay:
         self.listener_thread = None
         self.sender_thread = None
         self._timeout = 5.0
+        self._received_count = 0
 
     def bind(self, port: int, use_my_ip: bool = False, device_ip: str = "192.168.1.100", device_port: int = "9999"): 
         self.stop()
         with self.sock_lock:
-            
-
             if use_my_ip:
                 try:
                     tmp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -40,7 +39,7 @@ class UDPRelay:
             self.sock.bind(self.addr)
             self.sock.settimeout(5.0)
             self.start()
-            print(f"[INFO] Bound to {self.addr[0]}:{self.addr[1]}")      
+            #print(f"[INFO] Bound to {self.addr[0]}:{self.addr[1]}")      
 
     def start(self):
         if not self.sock:
@@ -76,7 +75,7 @@ class UDPRelay:
                 data, addr = self.sock.recvfrom(4096)
                 #print(f"[DEBUG] Příchozí data od {addr}: {data}")
                 self.receive_buffer.put((data, addr))
-                
+                self._received_count += 1
             except socket.timeout:
                 #print("timeout")
                 continue
@@ -115,6 +114,8 @@ class UDPRelay:
         except queue.Empty:
             raise socket.timeout("recvfrom timeout vypršel")
 
+    def get_received_count(self):
+        return self._received_count
 
     def close(self):
         self.stop()

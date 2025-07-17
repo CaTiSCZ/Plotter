@@ -72,17 +72,20 @@ def verify_crc(pkt):
 class SamplingThread(QThread):
     data_ready = pyqtSignal()
     log_signal = pyqtSignal(str)
-    def __init__(self, udprelay, ch, buffer_lock, signal_buffer, error_buffer, 
-                 udp_device_addr, udp_device_port, udp_data_port):
+    def __init__(self, ch, buffer_lock, signal_buffer, error_buffer, 
+                 udp_device_addr, udp_device_port, udp_data_port, use_my_ip):
         super().__init__()
         self.channels_count = ch
-        self.udprelay = udprelay
         self.buffer_lock = buffer_lock
         self.signal_buffer = signal_buffer
         self.error_buffer = error_buffer
         self.udp_device_addr = udp_device_addr
         self.udp_device_port = udp_device_port
         self.udp_data_port = udp_data_port
+        
+        self.udprelay = UDPRelay()
+        self.udprelay.bind(port=self.udp_data_port, use_my_ip=use_my_ip, device_ip=self.udp_device_addr, device_port=self.udp_device_port)
+        
 
         self.running = True
         #self.sock.settimeout(0.3)
@@ -560,9 +563,9 @@ class SignalClient(QWidget):
         if self.sampling_thread and self.sampling_thread.isRunning():
             self.sampling_thread.stop()
 
-        self.sampling_thread = SamplingThread(self.udp_relay, self.channels_count,
-                                              self.buffer_lock, self.signal_buffer, self.error_buffer,self.udp_device_addr,self.udp_device_port, self.udp_data_port)
-        self.sampling_thread.log_signal.connect(self.log_message)
+        self.sampling_thread = SamplingThread(self.channels_count,
+                                              self.buffer_lock, self.signal_buffer, self.error_buffer,self.udp_device_addr,self.udp_device_port, self.udp_data_port, use_my_ip)
+        self.sampling_thread.log_signal.connect(self.log_message)   
         self.sampling_thread.start()
         self.log_message(f"Listening for data on {self.udp_data_port}") #bez ověření z udprelay
   
@@ -625,7 +628,7 @@ class SignalClient(QWidget):
                 self.lost_packets_value.setText(str(self.sampling_thread.lost_packets_counter))
                 self.err_packets_value.setText(str(self.sampling_thread.crc_error_counter))
                 self.recv_packets_value.setText(str(self.sampling_thread.received_packets))
-                queued = self.sampling_thread.get_packet_buffer_size()
+                queued = self.udp_relay.get_received_count()
                 self.queued_packets_value.setText(str(queued))
             if self.sampling_thread.received_packets == self.num_packets:
                 self.stop_sampling()
@@ -820,7 +823,9 @@ class SignalClient(QWidget):
                 packet_type, error_state, cmd_type, packets_sent = struct.unpack('<HHIQ', resp[:16])
                 
                 if packet_type == ACK_packet and cmd_type == STOP_SAMPLING:
-                    self.log_message(f"[OK] Stop sampling confirmed, packets sent by divice: {packets_sent}")
+                    #self.log_message(f"[OK] Stop sampling confirmed, packets sent by divice: {packets_sent}")
+                    if packets_sent != self.received_packets:
+                        self.log_message(f"[WORNING] packet from device ({packets_sent}) not equal to recv packets ({self.received_packets}) ")
                 else:
                     self.log_message(f"[WARN] Stop sampling: unexpected ACK structure or CMD")
             else:
