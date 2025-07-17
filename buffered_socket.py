@@ -5,12 +5,10 @@ import time
 
 
 class UDPRelay:
-    def __init__(self, host='127.0.0.1', port=9999):
-        self.addr = (host, port)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(self.addr)
+    def __init__(self):
+        self.addr = None
+        self.sock = None
         self.sock_lock = threading.Lock()
-        self.sock.settimeout(5.0)
 
         self.receive_buffer = queue.Queue(maxsize=1000)
         self.send_buffer = queue.Queue(maxsize=1000)
@@ -19,7 +17,21 @@ class UDPRelay:
         self.listener_thread = None
         self.sender_thread = None
 
+    def bind(self, host: str, port: int):
+        """Nastaví IP/port a vytvoří nový socket."""
+        self.addr = (host, port)
+        with self.sock_lock:
+            if self.sock:
+                self.sock.close()
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.bind(self.addr)
+            self.sock.settimeout(5.0)
+        print(f"[INFO] Bound to {host}:{port}")        
+
     def start(self):
+        if not self.sock:
+            raise RuntimeError("Nejdřív zavolej bind() pro nastavení IP a portu.")
+
         self.running = True
         if self.listener_thread is None or not self.listener_thread.is_alive():
             self.listener_thread = threading.Thread(target=self.listen_loop, daemon=True)
@@ -32,7 +44,9 @@ class UDPRelay:
         self.running = False
         try:
             with self.sock_lock:
-                self.sock.close()  # Uzavři socket jako první, tím odblokuješ recvfrom
+                if self.sock:
+                    self.sock.close()
+                    self.sock = None
         except Exception as e:
             print(f"[CHYBA] při zavírání socketu: {e}")
         if self.listener_thread and self.listener_thread.is_alive():
@@ -58,15 +72,15 @@ class UDPRelay:
                 break
 
     def send_loop(self):
-        import time
-        last_send = time.time()
+        
+        #last_send = time.time()
         while self.running:
             try:
                 data, addr = self.send_buffer.get(timeout=0.1)
                 self.sock.sendto(data, addr)
-                now = time.time()
+                #now = time.time()
                 #print(f"[ODESLÁNO] na {addr} v čase {now:.3f} (interval {now - last_send:.3f}s): {data.decode('utf-8').strip()}")
-                last_send = now
+                #last_send = now
             except queue.Empty:
                 continue
             except (socket.error, OSError) as e:
@@ -95,6 +109,7 @@ if __name__ == '__main__':
     remote_port = 5001
 
     relay = UDPRelay(local_host, local_port)
+    relay.bind(local_host, local_port)
     relay.start()
 
     print(f"Relay spuštěn. Poslouchám na {local_host}:{local_port}")
@@ -132,9 +147,10 @@ if __name__ == '__main__':
                 relay.stop()
                 break
 
-    input_thread = threading.Thread(target=input_listener, daemon=True)
-    input_thread.start()
+    threading.Thread(target=input_listener, daemon=True).start()
     threading.Thread(target=periodic_sender, daemon=True).start()
+
+
     try:
         while not quit_event.is_set():
             packet = relay.recvfrom()
@@ -149,9 +165,8 @@ if __name__ == '__main__':
         print("\n[INFO] Ukončuji (KeyboardInterrupt)...")
         quit_event.set()
         relay.stop()
-        input_thread.join()
+
     except Exception as e:
         print(f"\n[CHYBA]: {e}")
         quit_event.set()
         relay.stop()
-        input_thread.join()
