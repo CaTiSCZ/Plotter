@@ -8,6 +8,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from collections import deque, OrderedDict
 import threading
 import time
+from buffered_socket import UDPRelay
 
 
 # ---------------------- Parametry ----------------------
@@ -71,19 +72,22 @@ def verify_crc(pkt):
 class SamplingThread(QThread):
     data_ready = pyqtSignal()
     log_signal = pyqtSignal(str)
-    def __init__(self, addr, port, ch, buffer_lock, signal_buffer, error_buffer, cmd_sock):
+    def __init__(self, udprelay, ch, buffer_lock, signal_buffer, error_buffer, 
+                 udp_device_addr, udp_device_port, udp_data_port):
         super().__init__()
         self.channels_count = ch
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((addr, port))
-        self.sock.settimeout(RECV_TIMEOUT)
+        self.udprelay = udprelay
         self.buffer_lock = buffer_lock
         self.signal_buffer = signal_buffer
         self.error_buffer = error_buffer
+        self.udp_device_addr = udp_device_addr
+        self.udp_device_port = udp_device_port
+        self.udp_data_port = udp_data_port
+
         self.running = True
-        self.sock.settimeout(0.3)
+        #self.sock.settimeout(0.3)
         self.lock = threading.Lock() 
-        self.cmd_sock = cmd_sock
+        #self.cmd_sock = cmd_sock
 
         # === Nový mezibuffer pro seřazené packety ===
         self.packet_buffer = {}
@@ -105,7 +109,7 @@ class SamplingThread(QThread):
     def run(self):
         while self.running:
             try:
-                pkt, _ = self.sock.recvfrom(4096)
+                pkt, _ = self.udprelay.recvfrom(4096)
                 self.received_packets += 1
                 if len(pkt) >= 2:
                     packet_type, packet_order = struct.unpack('<HH', pkt[0:4])
@@ -145,8 +149,7 @@ class SamplingThread(QThread):
 
                             # === Dekódování a přesun dat ===
                             self.process_packets(to_flush)
-
-                            
+                          
                             self.data_ready.emit()
 
 
@@ -159,13 +162,10 @@ class SamplingThread(QThread):
 
                     else:
                         print(f"[ERR] wrong packet, {pkt}")
-                        
-                         
+                                             
             except socket.timeout:
                 pass
-        if self.sock:
-            self.sock.close()
-            print("Data socket closed.")        
+            
 
     def process_packets(self, orders: list):
         with self.lock:
@@ -208,13 +208,11 @@ class SamplingThread(QThread):
     def send_trigger_ack(self):
         try:
             packet = struct.pack('<I', TRIGGER_ACK)
-            self.cmd_sock.sendto(packet, (UDP_DEVICE_IP, UDP_PORT_SEND))
+            self.udprelay.sendto(packet, (self.udp_device_addr, self.udp_data_port))
             self.log_signal.emit("[ACK] Trigger ACK send")
         except Exception as e:
             print(f"[ERR] Sendind Trigger ACK failed: {e}")
-            
-
-
+      
     def stop(self):
         self.running = False
         self.quit()
@@ -247,25 +245,20 @@ def parse_id_packet(data):
         'channels_count': unpacked[18],
     }
 
-
 # -------------------- GUI s více tlačítky ----------------------
-
 class SignalClient(QWidget):
     data_received = pyqtSignal(int, float, bool)
 
     def __init__(self):
         super().__init__()
         
-        self.udp_cmd_port  = UDP_PORT_SEND
-        self.udp_ack_port  = UDP_PORT_RECV
-        self.udp_data_port = UDP_PORT_DATA
-
+        self.udp_relay = UDPRelay()
         self.udp_device_addr = UDP_DEVICE_IP
-
-        self.sock = None
+        self.udp_device_port = UDP_PORT_SEND #generátor
+        self.udp_ack_port = UDP_PORT_RECV #klient pro ack
+        self.udp_data_port = UDP_PORT_DATA #klient pro data
 
         self.buffer_lock = threading.Lock()
-        
         self.sampling_thread = None
         
         self.num_packets = 0
@@ -401,7 +394,7 @@ class SignalClient(QWidget):
         grid = QGridLayout()
 
         # === Sloupec 0: GENERÁTOR & KLIENT IP ===
-        self.generator_ip_edit = QLineEdit(f"{self.udp_device_addr}:{self.udp_cmd_port}")
+        self.generator_ip_edit = QLineEdit(f"{self.udp_device_addr}:{self.udp_device_port}")
         grid.addWidget(QLabel("Device address:"), 0, 0, 1, 5)
         grid.addWidget(self.generator_ip_edit, 1, 0, 1, 2)
         self.confirm_generator_button = QPushButton("Use")
@@ -415,11 +408,15 @@ class SignalClient(QWidget):
 #ploter ports
         grid.addWidget(QLabel("Plotter ports:"), 2, 0, 1, 5)
 
+        self.listen_all_checkbox = QCheckBox("Listen on all IPs")
+        self.listen_all_checkbox.setChecked(True) 
+        
         self.cmd_label = QLabel("CMD:")
         self.command_port_edit = QLineEdit(str(self.udp_ack_port))
         self.command_port_edit.returnPressed.connect(self.init_sockets)
         grid.addWidget(self.cmd_label, 3, 0, alignment=Qt.AlignRight)
         grid.addWidget(self.command_port_edit, 3, 1, alignment=Qt.AlignLeft)
+        grid.addWidget(self.listen_all_checkbox, 2, 2, 1, 3)
 
         self.data_label = QLabel("DATA:")
         self.data_port_edit = QLineEdit(str(self.udp_data_port))
@@ -532,7 +529,7 @@ class SignalClient(QWidget):
         self.signal_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count+1)]
         self.error_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count)]
         self.init_curves()
-
+        
         self.init_sockets()
 
         self.timer = QTimer()
@@ -551,29 +548,23 @@ class SignalClient(QWidget):
         self.curves = [self.plot.plot(pen=pg.intColor(i, hues=self.channels_count)) for i in range(self.channels_count)]
 
     def init_sockets(self):
+        #print("Init sockets called")
         self.udp_data_port = int(self.data_port_edit.text())
         self.udp_ack_port = int(self.command_port_edit.text())
-        self.udp_device_addr, self.udp_cmd_port = self.generator_ip_edit.text().split(':', 1)
-        self.udp_cmd_port = int(self.udp_cmd_port)
-        if self.sock:
-            self.sock.close()
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.connect((self.udp_device_addr, self.udp_cmd_port)) # abych mohl zjistit svou adresu, potřebuji se připojit na zařízení
-        self.udp_my_addr = self.sock.getsockname()[0]
-        self.sock.close()
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((self.udp_my_addr, self.udp_ack_port))
-        self.sock.connect((self.udp_device_addr, self.udp_cmd_port))
-        self.sock.settimeout(RECV_TIMEOUT)
-        self.log_message(f"Connected to {self.sock.getpeername()} from {self.sock.getsockname()}")
+        self.udp_device_addr, self.udp_device_port = self.generator_ip_edit.text().split(':', 1)
+        self.udp_device_port = int(self.udp_device_port)
+        use_my_ip = not self.listen_all_checkbox.isChecked()
+        self.udp_relay.bind(port=self.udp_ack_port, use_my_ip=use_my_ip, device_ip=self.udp_device_addr, device_port=self.udp_device_port)  
+        self.log_message(f"Relay bound to {self.udp_ack_port}")
 
         if self.sampling_thread and self.sampling_thread.isRunning():
             self.sampling_thread.stop()
-        self.sampling_thread = SamplingThread(self.udp_my_addr, self.udp_data_port, self.channels_count, self.buffer_lock, self.signal_buffer, self.error_buffer, self.sock)
+
+        self.sampling_thread = SamplingThread(self.udp_relay, self.channels_count,
+                                              self.buffer_lock, self.signal_buffer, self.error_buffer,self.udp_device_addr,self.udp_device_port, self.udp_data_port)
         self.sampling_thread.log_signal.connect(self.log_message)
-        #self.sampling_thread.data_ready.connect(self.packet_counter)
         self.sampling_thread.start()
-        self.log_message(f"Listening for data on {self.sampling_thread.sock.getsockname()}")
+        self.log_message(f"Listening for data on {self.udp_data_port}") #bez ověření z udprelay
   
     def on_auto_range_changed(self, state):
         self.auto_x_range = self.auto_x_range_checkbox.isChecked()
@@ -639,14 +630,6 @@ class SignalClient(QWidget):
             if self.sampling_thread.received_packets == self.num_packets:
                 self.stop_sampling()
     
-    
-    def packet_counter (self):
-        self.received_packets +=1
-
-        # this crashes hw
-        if self.received_packets == self.num_packets:
-            self.stop_sampling()
-    
     def clear_error_stats(self):
         if self.sampling_thread:
             self.sampling_thread.lost_packets_counter = 0
@@ -663,28 +646,24 @@ class SignalClient(QWidget):
 
     def send_command(self, cmd: int, data: bytes = b'', expect_response: bool = False, expected_packets: int = 1):
         pkt = struct.pack('<I', cmd) + data
-        self.sock.send(pkt)
-        
+        self.udp_relay.sendto(pkt, (self.udp_device_addr, self.udp_device_port)) 
+
         if not expect_response:
             return None
 
         responses = []
-        self.sock.settimeout(0.3)
+        self.udp_relay.settimeout(0.3)
         try:
             for _ in range(expected_packets):
-                resp, _ = self.sock.recvfrom(1024)
+                resp, _ = self.udp_relay.recvfrom(1024) 
                 responses.append(resp)
-        except socket.timeout:
-
-
-# je tam tohle na místě??
+        except socket.timeout: #???
             if not responses:
                 print(f"[TIMEOUT] CMD {cmd}: no response")
             else:
-                print(f"[INFO] CMD {cmd}: received {len(responses)} / {expected_packets} pakets")
-        finally:
-            self.sock.settimeout(None)
-
+                print(f"[INFO] CMD {cmd}: received {len(responses)} / {expected_packets} packets")
+        #finally:
+            #self.sock.settimeout(None)
         return responses if expected_packets > 1 else (responses[0] if responses else None)
 
     def ping(self):
@@ -851,9 +830,7 @@ class SignalClient(QWidget):
             self.update_plot_buffered()
         else:
             self.log_message("[INFO] Sampling is already stopped")
-
-        
-    
+ 
     def send_trigger(self):
         try:
             resp = self.send_command(FORSE_TRIGGER)
@@ -863,8 +840,6 @@ class SignalClient(QWidget):
             self.log_message(f"[ERR] Trigger send: {e}")
     
     def clear_plot(self):
-            
-
         # Vyčistit buffery
         with self.buffer_lock:
             for buf in self.signal_buffer:
@@ -887,17 +862,10 @@ class SignalClient(QWidget):
             print("Zastavuji příjem dat...")
             self.sampling_thread.stop()
 
-        if self.sock:
-            self.sock.close()
-            print("Socket uzavřen.")
+        self.udp_relay.close()
 
         self.timer.stop()
         event.accept()
-
-
-
-
-
 
 # Spuštění aplikace
 QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)

@@ -16,17 +16,31 @@ class UDPRelay:
         self.running = False
         self.listener_thread = None
         self.sender_thread = None
+        self._timeout = 5.0
 
-    def bind(self, host: str, port: int):
-        """Nastaví IP/port a vytvoří nový socket."""
-        self.addr = (host, port)
+    def bind(self, port: int, use_my_ip: bool = False, device_ip: str = "192.168.1.100", device_port: int = "9999"): 
+        self.stop()
         with self.sock_lock:
-            if self.sock:
-                self.sock.close()
+            
+
+            if use_my_ip:
+                try:
+                    tmp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    tmp_sock.connect((device_ip, device_port))  
+                    local_ip = tmp_sock.getsockname()[0]
+                    tmp_sock.close()
+                    print(f"[INFO] Detekovaná vlastní IP: {local_ip}")
+                except Exception as e:
+                    raise RuntimeError(f"Chyba při zjišťování vlastní IP: {e}")
+            else:
+                local_ip = "0.0.0.0"
+
+            self.addr = (local_ip, port)
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.bind(self.addr)
             self.sock.settimeout(5.0)
-        print(f"[INFO] Bound to {host}:{port}")        
+            self.start()
+            print(f"[INFO] Bound to {self.addr[0]}:{self.addr[1]}")      
 
     def start(self):
         if not self.sock:
@@ -90,12 +104,17 @@ class UDPRelay:
 
     def sendto(self, data: bytes, addr):
         self.send_buffer.put((data, addr))
-
-    def recvfrom(self):
+    
+    def settimeout(self, timeout):
+        self._timeout = timeout
+        
+    def recvfrom(self, bufsize):
         try:
-            return self.receive_buffer.get_nowait()
+            data, addr = self.receive_buffer.get(timeout=self._timeout)
+            return data[:bufsize], addr  # <<< zde aplikujeme bufsize limit
         except queue.Empty:
-            return None
+            raise socket.timeout("recvfrom timeout vypršel")
+
 
     def close(self):
         self.stop()
@@ -108,9 +127,9 @@ if __name__ == '__main__':
     remote_host = '127.0.0.1'
     remote_port = 5001
 
-    relay = UDPRelay(local_host, local_port)
-    relay.bind(local_host, local_port)
-    relay.start()
+    relay = UDPRelay()
+    relay.bind(port=local_port, use_my_ip=True, device_ip=remote_host)
+    
 
     print(f"Relay spuštěn. Poslouchám na {local_host}:{local_port}")
     print("Zmáčkni 's' pro zapnutí/vypnutí odesílání \"Ahoj\" každou sekundu.")
@@ -153,7 +172,7 @@ if __name__ == '__main__':
 
     try:
         while not quit_event.is_set():
-            packet = relay.recvfrom()
+            packet = relay.recvfrom(4096)
             if packet:
                 data, addr = packet
                 text = data.decode('utf-8', errors='ignore')
