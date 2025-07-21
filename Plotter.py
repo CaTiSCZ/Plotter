@@ -112,7 +112,10 @@ class SamplingThread(QThread):
     def get_packet_buffer_size(self):
         with self.lock:
             return len(self.packet_buffer)
-        
+    def set_buffers(self, signal_buffer, error_buffer):
+        with self.lock:
+            self.signal_buffer = signal_buffer
+            self.error_buffer = error_buffer    
     def run(self):
         while self.running:
             try:
@@ -186,7 +189,7 @@ class SamplingThread(QThread):
 
     def process_packets(self, orders: list):
         with self.lock:
-            ch_count = self.channels_count
+            ch_count = min(self.channels_count, len(self.signal_buffer) - 1, len(self.error_buffer))
 
         for order in orders:
             data = self.packet_buffer.pop(order)
@@ -276,9 +279,13 @@ class SignalClient(QWidget):
         self.udp_ack_port = UDP_PORT_RECV #klient pro ack
         self.udp_data_port = UDP_PORT_DATA #klient pro data
 
+        self.buffer_length_s = BUFFER_LENGTH_S
+        self.buffer_size = BUFFER_SIZE
+
         self.buffer_lock = threading.Lock()
         self.sampling_thread = None
-        
+
+       
         self.num_packets = 0
         self.channels_count = 0
         self.lost_packets = 0
@@ -339,11 +346,12 @@ class SignalClient(QWidget):
 # X range
         self.x_range_label = QLabel("X range:")
         self.x_range_spinbox = QDoubleSpinBox()
-        self.x_range_spinbox.setRange(0, BUFFER_SIZE/SAMPLES_PER_PACKET)
+        self.x_range_spinbox.setRange(0, self.buffer_size/SAMPLES_PER_PACKET)
         self.x_range_spinbox.setValue(200)
         self.x_range_spinbox.setSuffix(" ms")
         row2.addWidget(self.x_range_label, 0, 4, alignment=Qt.AlignRight)
         row2.addWidget(self.x_range_spinbox, 0, 5, alignment=Qt.AlignLeft)
+        self.x_range_spinbox.valueChanged.connect(self.update_plot_buffered)
 
 
 # --- Y Min ---
@@ -354,6 +362,7 @@ class SignalClient(QWidget):
 
         row2.addWidget(self.y_min_label, 0, 6, alignment=Qt.AlignRight)
         row2.addWidget(self.y_min_spinbox, 0, 7, alignment=Qt.AlignLeft)
+        self.y_min_spinbox.valueChanged.connect(self.update_plot_buffered)
 # --- Y Max ---
         self.y_max_label = QLabel("Y max:")
         self.y_max_spinbox = QDoubleSpinBox()
@@ -362,6 +371,7 @@ class SignalClient(QWidget):
 
         row2.addWidget(self.y_max_label, 0, 8, alignment=Qt.AlignRight)
         row2.addWidget(self.y_max_spinbox, 0, 9, alignment=Qt.AlignLeft)
+        self.y_max_spinbox.valueChanged.connect(self.update_plot_buffered)
         
 # x auto range        
 
@@ -375,9 +385,14 @@ class SignalClient(QWidget):
         self.buffer_size_label = QLabel("Buffer size [s]:")
         self.buffer_size_spinbox = QDoubleSpinBox()
         self.buffer_size_spinbox.setRange(0.1, 60.0)
-        self.buffer_size_spinbox.setValue(BUFFER_SIZE * SAMPLING_PERIOD)
+        self.buffer_size_spinbox.setValue(BUFFER_LENGTH_S)
+        
+        self.buffer_length_s = self.buffer_size_spinbox.value()
+        self.buffer_size = int(self.buffer_length_s * SAMPLES_PER_PACKET * PACKET_RATE_HZ)
+
         row2.addWidget(self.buffer_size_label, 0, 11, alignment=Qt.AlignRight)
         row2.addWidget(self.buffer_size_spinbox, 0, 12, alignment=Qt.AlignLeft)
+        self.buffer_size_spinbox.valueChanged.connect(self.on_buffer_size_changed)
 
 # clear graf
         self.clear_button = QPushButton("Clean graf")
@@ -464,7 +479,7 @@ class SignalClient(QWidget):
 #trigger position
         self.num_packets_label = QLabel("Trigger position:")
         self.num_packets_spinbox = QSpinBox()
-        self.num_packets_spinbox.setRange(0, BUFFER_SIZE)
+        self.num_packets_spinbox.setRange(0, self.buffer_size)
         #self.num_packets_spinbox.setValue(TRIGGER_POSITION)
 
         grid.addWidget(self.num_packets_label, 5, 0, 1, 2, alignment=Qt.AlignRight)
@@ -545,8 +560,8 @@ class SignalClient(QWidget):
 
         # === Signálové křivky ===
         self.curves = []
-        self.signal_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count+1)]
-        self.error_buffer = [deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count)]
+        self.signal_buffer = [deque(maxlen=self.buffer_size) for _ in range(self.channels_count+1)]
+        self.error_buffer = [deque(maxlen=self.buffer_size) for _ in range(self.channels_count)]
         self.init_curves()
         
         self.init_sockets()
@@ -555,11 +570,6 @@ class SignalClient(QWidget):
         self.timer.setInterval(33)
         self.timer.timeout.connect(self.update_plot_buffered)
         self.timer.start()
-
-        # Spojení spinboxů s funkcí
-        self.x_range_spinbox.valueChanged.connect(self.update_plot_buffered)
-        self.y_min_spinbox.valueChanged.connect(self.update_plot_buffered)
-        self.y_max_spinbox.valueChanged.connect(self.update_plot_buffered)
         self.update_plot_buffered()
 
     def init_curves(self):
@@ -611,12 +621,11 @@ class SignalClient(QWidget):
             if self.auto_x_range:
                 x = x_raw
             else:
-                # stále vykreslíme *všechna* data
+                # stále vykreslíme *všechna* data, zobrazí se nejnovější data v rozsahu x_range
                 x = x_raw
-                if args:  # změna spinboxu → změň rozsah
-                    xmax = x_raw[-1]
-                    xmin = max(0, xmax - x_range_s)
-                    vb.setXRange(xmin, xmax, padding=0)
+                xmax = x_raw[-1]
+                xmin = max(0, xmax - x_range_s)
+                vb.setXRange(xmin, xmax, padding=0)
 
             # Aktualizace křivek
             if len(self.curves) != self.channels_count:
@@ -631,6 +640,7 @@ class SignalClient(QWidget):
 
             vb.setYRange(self.y_min_spinbox.value(), self.y_max_spinbox.value())
 
+
             # Výpočet chyb
             N_err = int(x_range_s * SAMPLES_PER_PACKET)
             channel_errors = [sum(1 for val in list(self.error_buffer[i])[-N_err:] if val != 0)
@@ -641,12 +651,14 @@ class SignalClient(QWidget):
 
             # === Aktualizace hodnot ztracených a CRC chybných paketů ===
             if self.sampling_thread:
-                self.lost_packets_value.setText(str(self.sampling_thread.lost_packets_counter))
+                self.lost_packets_value.setText(str(f"{self.sampling_thread.lost_packets_counter}  ({self.sampling_thread.lost_packets_counter * 100 / self.sampling_thread.received_packets:.2f} %)"))
                 self.err_packets_value.setText(str(self.sampling_thread.crc_error_counter))
                 self.recv_packets_value.setText(str(self.sampling_thread.received_packets))
                 queued = self.sampling_thread.udprelay.get_received_count()
                 buffered = self.sampling_thread.get_packet_buffer_size()
                 self.queued_packets_value.setText(f" buf socket: {queued} ; sequencing buffer: {buffered}")
+                self.sampling_thread.set_buffers(self.signal_buffer, self.error_buffer)
+                self.sampling_thread.set_channels_count(self.channels_count)
             if self.sampling_thread.received_packets == self.num_packets:
                 self.stop_sampling()
     
@@ -663,6 +675,45 @@ class SignalClient(QWidget):
     def log_message(self, msg: str):
         timestamp = time.strftime("%H:%M:%S")
         self.log_output.append(f"[{timestamp}] {msg}")
+
+    def on_buffer_size_changed(self, value):
+        self.buffer_length_s = value
+        self.update_buffers(buffer_length_s=value, preserve_data=True)
+    def update_buffers(self, buffer_length_s=None, channels_count=None, preserve_data=True):
+        """
+        Obnoví signal_buffer a error_buffer podle nové délky v sekundách nebo počtu kanálů.
+        - Pokud preserve_data=True, zachová co nejvíc dat.
+        """
+        with self.buffer_lock:
+            if buffer_length_s is not None:
+                self.buffer_length_s = buffer_length_s
+
+            if channels_count is not None:
+                self.channels_count = channels_count
+
+            # Přepočet buffer_size (počet vzorků)
+            buffer_size = int(self.buffer_length_s * SAMPLES_PER_PACKET * PACKET_RATE_HZ)
+
+            # Signal buffer (channels + 1)
+            new_signal_buffer = []
+            for i in range(self.channels_count + 1):
+                if preserve_data and i < len(self.signal_buffer):
+                    new_deque = deque(self.signal_buffer[i], maxlen=buffer_size)
+                else:
+                    new_deque = deque(maxlen=buffer_size)
+                new_signal_buffer.append(new_deque)
+            self.signal_buffer = new_signal_buffer
+
+            # Error buffer (channels only)
+            new_error_buffer = []
+            for i in range(self.channels_count):
+                if preserve_data and i < len(self.error_buffer):
+                    new_deque = deque(self.error_buffer[i], maxlen=buffer_size)
+                else:
+                    new_deque = deque(maxlen=buffer_size)
+                new_error_buffer.append(new_deque)
+            self.error_buffer = new_error_buffer
+
 
     def send_command(self, cmd: int, data: bytes = b'', expect_response: bool = False, expected_packets: int = 1):
         pkt = struct.pack('<I', cmd) + data
@@ -709,17 +760,11 @@ class SignalClient(QWidget):
             parsed = parse_id_packet(data)
             self.channels_count = parsed['channels_count']
 
-            # Změnit velikost již existujících bufferů
-            with self.buffer_lock:
-                # Smazat původní obsah
-                self.signal_buffer.clear()
-                self.error_buffer.clear()
-                # Přidat nové prázdné dequey podle nového počtu kanálů
-                self.signal_buffer.extend(deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count + 1))
-                self.error_buffer.extend(deque(maxlen=BUFFER_SIZE) for _ in range(self.channels_count))
+            self.update_buffers(channels_count=self.channels_count, preserve_data=False)
 
             # Předat nový počet kanálů do vlákna
             if self.sampling_thread:
+                self.sampling_thread.set_buffers(self.signal_buffer, self.error_buffer)
                 self.sampling_thread.set_channels_count(self.channels_count)
 
             self.init_curves()
