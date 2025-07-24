@@ -8,7 +8,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from collections import deque, OrderedDict
 import threading
 import time
-from buffered_socket import UDPRelay
+from buffered_socket import BufferedSocket
 
 
 # ---------------------- Parametry ----------------------
@@ -87,7 +87,8 @@ class SamplingThread(QThread):
         self.udp_data_port = udp_data_port
         self.last_packet_order = None
         
-        self.udprelay = UDPRelay()
+        
+        self.udprelay = BufferedSocket()
         self.udprelay.bind(port=self.udp_data_port, use_my_ip=use_my_ip, device_ip=self.udp_device_addr, device_port=self.udp_device_port)
         
 
@@ -273,7 +274,7 @@ class SignalClient(QWidget):
     def __init__(self):
         super().__init__()
         
-        self.udp_relay = UDPRelay()
+        self.udp_relay = BufferedSocket()
         self.udp_device_addr = UDP_DEVICE_IP
         self.udp_device_port = UDP_PORT_SEND #generátor
         self.udp_ack_port = UDP_PORT_RECV #klient pro ack
@@ -438,6 +439,7 @@ class SignalClient(QWidget):
 
         self.connect_generator_button = QPushButton("Connect")
         grid.addWidget(self.connect_generator_button, 1, 3,1,2)
+        self.connect_generator_button.clicked.connect(self.connect)
  
 #ploter ports
         grid.addWidget(QLabel("Plotter ports:"), 2, 0, 1, 5)
@@ -803,6 +805,9 @@ class SignalClient(QWidget):
             )
         except Exception as e:
             self.log_message(f"[ERR] Registr: {e}")
+    def connect(self):
+        self.get_id()
+        self.register_receiver()
 
     def remove_receiver(self):
         try:
