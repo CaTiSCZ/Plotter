@@ -1,0 +1,282 @@
+Plotter
+    parameters:
+        [permanentStorage] # where to store application settings (e. g. ports, device ip, ...) between application runs
+    init:
+        init GUI
+        open sockets
+        create deviceManager
+        register _deviceAdded to deviceManager.onDeviceAdd
+    properties:
+        GUI
+        sockets: [AsyncSocket]
+        deviceManager: DeviceManager
+    methods:
+        run()
+            application main loop and cleanup
+        _deviceAdded(manager, device)
+            register _deviceIdUpdated to device.onIDchanged
+        _deviceIdUpdated(device)
+            update chart series based on device channels
+    events:
+    threads:
+
+DeviceManager
+    parameters:
+        sockets: [AsyncSocket]
+    init:
+        register _packetHandler to all sockets.onPacketReceived
+    properties:
+        devices: {(ip, port): Device}
+    methods:
+        # device management
+        connect(ip, port)
+            call getID and registerReceiver (if getID succeed)
+        disconnect(ip, port)
+            call removeReceiver
+            remove device from chart?
+        disconnectAll()
+        saveDevices(file)
+        loadDevices(file)
+        saveData(file)
+        loadData(file)?
+        # devices control (do it on all devices)
+        ping()
+        getID()
+        getReceivers()
+        registerReceiver([ip, port])
+        removeReceiver([ip, port])
+        startSampling([samples])
+        startSamplingOnTrigger([samples])
+        stopSampling()
+        forceTrigger()
+        resetCounters()
+        markMissingPacketsAsLost()
+        # internal
+        _packetHandler(socket: AsyncSocket, data: bytes, address: (ip: str, port: int))
+            dispatch incoming packets to devices based on source ip and port
+            create new device if neccessary
+                call onDeviceAdd
+    events:
+        onDeviceAdd(manager, device)
+            called when new device added to devices
+        onDeviceRemove(manager, device)
+    threads:
+
+Device
+    parameters:
+        ip
+        port
+        cmdSocket
+        DeviceManager
+    init:
+    properties:
+        name
+        id
+        state
+        registeredReceivers
+        # init aboves to None
+        counters # init to zero
+            recvPackets
+            lostPackets
+            errPackets
+        triggers
+        _rawData # int16
+        _ackTimers: {cmd: threading.Timer} # ACK timeout timers
+    methods:
+        disconnect()
+        # device control
+        ping()
+        getID()
+        getReceivers()
+        registerReceiver([ip, port])
+        removeReceiver([ip, port])
+        startSampling([samples])
+        startSamplingOnTrigger([samples])
+        stopSampling()
+        forceTrigger()
+        resetCounters()
+            New command, resets packet num and internall error counters
+        markMissingPacketsAsLost()
+        getRawData(size=None) -> (firstSampleNum, rawData) # return up to size newest samples of raw data (all if size is None)
+        getData(size=None) -> (firstSampleNum, data) # return up to size newest samples of processed data - gain and offset applied (all if size is None)
+        getDataAsync(size=None, callback, *callbackArgs, **callbackKwargs) # return up to size newest samples of processed data - gain and offset applied (all if size is None)
+            callback parameters: (Device, firstSampleNum, data, *callbackArgs, **callbackKwargs)
+        # communication events
+        packetReceived(data: bytes) # shall be called from DeviceManager._packetHandler
+    events:
+        onTimeout(device, cmd)
+        onPing(device)
+        onIDchanged(device)
+        onTrigger(device, packetNum, sampleNum)
+        onData(device)
+        onReceivers(device, receivers)
+
+AsyncSocket
+    parameters:
+    init:
+    properties:
+        _socket: BufferedSocket
+    methods:
+        bind(ip, port)
+            see underlaying BufferedSocket
+        close()
+            see underlaying BufferedSocket
+            shutdown _rxProcess thread
+        sendto(bytes, address)
+            send data through underlaying BufferedSocket
+        rxQueueSize(): int
+            return items in _rxQueue
+        txQueueSize(): int
+            return items in _txQueue
+    events:
+        onPacketReceived(socket: AsyncSocket, data: bytes, address: (ip: str, port: int))
+            called on every received packet
+    threads:
+        _rxProcess
+            read data from _socket and pass them to onPacketReceived
+
+BufferedSocket
+    ''' Use multiprocessing, instead of threading (becaouse of Global Interpret Lock)?
+            Use fork start method because future application freezing (pyinstaller), start all processes before any threads.
+            One process should use threads for rx and tx (chech if it is possible to create threads in subprocess, if this subprocess is not going to create sub-subprocesses).
+            Add communiation to the process:
+                - Command for quit
+                - Command to chenge socket (it is not feasible to restart whole process)
+        Convert it to C++ and bind back to Python?
+        ! Setup larger socket system internal  storage !
+    '''
+    parameters:
+        [timeout: float | None]
+    init:
+    properties:
+        _rxQueue: SimpleQueue
+        _txQueue: SimpleQueue
+        _socket: socket
+    methods:
+        bind(ip, port)
+            bind or rebing socket
+        close()
+            close socket and shutdown threads
+        recvfrom(*_): (data: bytes, address: (ip: str, port: int))
+            return data from _rxQueue
+        sendto(bytes, address)
+            put data to _txQueue
+        rxQueueSize(): int
+            return items in _rxQueue
+        txQueueSize(): int
+            return items in _txQueue
+    events:
+    threads:
+        _rxProcess
+            receive data from socket and put them to _rxQueue
+        _txProcess
+            get data from _txQueue and send them through socket
+
+'''
+# class template
+Object
+    parameters:
+    init:
+    properties:
+    methods:
+    events:
+    threads:
+'''
+
+Plotter je hlavní třída programu.
+Vytvoří GUI, sockety a device manager.
+Devece manageru předá sockety, na kterých bude poslouchat.
+Ten si u nich běhěm své inicializace zaregistruje metodu _packetHandler jako callback pro event onPacketReceived.
+(Když jsem se zeptal Googlu na "event callback concept", tak mi to Gemini myslím vcelku pěkně vysvětlila.)
+(Místo callbacků by mohlo být zajímavé použít asyncio, ale s tím neumím zacházet. [Hm, nejspíš ne.])
+V _packetHandler předá manager přišlý packet příslušnému zařízení, podle IP a portu zdroje, pomocí volání Device.packetReceived.
+Device v packetReceived provede parsování přijatého paketu, aktualizuje podle něj svůj stav (ID, ...) a zprocesuje příslušné události.
+Pokud _packetHandler přijme packet od adresy, kterou nemá v devices, vytvoří nové Device a vygeneruje event onDeviceAdd.
+
+Asynchronní posílání příkazů:
+Poslání příkazu (např. zavolání Device.ping) nemá jak jednoduše čekat na příjem odpovědi (ani by nemělo, čekání je blokující).
+Že má přijít odpověď je potřeba si poznamenat a zpracovat ji v packetReceived.
+Pro případ, že odpověď nejpřijdem je potřeba mít definovaný timeout.
+Řešit pomocí _ackTimers: při poslání příkazu spustit timeout timer, jehož callback při vypršení ošetří nepřijatou odpověď.
+Při příjmu odpovědi včas tento timer zrušit (zavolat na něm cancel()) a zapomenout (smazat z _ackTimers).
+
+Při inicializaci by si měl Plotter registrovat _deviceAdded callback do deviceManager.onDeviceAdd.
+V tomto callbacku si pak registrovat _deviceIdUpdated do nevě přidaného device.onIDchanged.
+V _deviceIdUpdated pak upravovat počet křivek v grafu podle informací ze zařízení.
+
+Data k vykreslení by si měl Plotter tahat z deviceManager.devices pomocí vlastního časovače s nějakou rozumnou periodou 30 - 100 ms (nevázat se na Device.onData event).
+Nebo možná ještě lépe, vykreslovat, jak nejrychleji to jde. Nové vykreslování zahájit okamžitě, jakmile skončí předchozí.
+Díky čekání na asynchronní přepočet dat (viz dále Přepočet rawData -> data) bude mít GUI vlákno dost času na to, aby bylo stále responzivní.
+Vypisovat někde průběžné fps (kolikrát za sekundu zvládnu překreslit graf) - indikátor aktuálního zatížení.
+
+Přetečení packet num:
+Interně držet počítadlo přijatých packetů kontinuální (nepřeteče zároveň s int16_t z přijatého packetu). S přijatým packetem porovnávat pouze spodních 16 bitů.
+TODO: Zamyslet se nad případnými edge cases.
+    max_recv_packet_num = 65535
+    threshold = int(max_recv_packet_num // 4)
+    if (expected_packet_num & max_recv_packet_num) > (max_recv_packet_num - threshold) and recv_packet_num < threshold:
+        expected_packet_num += max_recv_packet_num + 1
+
+Ukládání dat v Device:
+Prealokovat si buffer (_rawData) maximální velikosti (uživatelsky nastavitelné, varovat a chtít potvrzení při zadání něčeho moc velkého - cca od jednotek GB nahoru).
+Do tohoto bufferu skládat data podle packet num. Při ztrátě packetu zde může vzniknout mezera. Pamatovat si index první mezery a při dotazu na data (nebo jejich množství) vrátit jen po první mezeru.
+Při přijmu přiměřeného množství packetů po mezeře (cca 50?) prochlásit chybějící packety za ztracené a upravit index první mezery.
+Aby bylo v datech poznat chybějící packety, nastavit prázdná místa v bufferu na -32768 (nejmenší možná hodnota).
+Přidat timeout, detekující, že přestaly chodit data dřív, než bylo očekáváno:
+    Při přijmu datového packetu se resetuje, při vypršení vynutí prohlášení chybějících packetů za ztracené.
+    Zrušit při korektním příjmu posledního očekávaného packetu.
+Buffer by měl umět fungovat jako kruhový - při zaplnění se začne plnit od začátku (přepisovat nejstarší data).
+    Tohle by lěm být implementační detail, který nebude z venku Device viditelný - pokud se dotážu na data, dostanu vždy kontinuální pole.
+    Návrh implementace: mít ve skutečnosti buffer třikrát větší. Začít od třetiny a pokračovat na konec. Na konci zkopírovat poslední třetinu do první a s ukládáním pokračovat opět od třetiny.
+    Tím pádem bude potřeba jedno velké kopírování třetiny dat vždy při zaplnění bufferu, ne při každém čtení.
+
+Přepočet rawData -> data:
+Vynásobit gain a přičíst offset (z ID packetu).
+Dělat při žádosti o data. Protože přepočet bude dělat numpy, může běžet asynchronně v adhoc vlákně (nebo na to mít vyhrazený pool vláken v deviceManageru?) a neblokovat hlavní GUI vlákno (předpoklad je, že dotazy budou chodit hlavně z něj.)
+Ideálně mít na data vlastní buffer a přepočítávat vždy jen ta rawData, která přišla od posledního volání.
+Podobně jako pro rawData by měl být buffer prealokovaný a kruhový.
+V tomto případě ale stačí dvojnásobná velikost: začne se zapisovat od půlky, při dojití na konec se druhá půlka bufferu zkopíruje do první a začíná se zapisovat opět do druhé půlky.
+
+TODO: přidat packet offset, který řeší restart zařízení (např kvůli nahrání nového FW): pokud mi přijde packet num, které už v bufferu mám, a navíc blízké nule (samotný packet 0 se může ztratit), měl bych vyhodnotit, že zařízení bylo restartováno.
+Žádané chování je v tomto případě pokračovat s ukládáním dat, jako by k restartu nedošlo.
+Návrh implementace: nastavit packet_offset podle expected_packet_num a to pak vynulovat. Data ukládat do bufferu na pozici packet_offset + expected_packet_num.
+
+Formát ukládání dat do souboru (jeden soubor per Device):
+- Magic number (8 B): "FDDSMBF\0"
+- file format version (uint32): 2
+- file creation time (char[32]): ISO 8601, zero padded
+- device ID: (ID packet from MCU HW ID (included) up to CRC (excluded))
+- samples count (uint32)
+- channel0 (int16[])
+- channel1 (int16[])
+  ...
+  channeln (int16[])
+- triggers count (uint32)
+- triggers (uint32[])
+- MD5 checksum of file
+
+Formát ukládání dat do souboru (všechna zařízení v jednom souboru):
+- Magic number (8 B): "FDDSMBF\0"
+- file format version (uint32): 3
+- file creation time (char[32]): ISO 8601, zero padded
+- devices count (uint32)
+- devices offset (uint64[]): list of byte offset from start of the file where particular device information starts
+- device0: as in file per device from device ID (included) up to MD5 checksum (excluded)
+- device1
+  ...
+  devicen
+- MD5 checksum of file
+
+Návrhy na optimalizaci, když bude vykreslování pomalé:
+- PlotDataItem.setDownsampling
+    https://pyqtgraph.readthedocs.io/en/latest/api_reference/graphicsItems/plotdataitem.html#pyqtgraph.PlotDataItem.setDownsampling
+- scrolování / zoomování při příjmu nových dat nechat na pyqtgraph:
+    https://pyqtgraph.readthedocs.io/en/latest/api_reference/graphicsItems/viewbox.html#pyqtgraph.ViewBox.enableAutoRange
+    https://pyqtgraph.readthedocs.io/en/latest/api_reference/graphicsItems/viewbox.html#pyqtgraph.ViewBox.setAutoPan
+
+
+TODO global:
+- dopsat korektní ukončování všeho
+- použít na logování logging
+- zkusit na parsování dat použít separé procesy, ať se lépe využije výcejádrový procesor (viz poznámka u BufferedSocket)? NEJSPÍŠ NEMÁ SMYSL a byla by to dost komplikace
+- má smysl předávat (znovupoužít) logging, config_parser, callback_engine, ... z cac?
