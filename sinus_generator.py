@@ -113,7 +113,7 @@ class DualSignalGenerator:
 
 # --- Spuštění ---
 if __name__ == "__main__":
-    gen = DualSignalGenerator(dx=0.0001, interval=0.001, ip='127.0.0.1', port=9999)
+    gen = DualSignalGenerator(dx=0.0001, interval=0.001, ip='192.168.137.1', port=10577)
     gen.start()
     print("Generátor napětí a proudu spuštěn. Ukonči pomocí Ctrl+C.")
 

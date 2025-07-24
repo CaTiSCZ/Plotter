@@ -11,7 +11,7 @@ import time
 
 # ---------------------- Parametry ----------------------
 
-UDP_DEVICE_IP = "192.168.2.10" # "127.0.0.1"
+UDP_DEVICE_IP = "192.168.137.101" # "127.0.0.1"
 
 UDP_PORT_SEND = 10578  # generátor
 UDP_PORT_RECV = 10579  # tento klient - port pro příjem ACK +
@@ -63,7 +63,7 @@ class SamplingThread(QThread):
         self.error_buffer = error_buffer
         self.running = True
         self.sock.settimeout(0.3)
-        self.lock = threading.Lock() 
+        self.lock = threading.Lock()
     def set_channels_count(self, new_count):
         with self.lock:
             self.channels_count = new_count
@@ -76,6 +76,7 @@ class SamplingThread(QThread):
 
                 # Parsování hlavičky (2B type + 2B číslo paketu)
                 packet_type, packet_order = struct.unpack('<HH', pkt[0:4])
+                print(f"[DBG] Incomming packet {packet_type:04X} order {packet_order:5} length {len(pkt)}")
                 
                 data = verify_crc(pkt)
                 if not data:
@@ -118,7 +119,9 @@ class SamplingThread(QThread):
                         self.error_buffer[i].extend([errors[i]] * SAMPLES_PER_PACKET)
                 self.data_ready.emit()
             except socket.timeout:
-                pass
+                continue
+            except Exception as e:
+                print("[ERR] SamplingThread error:", e)
         if self.sock:
             self.sock.close()
             print("Data socket closed.")        
@@ -325,7 +328,7 @@ class SignalClient(QWidget):
         self.get_id_button.clicked.connect(self.get_id)
         grid.addWidget(self.get_id_button, 0, 1)
 
-        self.register_text_edit = QLineEdit(f"0.0.0.0:{self.udp_data_port}")
+        self.register_text_edit = QLineEdit(f"192.168.137.1:{self.udp_data_port}")
         self.register_text_edit.returnPressed.connect(self.register_receiver)
         grid.addWidget(QLabel("Register receiver:"), 1, 1)
         grid.addWidget(self.register_text_edit, 2, 1)
