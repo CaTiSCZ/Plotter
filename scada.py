@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Eaton FDDS SCADA – full-featured multi-device UDP client & visualiser
+"""multi_device_plotter.py – full-featured multi-device UDP client & visualiser
 ==============================================================================
-Jakub Arm
-
 Features:
   - Logging with timestamped pane
   - Enable/disable individual devices
@@ -10,8 +8,11 @@ Features:
   - Automatic receiver address set from first device
   - Sample count input, Start/StopSampling and Trigger commands
   - Leader/follower selection (none = all followers)
+  - Packet order checking per device
+  - Display legend with device/channel colors
   - Clean Graf functionality
   - Save Data per device to CSV
+  - Reset Counter command (code 8)
   - UDP I/O via selector-based asyncio loop (Windows compatible)
 """
 from __future__ import annotations
@@ -52,7 +53,7 @@ def _verify_crc(pkt: bytes) -> bytes|None:
     data, recv_crc = pkt[:-2], struct.unpack('<H', pkt[-2:])[0]
     return data if crc16_ccitt(data)==recv_crc else None
 
-# ID packet parsing from GrafTest fileciteturn4file10
+# ID packet parsing from GrafTest
 ID_HEADER_STRUCT = struct.Struct('<HHHBBI3I HBB I HBB 8s 30s H')
 def parse_id_packet(data):
     if len(data) < ID_HEADER_STRUCT.size:
@@ -79,7 +80,7 @@ def parse_id_packet(data):
     }
 
 # Buffer container
-dataclass
+@dataclass
 class DeviceBuffer:
     def __init__(self, channels:int=3):
         self.lock = threading.Lock()
@@ -95,7 +96,6 @@ class DeviceBuffer:
             self.signal[0].extend(t)
 
 # Async UDP socket
-dataclass
 class AsyncSocket:
     def __init__(self, loop, local_port:int, label:str):
         self.loop = loop
@@ -105,12 +105,14 @@ class AsyncSocket:
         self.sock,self.queue = sock, asyncio.Queue()
         loop.add_reader(sock.fileno(), self._on_ready)
     def _on_ready(self):
-        try: data, addr = self.sock.recvfrom(4096); self.queue.put_nowait((data, addr))
+        try:
+            data, addr = self.sock.recvfrom(4096)
+            self.queue.put_nowait((data, addr))
         except: pass
-    def send(self, data:bytes, target:Tuple[str,int]): self.sock.sendto(data, target)
+    def send(self, data:bytes, target:Tuple[str,int]):
+        self.sock.sendto(data, target)
 
-# Device client
-dataclass
+# Single device client
 class Device:
     PKT_TYPE_DATA = 2
     def __init__(self, ip:str, cmd_port:int, data_port:int, loop):
@@ -120,100 +122,166 @@ class Device:
         self.cmd_sock.settimeout(RECV_TIMEOUT_S)
         self.cmd_sock.connect((ip, cmd_port))
         self.buffer = DeviceBuffer(self.channels)
+        self.id = int(ip.split('.')[3])
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True):
-        pkt = struct.pack('<I', code)+payload; self.cmd_sock.send(pkt)
+        pkt = struct.pack('<I', code) + payload
+        self.cmd_sock.send(pkt)
         if not expect: return None
         try: return self.cmd_sock.recv(2048)
         except socket.timeout: return None
     def ping(self)->bool: return bool(self._send_cmd(0))
     def get_id(self)->dict|None:
-        data=_verify_crc(self._send_cmd(1) or b'');
-        if not data: return None
-        info=parse_id_packet(data); self.channels=info['channels_count']; return info
-    def register_receiver(self,addr,port): return self._send_cmd(2, socket.inet_aton(addr)+struct.pack('<H',port))
-    def start_sampling(self,n:int=0): return self._send_cmd(5, struct.pack('<I',n))
-    def start_sampling_trigger(self,n:int=0): return self._send_cmd(6, struct.pack('<I',n))
-    def stop_sampling(self): self._send_cmd(7, expect=False)
-    def on_raw_packet(self,pkt:bytes):
-        data=_verify_crc(pkt);
+        rsp = _verify_crc(self._send_cmd(1) or b'')
+        if not rsp: return None
+        info = parse_id_packet(rsp)
+        self.channels = info['channels_count']
+        return info
+    def register_receiver(self, addr:str, port:int):
+        return self._send_cmd(2, socket.inet_aton(addr)+struct.pack('<H',port))
+    def start_sampling(self, n:int=0):
+        return self._send_cmd(5, struct.pack('<I',n))
+    def start_sampling_trigger(self, n:int=0):
+        return self._send_cmd(6, struct.pack('<I',n))
+    def stop_sampling(self):
+        return self._send_cmd(7, expect=False)
+    def reset_counter(self):
+        return self._send_cmd(9, expect=False)
+    def on_raw_packet(self, pkt:bytes):
+        data = _verify_crc(pkt)
         if not data: return
-        typ,order=struct.unpack('<HH',data[:4])
-        if typ!=self.PKT_TYPE_DATA: return
-        off=4; t=[order*SAMPLES_PER_PACKET+k for k in range(SAMPLES_PER_PACKET)]
-        samples=[]
+        typ, order = struct.unpack('<HH', data[:4])
+        if typ != self.PKT_TYPE_DATA: return
+        print(f"[DBG] Dev {self.id} dataPacket {order} length {len(pkt)}")
+        off = 4
+        t = [order*SAMPLES_PER_PACKET + k for k in range(SAMPLES_PER_PACKET)]
+        samples = []
         for _ in range(self.channels):
-            sig=struct.unpack('<'+'h'*SAMPLES_PER_PACKET, data[off:off+2*SAMPLES_PER_PACKET]); off+=2*SAMPLES_PER_PACKET
-            samples.append(list(sig))
-        errs=list(data[off:off+self.channels])
+            sig = struct.unpack('<'+'h'*SAMPLES_PER_PACKET, data[off:off+2*SAMPLES_PER_PACKET])
+            samples.append(list(sig)); off += 2*SAMPLES_PER_PACKET
+        errs = list(data[off:off+self.channels])
         self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
 
-# Manager
-dataclass
+# Manager of multiple devices
 class DeviceManager:
-    MAX_DEVICES=4
-    def __init__(self,data_port:int=DEFAULT_DATA_PORT): self.data_port=data_port; self.devices={}; self.loop=None; self.data_socket=None
-    def attach_loop(self,loop): self.loop=loop; self.data_socket=AsyncSocket(loop,self.data_port,'data')
-    def clear(self): self.devices.clear()
-    def add_device(self,ip,cmd_port=DEFAULT_CMD_PORT):
-        if len(self.devices)>=self.MAX_DEVICES or ip in self.devices: return
-        self.devices[ip]=Device(ip,cmd_port,self.data_port,self.loop)
-    def ping_all(self): return {ip:dev.ping() for ip,dev in self.devices.items()}
-    def get_all_ids(self): return {ip:dev.get_id() for ip,dev in self.devices.items()}
-    def register_all(self,addr,port):
-        for dev in self.devices.values(): dev.register_receiver(addr,port)
-    def dispatch_loop(self,signal):
+    MAX_DEVICES = 4
+    def __init__(self, data_port:int = DEFAULT_DATA_PORT):
+        self.data_port = data_port
+        self.devices: Dict[str,Device] = {}
+        self.loop = None
+        self.data_socket = None
+    def broadcast(self, method:str, *args, **kwargs):
+        for dev in self.devices.values():
+            getattr(dev, method)(*args, **kwargs)
+    def attach_loop(self, loop):
+        self.loop = loop
+        self.data_socket = AsyncSocket(loop, self.data_port, 'data')
+    def clear(self):
+        self.devices.clear()
+    def add_device(self, ip:str, cmd_port:int = DEFAULT_CMD_PORT):
+        if len(self.devices) >= self.MAX_DEVICES or ip in self.devices: return
+        self.devices[ip] = Device(ip, cmd_port, self.data_port, self.loop)
+    def ping_all(self):
+        return {ip: dev.ping() for ip,dev in self.devices.items()}
+    def get_all_ids(self):
+        return {ip: dev.get_id() for ip,dev in self.devices.items()}
+    def register_all(self, addr:str, port:int):
+        for dev in self.devices.values(): dev.register_receiver(addr, port)
+    def dispatch_loop(self, signal):
         async def run():
             while True:
-                pkt,(ip,_)=await self.data_socket.queue.get()
-                if ip in self.devices:
-                    self.devices[ip].on_raw_packet(pkt);
-                    signal.emit(ip)
+                pkt, (ip, _) = await self.data_socket.queue.get()
+                dev = self.devices.get(ip)
+                if not dev: continue
+                data = _verify_crc(pkt)
+                if not data: continue
+                typ, order = struct.unpack('<HH', data[:4])
+                dev.on_raw_packet(pkt)
+                signal.emit(ip, order)
         self.loop.create_task(run())
 
-# GUI
+# Main GUI application
 class Plotter(QWidget):
-    data_ready=pyqtSignal(str)
-    def __init__(self,mgr:DeviceManager):
-        super().__init__(); self.manager=mgr; self.default_cmd_port=DEFAULT_CMD_PORT
-        self.setWindowTitle('Eaton FDDS SCADA'); self.resize(1400,800)
-        root=QVBoxLayout(self)
-        cfg=QGridLayout(); root.addLayout(cfg)
-        # device entries
-        self.device_edits=[]; self.device_checks=[]; self.leader_buttons=QButtonGroup(self); self.leader_buttons.setExclusive(True)
+    # emits (ip, packet_order)
+    data_ready = pyqtSignal(str, int)
+
+    def __init__(self, manager:DeviceManager):
+        super().__init__()
+        self.manager = manager
+        self.default_cmd_port = DEFAULT_CMD_PORT
+        self.last_order: Dict[str,int] = {}
+
+        self.setWindowTitle('Eaton FDDS SCADA')
+        self.resize(1400, 800)
+
+        root = QVBoxLayout(self)
+        cfg = QGridLayout(); root.addLayout(cfg)
+
+        self.device_edits: List[QLineEdit] = []
+        self.device_checks: List[QCheckBox] = []
+        self.leader_buttons = QButtonGroup(self)
+        self.leader_buttons.setExclusive(True)
+
         for i in range(DeviceManager.MAX_DEVICES):
-            cfg.addWidget(QLabel(f'Device {i+1}'),i,0)
-            chk=QCheckBox('Enable'); chk.setChecked(True); cfg.addWidget(chk,i,1); self.device_checks.append(chk)
-            le=QLineEdit(); le.setPlaceholderText('ip:port');
-            if i==0: le.textChanged.connect(self._update_defaults)
-            cfg.addWidget(le,i,2); self.device_edits.append(le)
-            rb=QRadioButton('Leader'); cfg.addWidget(rb,i,3); self.leader_buttons.addButton(rb,i)
-        cfg.addWidget(QLabel('Receiver addr:port'),0,4)
-        self.receiver_edit=QLineEdit(f'0.0.0.0:{DEFAULT_DATA_PORT}'); cfg.addWidget(self.receiver_edit,0,5)
-        self.apply_btn=QPushButton('Apply Device List'); cfg.addWidget(self.apply_btn,DeviceManager.MAX_DEVICES,2)
+            cfg.addWidget(QLabel(f'Device {i+1}'), i, 0)
+            chk = QCheckBox('Enable'); chk.setChecked(True); cfg.addWidget(chk, i, 1)
+            self.device_checks.append(chk)
+            le = QLineEdit(); le.setPlaceholderText('ip:port')
+            if i == 0: le.textChanged.connect(self._update_defaults)
+            cfg.addWidget(le, i, 2)
+            self.device_edits.append(le)
+            rb = QRadioButton('Leader'); cfg.addWidget(rb, i, 3)
+            self.leader_buttons.addButton(rb, i)
+
+        cfg.addWidget(QLabel('Receiver addr:port'), 0, 4)
+        self.receiver_edit = QLineEdit(f'0.0.0.0:{DEFAULT_DATA_PORT}')
+        cfg.addWidget(self.receiver_edit, 0, 5)
+
+        self.apply_btn = QPushButton('Apply Device List')
+        cfg.addWidget(self.apply_btn, DeviceManager.MAX_DEVICES, 2)
         self.apply_btn.clicked.connect(self._apply_devices)
-        # controls
-        btns=QHBoxLayout(); root.addLayout(btns)
-        for label,fn in [('Ping All',self._ping_all),('Get IDs',self._get_ids),('Register All',self._register_all)]:
-            b=QPushButton(label); b.clicked.connect(fn); btns.addWidget(b)
+
+        btns = QHBoxLayout(); root.addLayout(btns)
+        for label, fn in [('Ping All', self._ping_all), ('Get IDs', self._get_ids), ('Register All', self._register_all)]:
+            b = QPushButton(label); b.clicked.connect(fn); btns.addWidget(b)
         btns.addWidget(QLabel('Samples:'))
-        self.sample_spin=QSpinBox(); self.sample_spin.setRange(0,10000); self.sample_spin.setValue(10); btns.addWidget(self.sample_spin)
+        self.sample_spin = QSpinBox(); self.sample_spin.setRange(0,10000); self.sample_spin.setValue(10); btns.addWidget(self.sample_spin)
         b=QPushButton('Start Sampling'); b.clicked.connect(self._start_sampling); btns.addWidget(b)
         b=QPushButton('Stop Sampling'); b.clicked.connect(self._stop_sampling); btns.addWidget(b)
+        b=QPushButton('Reset Counter'); b.clicked.connect(self._reset_counter); btns.addWidget(b)
         b=QPushButton('Clean Graf'); b.clicked.connect(self.clear_plot); btns.addWidget(b)
         b=QPushButton('Save Data'); b.clicked.connect(self.save_data); btns.addWidget(b)
-        # plot
-        self.plot=pg.GraphicsLayoutWidget(); root.addWidget(self.plot)
-        self.ax=self.plot.addPlot(title='Signals'); self.ax.showGrid(x=True,y=True,alpha=0.3)
+
+        # Plot area with legend
+        self.plot_widget = pg.GraphicsLayoutWidget(); root.addWidget(self.plot_widget)
+        self.ax = self.plot_widget.addPlot(title='Signals – device×channel')
+        self.ax.showGrid(x=True,y=True,alpha=0.3)
         self.ax.setLabel('bottom','Time',units='s'); self.ax.setLabel('left','Amplitude')
-        self.curves={}
-        self.error_lbl=QLabel(); self.error_lbl.setStyleSheet('font-family: monospace'); root.addWidget(self.error_lbl)
-        self.log_output=QTextEdit(); self.log_output.setReadOnly(True); self.log_output.setLineWrapMode(QTextEdit.NoWrap)
+        self.ax.addLegend()
+        self.curves: Dict[Tuple[str,int], pg.PlotDataItem] = {}
+
+        self.error_lbl = QLabel(); self.error_lbl.setStyleSheet('font-family: monospace')
+        root.addWidget(self.error_lbl)
+
+        self.log_output = QTextEdit(); self.log_output.setReadOnly(True); self.log_output.setLineWrapMode(QTextEdit.NoWrap)
         self.log_output.setStyleSheet('font-family: monospace; background:#f0f0f0')
-        scroll=QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(self.log_output); root.addWidget(scroll)
-        self.timer=QTimer(self); self.timer.setInterval(33); self.timer.timeout.connect(self._update_plot); self.timer.start()
-        self.data_ready.connect(lambda ip:None)
-    def log_message(self,msg): self.log_output.append(f'[{time.strftime("%H:%M:%S")}] {msg}')
-    def _update_defaults(self,text):
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(self.log_output); root.addWidget(scroll)
+
+        self.timer = QTimer(self)
+        self.timer.setInterval(33)
+        self.timer.timeout.connect(self._update_plot)
+        self.timer.start()
+
+        self.data_ready.connect(self._check_order)
+
+    def log_message(self,msg:str): self.log_output.append(f'[{time.strftime("%H:%M:%S")}] {msg}')
+
+    def _check_order(self, ip:str, order:int):
+        last = self.last_order.get(ip)
+        if last is not None and order != (last + 1) & 0xFFFF:
+            self.log_message(f'[PKT ORDER] {ip}: expected {(last+1)&0xFFFF}, got {order}')
+        self.last_order[ip] = order
+
+    def _update_defaults(self,text:str):
         try:
             if not ':' in text: return
             ip,port=text.split(':'); octs=ip.split('.')
@@ -224,8 +292,10 @@ class Plotter(QWidget):
             self.device_edits[0].setText(f'{prefix}.{base}:{port}')
             self.receiver_edit.setText(f'{prefix}.1:{DEFAULT_DATA_PORT}')
         except: pass
+
     def _apply_devices(self):
-        self.manager.clear(); self.ax.clear(); count=0
+        self.manager.clear(); self.ax.clear(); self.curves.clear()
+        count=0
         for chk,le in zip(self.device_checks,self.device_edits):
             if not chk.isChecked(): continue
             txt=le.text().strip();
@@ -236,51 +306,67 @@ class Plotter(QWidget):
                 self.manager.add_device(ip,port); count+=1
             except: self.log_message(f'Bad entry: {txt}')
         self.log_message(f'Applied {count} devices')
+
     def _ping_all(self):
         for ip,ok in self.manager.ping_all().items(): self.log_message(f'Ping {ip}: '+('OK' if ok else 'FAIL'))
+
     def _get_ids(self):
         for ip,info in self.manager.get_all_ids().items():
             self.log_message(f'ID {ip}: '+(f"channels={info['channels_count']}" if info else 'FAIL'))
+
     def _register_all(self):
-        try: addr,pr=self.receiver_edit.text().split(':'); self.manager.register_all(addr,int(pr)); self.log_message(f'Registered {addr}:{pr}')
+        try:
+            addr,pr=self.receiver_edit.text().split(':')
+            self.manager.register_all(addr,int(pr))
+            self.log_message(f'Registered {addr}:{pr}')
         except: self.log_message('Bad receiver address')
+
     def _start_sampling(self):
         n=self.sample_spin.value(); leader_id=self.leader_buttons.checkedId()
         for i,(ip,dev) in enumerate(self.manager.devices.items()):
-            if i!=leader_id: dev.start_sampling_trigger(n); self.log_message(f'Trigger on follower {ip}')
+            if i!=leader_id: dev.start_sampling_trigger(n); self.log_message(f'Trigger on follower {ip} (n={n})')
         if 0<=leader_id<len(self.manager.devices):
             ip=list(self.manager.devices)[leader_id]; self.manager.devices[ip].start_sampling(n)
             self.log_message(f'Start on leader {ip} (n={n})')
         else:
             for ip,dev in self.manager.devices.items(): dev.start_sampling(n); self.log_message(f'Start on {ip} (n={n})')
+
     def _stop_sampling(self):
-        for ip,dev in self.manager.devices.items(): dev.stop_sampling()
+        self.manager.broadcast('stop_sampling')
         self.log_message('Stopped all sampling')
+
+    def _reset_counter(self):
+        self.manager.broadcast('reset_counter')
+        self.log_message('Reset counter on all devices')
+        self.last_order.clear()
+
     def clear_plot(self):
         for dev in self.manager.devices.values():
             with dev.buffer.lock:
-                dev.buffer.time.clear();
+                dev.buffer.time.clear()
                 for dq in dev.buffer.signal: dq.clear()
                 for dq in dev.buffer.error: dq.clear()
-        self.ax.clear(); self.curves={}
-        self._update_plot(); self.log_message('Graf cleaned.')
+        self.ax.clear(); self.curves.clear(); self._update_plot()
+        self.log_message('Graf cleaned')
+
     def save_data(self):
-        path, _ = QFileDialog.getSaveFileName(self, 'Save Data', '', 'CSV Files (*.csv)')
+        path,_=QFileDialog.getSaveFileName(self,'Save Data','','CSV Files (*.csv)')
         if not path: return
         base=path.rstrip('.csv')
         files=[]
         for idx,(ip,dev) in enumerate(self.manager.devices.items()):
             fname=f"{base}_dev{idx}_{ip.replace('.','_')}.csv"
             with open(fname,'w',newline='') as f:
-                writer=csv.writer(f)
-                header=['time']+ [f'ch{c}' for c in range(dev.channels)]
-                writer.writerow(header)
+                w=csv.writer(f)
+                header=['time']+[f'ch{c}' for c in range(dev.channels)]
+                w.writerow(header)
                 with dev.buffer.lock:
                     times=list(dev.buffer.time)
                     cols=list(zip(*[list(dev.buffer.signal[c+1]) for c in range(dev.channels)]))
-                for t, row in zip(times,cols): writer.writerow([t*SAMPLING_PERIOD,*row])
+                for t,row in zip(times,cols): w.writerow([t*SAMPLING_PERIOD,*row])
             files.append(fname)
-        self.log_message('Saved data: ' + ', '.join(files))
+        self.log_message('Saved data: '+', '.join(files))
+
     def _update_plot(self):
         lines=[]
         for ip,dev in self.manager.devices.items():
@@ -308,7 +394,8 @@ if __name__=='__main__':
     gui=Plotter(manager)
     def start_loop():
         loop=asyncio.SelectorEventLoop(); asyncio.set_event_loop(loop)
-        manager.attach_loop(loop); manager.dispatch_loop(gui.data_ready)
+        manager.attach_loop(loop)
+        manager.dispatch_loop(gui.data_ready)
         loop.run_forever()
     threading.Thread(target=start_loop,daemon=True).start()
     gui.show(); sys.exit(app.exec_())
