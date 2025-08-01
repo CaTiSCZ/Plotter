@@ -100,6 +100,7 @@ class AsyncSocket:
     def __init__(self, loop, local_port:int, label:str):
         self.loop = loop
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4*1024*1024)
         sock.setblocking(False)
         sock.bind(('0.0.0.0', local_port))
         self.sock,self.queue = sock, asyncio.Queue()
