@@ -22,7 +22,7 @@ class AsyncSocket:
                 data, addr = self.socket.recvfrom(self.max_size)
                 #print(f"[DEBUG] Příchozí data od {addr}: {data}")
                 if self._on_packet is not None:
-                    self._on_packet(data,addr)
+                    self._on_packet(self, data, addr)
             except socket.timeout:
                 #print("timeout")
                 continue
