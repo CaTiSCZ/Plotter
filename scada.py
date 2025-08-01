@@ -100,7 +100,7 @@ class AsyncSocket:
     def __init__(self, loop, local_port:int, label:str):
         self.loop = loop
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4*1024*1024)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8*1024*1024)
         sock.setblocking(False)
         sock.bind(('0.0.0.0', local_port))
         self.sock,self.queue = sock, asyncio.Queue()
@@ -268,7 +268,7 @@ class Plotter(QWidget):
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(self.log_output); root.addWidget(scroll)
 
         self.timer = QTimer(self)
-        self.timer.setInterval(33)
+        self.timer.setInterval(1000)
         self.timer.timeout.connect(self._update_plot)
         self.timer.start()
 
