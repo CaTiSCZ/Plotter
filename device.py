@@ -1,7 +1,8 @@
 import logging
 from logger import application_logger
 from async_socket import AsyncSocket
-
+import threading
+import struct
 from enum import IntEnum
 
     # ---------------------- CMD a packety -------------------
@@ -25,29 +26,81 @@ class CMD(IntEnum):
 
 
 class Device:
-    def __init__(self):
+    # ---------------------- CRC CCITT ----------------------
+    @staticmethod
+    def crc16_ccitt(data: bytes, start, end, poly=0x1021, crc=0xFFFF):
+        for i in range (start, end):
+            crc ^= data[i] << 8
+            for _ in range(8):
+                if crc & 0x8000:
+                    crc = (crc << 1) ^ poly
+                else:
+                    crc <<= 1
+                crc &= 0xFFFF
+        return crc
+
+    def verify_crc(self, packet):
+        if (l:=len(packet)) < 2:
+            self._logger.error(f"Verify crc: Too short packet ({l}).")
+            return False
+        crc_position = l - 2
+        received_crc = self._crc_parser.unpack_from(packet, crc_position)[0]
+        if (crc:=Device.crc16_ccitt(packet, 0, crc_position)) != received_crc:
+            self._logger.debug(f"CRC mismatch: expected 0x{crc:04X}, received 0x{received_crc:04X}")
+            return False
+        return True
+
+    def __init__(self, cmd_socket, addr):
         self._logger = logging.getLogger(__class__.__name__ if application_logger is None else f'{application_logger}.{__class__.__name__}')
-    def send_command(self, cmd: int, data: bytes = b'', expect_response: bool = False, expected_packets: int = 1):
-        pkt = struct.pack('<I', cmd) + data
-        self.udp_relay.sendto(pkt, (self.udp_device_addr, self.udp_device_port)) 
+        
+        self.cmd_socket = cmd_socket
+        self.addr = addr
 
-        if not expect_response:
-            return None
+        self._packet_type_parser = struct.Struct("<H")
+        self._ack_packet_parser = struct.Struct("<HI")
 
-        responses = []
-        self.udp_relay.settimeout(0.3)
-        try:
-            for _ in range(expected_packets):
-                resp, _ = self.udp_relay.recvfrom(1024) 
-                responses.append(resp)
-        except socket.timeout: #???
-            if not responses:
-                self._logger.warning(f"CMD {cmd}: no response")
-            else:
-                self._logger.info(f"CMD {cmd}: received {len(responses)} / {expected_packets} packets")
-        #finally:
-            #self.sock.settimeout(None)
-        return responses if expected_packets > 1 else (responses[0] if responses else None)
+        self._crc_parser = struct.Struct("<H")
+
+        self.sent_commands = {}
+        self.timeout = 1
+
+        self.send_command_lock = threading.Lock()
+
+    def packet_received (self, packet):
+        if (l:=len(packet)) < 2:
+            self._logger.warning(f"Packet received: Too short packet ({l}).")
+            return
+        packet_type = self._packet_type_parser.unpack_from(packet, 0)[0]
+        match packet_type:
+            case PACKET.ACK_packet:
+                error, cmd = self._ack_packet_parser.unpack_from(packet, 2)
+                try:
+                    with self.send_command_lock:
+                        timer, on_timeout, on_ack = self.sent_commands[cmd]
+                        del self.sent_commands[cmd]
+
+                    timer.cancel()
+                    on_ack(error, packet[8:])
+                except KeyError:
+                    self._logger.info("Packet received: unexpected ACK for {cmd}")
+    
+    def _on_timeout(self, cmd):
+        with self.send_command_lock:
+            timer, on_timeout, on_ack = self.sent_commands[cmd]
+            del self.sent_commands[cmd]
+        on_timeout()
+
+
+    def send_command(self, cmd: int, data: bytes = b'', on_timeout = None, on_ack = None):
+        with self.send_command_lock:
+            if on_timeout is not None and on_ack is not None:
+                if cmd in self.sent_commands:
+                    self._logger.warning(f"Send command: Command {cmd} in progres.")
+                    return
+                self.sent_commands[cmd] = (threading.Timer(self.timeout, self._on_timeout), on_timeout, on_ack)
+
+            packet = struct.pack('<I', cmd) + data
+            self.cmd_socket.sendto(packet, self.addr)
 
     def ping(self):
         try:
