@@ -3,7 +3,7 @@ import threading
 from queue import Queue
 from contextlib import AbstractContextManager
 
-application_logger = 'Plotter'
+application_logger = None
 
 logger = None
 
@@ -39,6 +39,7 @@ class QueueListener(logging.handlers.QueueListener):
         self._utilization_viewer_lock = threading.Lock()
         self._utilization_viewer = utilization_viewer
         super().__init__(queue, *handlers, **kwargs)
+        self.handlers = list(self.handlers)
 
     def set_utilization_viewer(self, utilization_viewer):
         with self._utilization_viewer_lock:
@@ -51,7 +52,15 @@ class QueueListener(logging.handlers.QueueListener):
             if self._utilization_viewer is not None:
                 self._utilization_viewer(self.queue.qsize())
             return res
-        
+
+class GuiHandler(logging.Handler):
+    def __init__(self, sink, level = logging.DEBUG):
+        super().__init__(level)
+        self.sink = sink
+    def emit(self, record):
+        if self.sink is not None:
+            self.sink(self.formatter.format(record))
+
 class Logging(AbstractContextManager):
     def __init__(self, tcp_host='localhost', tcp_port=12344):
         super().__init__()

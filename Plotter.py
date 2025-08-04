@@ -1,5 +1,5 @@
 import logging
-from logger import Logging, application_logger, logger
+from logger import Logging, application_logger, GuiHandler
 
 import numpy as np
 import pyqtgraph as pg
@@ -32,6 +32,7 @@ class Plotter(QWidget):
     
     def __init__(self):
         super().__init__()
+        self.isShown = False
         self._logger = logging.getLogger(__class__.__name__ if application_logger is None else f'{application_logger}.{__class__.__name__}')
         self._logger.debug("Plotter GUI start")
 
@@ -156,7 +157,7 @@ class Plotter(QWidget):
         self.path_label = QLabel("Path:")
         self.path_display = QLineEdit("C://future_path" + 40 * "/DIR" + "/End")
         self.path_display.setReadOnly(True)
-        self.path_display.setStyleSheet("font-family: monospace; padding: 4px;")
+        self.path_display.setStyleSheet("font: consolas; padding: 4px;")
         self.path_display.setFrame(False)
         self.path_display.setCursorPosition(len(self.path_display.text()))
         self.path_display.setAlignment(Qt.AlignLeft)  
@@ -325,7 +326,8 @@ class Plotter(QWidget):
         self.log_output = QTextEdit("Log messenge:")
         self.log_output.setReadOnly(True)
         self.log_output.setLineWrapMode(QTextEdit.NoWrap)
-        self.log_output.setStyleSheet("font-family: monospace; background-color: #f8f8f8;")
+        self.log_output.setStyleSheet("background-color: #f8f8f8;")
+        self.log_output.setFont(QFont("consolas", 9)) 
         log_scroll_area = QScrollArea()
         log_scroll_area.setWidgetResizable(True)
         log_scroll_area.setWidget(self.log_output)
@@ -418,8 +420,15 @@ class Plotter(QWidget):
         self.select_all_checkbox.blockSignals(False)
 
     def log_message(self, msg: str):
-        timestamp = time.strftime("%H:%M:%S")
-        self.log_output.append(f"[{timestamp}] {msg}")
+        #timestamp = time.strftime("%H:%M:%S")
+        #self.log_output.append(f"[{timestamp}] {msg}")
+        if self.isShown:
+            self.log_output.append(msg)
+
+    def show(self):
+        res = super().show()
+        self.isShown = True
+        return res
 
     def closeEvent(self, event):
         self._logger.debug("Ukončuji aplikaci...")
@@ -429,17 +438,20 @@ class Plotter(QWidget):
 
         self.data_socket.stop()
         self.cmd_socket.stop()
-
-
+        self.isShown = False
         event.accept()
 
 def main(argv):
-    with Logging():
+    with Logging() as logger:
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
         QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
         app = QApplication(sys.argv)
-        app.setFont(QFont("Segoe UI", 10)) 
+        app.setFont(QFont("Segoe UI", 9)) 
         plotter = Plotter()
+        gui_log = GuiHandler(plotter.log_message)
+        gui_log.setFormatter(logging.Formatter('%(levelname)-8s%(message)-50s - from: %(name)-15s at: %(asctime)s.%(msecs)03d'))
+        gui_log.formatter.datefmt='%H:%M:%S'
+        logger.log_printer.handlers.append(gui_log)
         plotter.show()
         return app.exec_()
 
