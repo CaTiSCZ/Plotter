@@ -6,9 +6,10 @@ import pyqtgraph as pg
 from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget, QPushButton, QGridLayout, QApplication, QSpinBox, QDoubleSpinBox, \
     QCheckBox, QTextEdit, QScrollArea, QLineEdit, QDesktopWidget, QSizePolicy 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtGui import QFont
 import time
 
-from config_parser import ConfigParser
+from config_parser import ConfigParser  
 
 
 from buffered_socket import BufferedSocket
@@ -292,48 +293,32 @@ class Plotter(QWidget):
         grid.addWidget(self.queued_packets_value, 5, 11, alignment=Qt.AlignCenter)
 
 # device adresses
-        grid.addWidget(QLabel("Device 1:"), 0, 14)
-        grid.addWidget(QLabel("Device 2:"), 1, 14)
-        grid.addWidget(QLabel("Device 3:"), 2, 14)
-        grid.addWidget(QLabel("Device 4:"), 3, 14)
-        grid.addWidget(QLabel("Device 5:"), 4, 14)
-        
-        self.div_enable_1 = QCheckBox()
-        self.div_enable_1.setChecked(True) 
-        grid.addWidget(self.div_enable_1, 0, 13)
-        self.div_enable_2 = QCheckBox()
-        self.div_enable_2.setChecked(True) 
-        grid.addWidget(self.div_enable_2, 1, 13)
-        self.div_enable_3 = QCheckBox()
-        self.div_enable_3.setChecked(True) 
-        grid.addWidget(self.div_enable_3, 2, 13)
-        self.div_enable_4 = QCheckBox()
-        self.div_enable_4.setChecked(True) 
-        grid.addWidget(self.div_enable_4, 3, 13)
-        self.div_enable_5 = QCheckBox()
-        self.div_enable_5.setChecked(True) 
-        grid.addWidget(self.div_enable_5, 4, 13)       
-        
-        
-        
-        self.div_ip_edit_1 = QLineEdit(f"{self.udp_device_addr}:{self.udp_device_port}")
-        grid.addWidget(self.div_ip_edit_1, 0, 15, 1, 2)
-        self.div_ip_edit_2 = QLineEdit(f"{self.udp_device_addr}:{self.udp_device_port}")
-        grid.addWidget(self.div_ip_edit_2, 1, 15, 1, 2)
-        self.div_ip_edit_3 = QLineEdit(f"{self.udp_device_addr}:{self.udp_device_port}")
-        grid.addWidget(self.div_ip_edit_3, 2, 15, 1, 2)
-        self.div_ip_edit_4 = QLineEdit(f"{self.udp_device_addr}:{self.udp_device_port}")
-        grid.addWidget(self.div_ip_edit_4, 3, 15, 1, 2)
-        self.div_ip_edit_5 = QLineEdit(f"{self.udp_device_addr}:{self.udp_device_port}")
-        grid.addWidget(self.div_ip_edit_5, 4, 15, 1, 2)
-  
+        self.dev_enable = []
+        self.div_ip_edit = []
+        device_count = 5
+        for i in range (device_count):
+            self.dev_enable.append(QCheckBox(f"Device {i+1}:"))
+            self.dev_enable[-1].setChecked(True)
+            self.dev_enable[-1].stateChanged.connect(self._device_selected_changed) 
+            grid.addWidget(self.dev_enable[-1], i+1, 13)
+            self.div_ip_edit.append(QLineEdit(f"{self.udp_device_addr}:{self.udp_device_port}"))
+            grid.addWidget(self.div_ip_edit[-1], i+1, 14, 1, 1)
+
+        self.select_all_checkbox = QCheckBox("Select All")
+        self.select_all_checkbox.setChecked(True)
+        grid.addWidget(self.select_all_checkbox, 0, 13) 
+        self.select_all_checkbox.stateChanged.connect(lambda state: self._select_all_devices(state == Qt.Checked))
+        self.invert_selection_button = QPushButton("Invert Selection")
+        grid.addWidget(self.invert_selection_button, 0, 14, 1, 1)
+        self.invert_selection_button.clicked.connect(self._invert_selection_devices)
+         
         self.confirm_generator_button = QPushButton("Use")
-        grid.addWidget(self.confirm_generator_button, 5, 13, 1, 2, alignment=Qt.AlignCenter)
+        grid.addWidget(self.confirm_generator_button, device_count + 1, 13, 1, 1, alignment=Qt.AlignCenter)
         #self.generator_ip_edit.returnPressed.connect(lambda: self.log_message("TO DO"))
         self.confirm_generator_button.clicked.connect(lambda: self.log_message("TO DO"))
 
         self.connect_generator_button = QPushButton("Connect")
-        grid.addWidget(self.connect_generator_button, 5, 15,1,2, alignment=Qt.AlignCenter)
+        grid.addWidget(self.connect_generator_button, device_count + 1, 14,1,1, alignment=Qt.AlignCenter)
         self.connect_generator_button.clicked.connect(lambda: self.log_message("TO DO"))
 
 # === Sloupec 3: LOG ===
@@ -351,6 +336,7 @@ class Plotter(QWidget):
         for col in range(17):
             grid.setColumnStretch(col, 0)
 
+        #===Pevná velikost tlačítek:
         #tlačítka 
         for btn, width  in [
             (self.confirm_client_button, 40),
@@ -371,7 +357,7 @@ class Plotter(QWidget):
             btn.setMinimumWidth(width)
             btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
-        # Nastavení pevné velikosti pro labely a checkboxy
+        # labely a checkboxy
         for label in [
             self.listen_all_checkbox,
             self.cmd_label,
@@ -380,28 +366,19 @@ class Plotter(QWidget):
             self.num_packets_label,
             self.queued_packets,
             self.queued_packets_value,
-            self.div_enable_1,
-            self.div_enable_2,
-            self.div_enable_3,
-            self.div_enable_4,
-            self.div_enable_5,
-        ]:
+            self.select_all_checkbox
+        ] :
             label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
-        # Nastavení pevné velikosti pro textová pole a spiny
+        # textová pole a spiny
         for widget, width in [
             (self.command_port_edit, 50),
             (self.data_port_edit, 50),
             (self.trigger_position_label, 100),
             (self.register_text_edit, 100),
             (self.remove_text_edit, 100),
-            (self.div_ip_edit_1, 100),
-            (self.div_ip_edit_2, 100),
-            (self.div_ip_edit_3, 100),
-            (self.div_ip_edit_4, 100),
-            (self.div_ip_edit_5, 100),
             (self.num_packets_spinbox, 50)
-        ]:
+        ] + list((k, 100) for k in self.div_ip_edit):
             widget.setFixedWidth(width)
             widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
@@ -409,9 +386,36 @@ class Plotter(QWidget):
 
         self.layout.addLayout(grid)
 
-        
-       
+    def _select_all_devices(self, checked):
+        self._logger.debug("select all")
+        for checkbox in self.dev_enable:
+            checkbox.blockSignals(True)
+            checkbox.setChecked(checked)
+            checkbox.blockSignals(False)
+        self.select_all_checkbox.blockSignals(True)
+        self.select_all_checkbox.setChecked(checked)
+        self.select_all_checkbox.blockSignals(False)
 
+    def _invert_selection_devices(self):
+        self._logger.debug("invert selection")
+        for checkbox in self.dev_enable:
+            checkbox.blockSignals(True)
+            checkbox.setChecked(not checkbox.isChecked())
+            checkbox.blockSignals(False)
+
+        # Po invertu ověř, jestli je všechno zaškrtnuté
+        all_checked = all(cb.isChecked() for cb in self.dev_enable)
+        self.select_all_checkbox.blockSignals(True)
+        self.select_all_checkbox.setChecked(all_checked)
+        self.select_all_checkbox.blockSignals(False) 
+    
+    def _device_selected_changed(self, state):
+        # Pokud je něco nezaškrtnuté → "Select All" musí být odškrtnutý
+        all_checked = all(cb.isChecked() for cb in self.dev_enable)
+        
+        self.select_all_checkbox.blockSignals(True)
+        self.select_all_checkbox.setChecked(all_checked)
+        self.select_all_checkbox.blockSignals(False)
 
     def log_message(self, msg: str):
         timestamp = time.strftime("%H:%M:%S")
@@ -434,6 +438,7 @@ def main(argv):
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
         QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
         app = QApplication(sys.argv)
+        app.setFont(QFont("Segoe UI", 10)) 
         plotter = Plotter()
         plotter.show()
         return app.exec_()
