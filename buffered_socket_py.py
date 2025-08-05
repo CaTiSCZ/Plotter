@@ -2,7 +2,7 @@ import socket
 import threading
 import queue
 import time
-
+import traceback
 
 class BufferedSocket:
     def __init__(self, max_size = 4096):
@@ -17,10 +17,10 @@ class BufferedSocket:
         self._running = False
         self._listener_thread = None
         self._sender_thread = None
-        self._timeout = 5.0
+        self._timeout = 1
         self._received_count = 0
 
-    def bind(self, port: int, use_my_ip: bool = False, device_ip: str = "192.168.1.100", device_port: int = "9999"): 
+    def bind(self, port: int, use_my_ip: bool = False, device_ip: str = "192.168.1.100", device_port: int = 9999): 
         self.close()
         with self._sock_lock:
             if use_my_ip:
@@ -40,7 +40,8 @@ class BufferedSocket:
             self._sock.bind(self._addr)
             self._sock.settimeout(5.0)
             self._start()
-            #print(f"[INFO] Bound to {self.addr[0]}:{self.addr[1]}")      
+            #print(f"[INFO] Bound to {self.addr[0]}:{self.addr[1]}")     
+        return self._addr 
 
     def _start(self):
         if not self._sock:
@@ -67,8 +68,7 @@ class BufferedSocket:
             self._listener_thread.join(timeout=2)
         if self._sender_thread and self._sender_thread.is_alive():
             self._sender_thread.join(timeout=2)
-
-
+        self._addr = None
 
     def _listen_loop(self):
         while self._running:
@@ -121,74 +121,89 @@ class BufferedSocket:
     def get_received_count(self):
         return self._receive_buffer.qsize()
 
+    def bound_to(self):
+        return self._addr
 
-if __name__ == '__main__':
-
+def test_main(Socket = BufferedSocket):
     # Konfigurace adres
-    local_host = '127.0.0.1'
+    #local_host = '127.0.0.1'
     local_port = 5000
     remote_host = '127.0.0.1'
+    #remote_host = '192.168.1.48'
     remote_port = 5001
 
-    relay = BufferedSocket()
-    relay.bind(port=local_port, use_my_ip=True, device_ip=remote_host)
+    socket_ = Socket()
+    bound_to = socket_.bind(port=local_port, use_my_ip=True, device_ip=remote_host)
     
 
-    print(f"Relay spuštěn. Poslouchám na {local_host}:{local_port}")
+    print(f"Socket spuštěn. Poslouchám na {bound_to[0]}:{bound_to[1]}")
     print("Zmáčkni 's' pro zapnutí/vypnutí odesílání \"Ahoj\" každou sekundu.")
     print("Zmáčkni 'q' pro ukončení programu.")
 
     sending_event = threading.Event()
     quit_event = threading.Event()
+    sending_event.set()
 
     def periodic_sender():
+        i = 0
         while not quit_event.is_set():
+            #print(f"sender period {i} @ {time.time():.3f}")
+            i += 1
             if sending_event.is_set():
-                message = "Ahoj\n".encode('utf-8')
-                relay.sendto(message, (remote_host, remote_port))
+                message = f"Ahoj {i}\n".encode('utf-8')
+                #print("sending... ", end = '')
+                socket_.sendto(message, (remote_host, remote_port))
+                #print("msg sent")
             time.sleep(1)
+        print("[INFO] Ukončuji (periodic_sender)...")
 
     def input_listener():
         while not quit_event.is_set():
             try:
-                cmd = input().strip().lower()
-                if cmd == 's':
-                    if sending_event.is_set():
-                        sending_event.clear()
-                        print("[INFO buffered socket] Odesílání VYPNUTO")
-                    else:
-                        sending_event.set()
-                        print(f"[INFO buffered socket] Odesílání ZAPNUTO na {remote_host}:{remote_port}")
-                elif cmd == 'q':
-                    print("[INFO buffered socket] Ukončuji...")
-                    quit_event.set()
-                    relay.close()
-                    break
-            except EOFError:
-                quit_event.set()
-                relay.close()
-                break
+                packet = socket_.recvfrom(4096)
+            except socket.timeout:
+                time.sleep(0.01)
+            except Exception as e:
+                print(f"recvfrom failed with message {e}")
+                traceback.print_exc()
+            else:
+                if packet:
+                    # print(f"Received packet [{len(packet)}]: \"{packet}\"")
+                    # continue
+                    data, addr = packet
+                    text = data.decode('utf-8', errors='ignore')
+                    print(f"[PŘIJATO] od {addr}: {text}")
+                    data = text.swapcase().encode('utf-8')
+                    socket_.sendto(data, addr)
+                else:
+                    time.sleep(0.01)
+        print("[INFO] Ukončuji (input_listener)...")
 
-    threading.Thread(target=input_listener, daemon=True).start()
-    threading.Thread(target=periodic_sender, daemon=True).start()
-
+    listener = threading.Thread(target=input_listener, daemon=True)
+    sender = threading.Thread(target=periodic_sender, daemon=True)
+    listener.start()
+    sender.start()
 
     try:
         while not quit_event.is_set():
-            packet = relay.recvfrom(4096)
-            if packet:
-                data, addr = packet
-                text = data.decode('utf-8', errors='ignore')
-                print(f"[PŘIJATO] od {addr}: {text}")
-                relay.sendto(data, addr)
-            else:
-                time.sleep(0.01)
+            cmd = input().strip().lower()
+            if cmd == 's':
+                if sending_event.is_set():
+                    sending_event.clear()
+                    print("[INFO buffered socket] Odesílání VYPNUTO")
+                else:
+                    sending_event.set()
+                    print(f"[INFO buffered socket] Odesílání ZAPNUTO na {remote_host}:{remote_port}")
+            elif cmd == 'q':
+                print("[INFO buffered socket] Ukončuji...")
+                break
     except KeyboardInterrupt:
         print("\n[INFO] Ukončuji (KeyboardInterrupt)...")
-        quit_event.set()
-        relay.close()
-
     except Exception as e:
         print(f"\n[CHYBA]: {e}")
+    finally:
         quit_event.set()
-        relay.close()
+        listener.join()
+        sender.join()
+        socket_.close()
+        print("[INFO] Vše korektně ukončeno.")
