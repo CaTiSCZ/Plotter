@@ -5,10 +5,12 @@
 
 namespace py = pybind11;
 
+using BufferedSocket = buffered_socket::BufferedSocket<std::vector<uint8_t> >;
+
 PYBIND11_MODULE(buffered_socket_cpp, m) {
     py::object py_socket = py::module_::import("socket");
     py::object py_socket_timeout = py_socket.attr("timeout");
-    py::register_exception<SocketTimeout>(m, "SocketTimeout", py_socket_timeout.ptr());
+    py::register_exception<buffered_socket::SocketTimeout>(m, "SocketTimeout", py_socket_timeout.ptr());
     py::class_<BufferedSocket>(m, "BufferedSocket")
         .def(py::init<int>(), py::arg("max_size") = 4096)
         .def("bind", &BufferedSocket::bind, py::arg("port"), py::arg("use_my_ip")=false, py::arg("device_ip")="192.168.1.100", py::arg("device_port")=9999)
@@ -33,7 +35,6 @@ PYBIND11_MODULE(buffered_socket_cpp, m) {
 
 /*
 <%
-cfg["sources"] = ["buffered_socket.cpp"]
 cfg["dependencies"] = ["buffered_socket.hpp", "winsock_manager.hpp"]
 setup_pybind11(cfg)
 %>

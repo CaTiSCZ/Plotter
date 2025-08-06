@@ -16,7 +16,9 @@ if USE_PYTHON_SOCKET:
     from buffered_socket_py import BufferedSocket
 else:
     import cppimport
+    print("Importuji C++ BufferedSocket...")
     buffered_socket = cppimport.imp("buffered_socket.buffered_socket_cpp")
+    BufferedSocket = buffered_socket.BufferedSocket
 
 from async_socket import AsyncSocket
 from device_manager import DeviceManager

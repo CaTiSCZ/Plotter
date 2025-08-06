@@ -8,12 +8,16 @@
 # handler.setFormatter(formatter)
 # root_logger.addHandler(handler)
 
-import cppimport
-
-buffered_socket = cppimport.imp("buffered_socket.buffered_socket_cpp")
-#import buffered_socket_py as buffered_socket
+USE_PYTHON_SOCKET = False
+if USE_PYTHON_SOCKET:
+    from buffered_socket_py import BufferedSocket
+else:
+    import cppimport
+    print("Importuji C++ BufferedSocket...")
+    buffered_socket = cppimport.imp("buffered_socket.buffered_socket_cpp")
+    BufferedSocket = buffered_socket.BufferedSocket
 
 from buffered_socket_py import test_main
 
 if __name__ == '__main__':
-    test_main(buffered_socket.BufferedSocket)
+    test_main(BufferedSocket)
