@@ -32,7 +32,7 @@ class BufferedSocket {
 public:
     BufferedSocket(int max_size = 4096)
         : max_size_(max_size), running_(false), sock_(INVALID_SOCKET),
-          timeout_(5.0), received_count_(0)
+          timeout_(1.0), received_count_(0)
     {
         WinsockManager::ensure_initialized();
     }
@@ -125,16 +125,19 @@ public:
             throw SocketTimeout("recvfrom timeout expired");
         auto p = std::move(receive_buffer_.front());
         receive_buffer_.pop();
+        //l.release();
         Container& data = p.first;
         if (data.size() > (size_t)bufsize)
             data.resize(bufsize);
         std::string sender_ip(INET_ADDRSTRLEN, '\0');
-        const char* result = inet_ntop(AF_INET, &p.second.sin_addr, &sender_ip[0], INET_ADDRSTRLEN);
-        if (!result)
+        if (!inet_ntop(AF_INET, &p.second.sin_addr, &sender_ip[0], INET_ADDRSTRLEN))
             throw std::runtime_error("inet_ntop failed");
         sender_ip.resize(std::min(strlen(sender_ip.c_str()), size_t(INET_ADDRSTRLEN)));
         int sender_port = ntohs(p.second.sin_port);
-        return {std::move(data), {sender_ip, sender_port}};
+        auto result = std::make_pair(std::move(data), std::make_pair(sender_ip, sender_port));
+        std::string s(reinterpret_cast<const char*>(result.first.data()), result.first.size());
+        std::cout << "cpp recvfrom " << result.second.first << ":" << result.second.second << " " << result.first.size() << " bytes: " << s << std::endl;
+        return result;
     }
 
     void settimeout(double timeout_sec) {
@@ -159,9 +162,19 @@ private:
             Container buffer;
             buffer.resize(max_size_);
             int ret = ::recvfrom(sock_, (char*)buffer.data(), max_size_, 0, (sockaddr*)&src_addr, &addrlen);
+            //std::cout << "cpp lstnloop ret " << ret << std::endl;
             if (ret > 0) {
                 buffer.resize(ret);
                 {
+                    /*std::cout << "cpp lstnloop "
+                              << int(src_addr.sin_addr.S_un.S_un_b.s_b1) << "."
+                              << int(src_addr.sin_addr.S_un.S_un_b.s_b2) << "."
+                              << int(src_addr.sin_addr.S_un.S_un_b.s_b3) << "."
+                              << int(src_addr.sin_addr.S_un.S_un_b.s_b4) << ":"
+                              << int(ntohs(src_addr.sin_port))      << " "
+                              << buffer.size()                      << " bytes: "
+                              << std::string(reinterpret_cast<const char*>(buffer.data()), buffer.size())
+                              << std::endl;*/
                     std::lock_guard<std::mutex> l(recv_mutex_);
                     receive_buffer_.emplace(std::move(buffer), src_addr);
                     received_count_++;

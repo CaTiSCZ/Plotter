@@ -168,8 +168,8 @@ def test_main(Socket = BufferedSocket):
                 traceback.print_exc()
             else:
                 if packet:
-                    # print(f"Received packet [{len(packet)}]: \"{packet}\"")
-                    # continue
+                    #print(f"Received packet [{len(packet)}]: \"{packet}\"")
+                    continue
                     data, addr = packet
                     text = data.decode('utf-8', errors='ignore')
                     print(f"[PŘIJATO] od {addr}: {text}")

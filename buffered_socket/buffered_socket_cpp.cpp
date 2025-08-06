@@ -20,14 +20,34 @@ PYBIND11_MODULE(buffered_socket_cpp, m) {
                 throw std::runtime_error("Address must be a tuple (ip, port)");
             std::string ip = py::str(addr[0]);
             int port = py::int_(addr[1]);
-            std::string s = data;
-            self.sendto(std::vector<uint8_t>(s.begin(), s.end()), ip, port);
+            const char* pdata = PyBytes_AsString(data.ptr());
+            size_t size = PyBytes_Size(data.ptr());
+            self.sendto(std::vector<uint8_t>(pdata, pdata + size), ip, port);
         }, py::arg("data"), py::arg("address"))
         .def("recvfrom", [](BufferedSocket& self, int bufsize) {
             py::gil_scoped_release release;
             auto result = self.recvfrom(bufsize);
-            py::bytes data(reinterpret_cast<const char*>(result.first.data()), result.first.size());
-            return std::make_tuple(data, std::make_tuple(result.second.first, result.second.second));
+            // py::bytes data(reinterpret_cast<const char*>(result.first.data()), result.first.size());
+            // PyObject* obj = PyBytes_FromStringAndSize(
+            //     reinterpret_cast<const char*>(result.first.data()),
+            //     static_cast<Py_ssize_t>(result.first.size())
+            // );
+            // if (!obj)
+            //     throw std::runtime_error("PyBytes_FromStringAndSize failed!");
+            if (result.first.size() == 0)
+                throw std::runtime_error("Empty packet received");
+            if (result.first.data() == nullptr)
+                throw std::runtime_error("null data");
+            std::string s(reinterpret_cast<const char*>(result.first.data()), result.first.size());
+            py::bytes data(s);
+            std::cout << "pyd recvfrom "
+                      << result.second.first  << ":"
+                      << result.second.second << " "
+                      << result.first.size()  << " bytes: "
+                      << s
+                      << std::endl;
+            return 42;
+            //return std::make_tuple(data, std::make_tuple(result.second.first, result.second.second));
         })
         .def("settimeout", &BufferedSocket::settimeout)
         .def("get_received_count", &BufferedSocket::get_received_count);
