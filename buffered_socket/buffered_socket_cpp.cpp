@@ -35,16 +35,8 @@ PYBIND11_MODULE(buffered_socket_cpp, m) {
                 if (result.first.data() == nullptr)
                     throw std::runtime_error("null data");
             }
-            std::string s(reinterpret_cast<const char*>(result.first.data()), result.first.size());
-            py::bytes data(reinterpret_cast<const char*>(result.first.data()), result.first.size());
-            std::cout << "pyd recvfrom "
-                    << result.second.first  << ":"
-                    << result.second.second << " "
-                    << result.first.size()  << " bytes: "
-                    << s
-                    << std::endl;
-            //return data;
-            return py::make_tuple(data, py::make_tuple(result.second.first, result.second.second));
+            return py::make_tuple(py::bytes(reinterpret_cast<const char*>(result.first.data()), result.first.size()),
+                                  py::make_tuple(result.second.first, result.second.second));
         })
         .def("settimeout", &BufferedSocket::settimeout)
         .def("get_received_count", &BufferedSocket::get_received_count);
