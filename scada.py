@@ -124,6 +124,7 @@ class Device:
         self.cmd_sock.connect((ip, cmd_port))
         self.buffer = DeviceBuffer(self.channels)
         self.id = int(ip.split('.')[3])
+        self.data_struct = struct.Struct('<'+'h'*SAMPLES_PER_PACKET)
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True):
         pkt = struct.pack('<I', code) + payload
         self.cmd_sock.send(pkt)
@@ -152,12 +153,12 @@ class Device:
         if not data: return
         typ, order = struct.unpack('<HH', data[:4])
         if typ != self.PKT_TYPE_DATA: return
-        print(f"[DBG] Dev {self.id} dataPacket {order} length {len(pkt)}")
+        #print(f"[DBG] Dev {self.id} dataPacket {order} length {len(pkt)}")
         off = 4
         t = [order*SAMPLES_PER_PACKET + k for k in range(SAMPLES_PER_PACKET)]
         samples = []
         for _ in range(self.channels):
-            sig = struct.unpack('<'+'h'*SAMPLES_PER_PACKET, data[off:off+2*SAMPLES_PER_PACKET])
+            sig = self.data_struct.unpack(data[off:off+2*SAMPLES_PER_PACKET])
             samples.append(list(sig)); off += 2*SAMPLES_PER_PACKET
         errs = list(data[off:off+self.channels])
         self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
