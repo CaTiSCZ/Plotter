@@ -39,6 +39,7 @@ PACKET_RATE_HZ     = 1000
 SAMPLING_PERIOD    = 1/(SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 BUFFER_LENGTH_S    = 10
 BUFFER_SIZE        = int(BUFFER_LENGTH_S*SAMPLES_PER_PACKET*PACKET_RATE_HZ)
+DEFAULT_AVG_LEN_MS = 1000
 
 # CRC-16/CCITT checksum
 def crc16_ccitt(data: bytes, poly: int=0x1021, crc: int=0xFFFF) -> int:
@@ -159,7 +160,7 @@ class Device:
         samples = []
         for _ in range(self.channels):
             sig = self.data_struct.unpack(data[off:off+2*SAMPLES_PER_PACKET])
-            samples.append(list(sig)); off += 2*SAMPLES_PER_PACKET
+            samples.append(sig); off += 2*SAMPLES_PER_PACKET
         errs = list(data[off:off+self.channels])
         self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
 
@@ -248,6 +249,7 @@ class Plotter(QWidget):
         btns.addWidget(QLabel('Samples:'))
         self.sample_spin = QSpinBox(); self.sample_spin.setRange(0,10000); self.sample_spin.setValue(10); btns.addWidget(self.sample_spin)
         b=QPushButton('Start Sampling'); b.clicked.connect(self._start_sampling); btns.addWidget(b)
+        b=QPushButton('Start New Sampling'); b.clicked.connect(self._start_new_sampling); btns.addWidget(b)
         b=QPushButton('Stop Sampling'); b.clicked.connect(self._stop_sampling); btns.addWidget(b)
         b=QPushButton('Reset Counter'); b.clicked.connect(self._reset_counter); btns.addWidget(b)
         b=QPushButton('Clean Graf'); b.clicked.connect(self.clear_plot); btns.addWidget(b)
@@ -333,6 +335,11 @@ class Plotter(QWidget):
         else:
             for ip,dev in self.manager.devices.items(): dev.start_sampling(n); self.log_message(f'Start on {ip} (n={n})')
 
+    def _start_new_sampling(self):
+        self._reset_counter()
+        self.clear_plot()
+        QTimer(self).singleShot(100, self._start_sampling)
+
     def _stop_sampling(self):
         self.manager.broadcast('stop_sampling')
         self.log_message('Stopped all sampling')
@@ -376,14 +383,17 @@ class Plotter(QWidget):
             if not buf.time: continue
             with buf.lock:
                 x=np.array(buf.signal[0])*SAMPLING_PERIOD
+                avgs = [0] * dev.channels
                 for ch in range(dev.channels):
                     key=(ip,ch)
                     if key not in self.curves:
                         self.curves[key]=self.ax.plot(pen=pg.intColor(hash(key)&0xFFFF,hues=32),name=f'{ip}[{ch}]')
                     y=np.array(buf.signal[ch+1])[-len(x):]
+                    avgs[ch] = np.mean(y[-min(len(y), SAMPLES_PER_PACKET*DEFAULT_AVG_LEN_MS):])
                     self.curves[key].setData(x[-len(y):],y)
                 errs=','.join(str(sum(list(buf.error[c])[-SAMPLES_PER_PACKET:])) for c in range(dev.channels))
-            lines.append(f'{ip}: {errs}')
+            avgs = ', '.join(map(lambda v: f'{v:.3f}', avgs))
+            lines.append(f'{ip}: {errs}; avg = {avgs}')
         self.error_lbl.setText('Parity errors:\n'+"\n".join(lines))
 
 if __name__=='__main__':
@@ -400,4 +410,14 @@ if __name__=='__main__':
         manager.dispatch_loop(gui.data_ready)
         loop.run_forever()
     threading.Thread(target=start_loop,daemon=True).start()
+    def autoinit():
+        gui._update_defaults('192.168.137.101:')
+        for i, checkbox in enumerate(gui.device_checks):
+            checkbox.setChecked(i == 0)
+        gui.leader_buttons.button(0).setChecked(True)
+        gui._apply_devices()
+        for i, f in enumerate((gui._ping_all, gui._get_ids, gui._register_all, gui._reset_counter)):
+            QTimer(gui).singleShot(i * 100, f)        
+        gui.sample_spin.setValue(int(1.1*DEFAULT_AVG_LEN_MS))
+    QTimer(gui).singleShot(500, autoinit)
     gui.show(); sys.exit(app.exec_())
