@@ -125,7 +125,7 @@ public:
             throw SocketTimeout("recvfrom timeout expired");
         auto p = std::move(receive_buffer_.front());
         receive_buffer_.pop();
-        //l.release();
+        l.unlock();
         Container& data = p.first;
         if (data.size() > (size_t)bufsize)
             data.resize(bufsize);
