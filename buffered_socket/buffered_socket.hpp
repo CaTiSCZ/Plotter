@@ -134,7 +134,7 @@ public:
             throw std::runtime_error("inet_ntop failed");
         sender_ip.resize(std::min(strlen(sender_ip.c_str()), size_t(INET_ADDRSTRLEN)));
         int sender_port = ntohs(p.second.sin_port);
-        auto result = std::make_pair(std::move(data), std::make_pair(sender_ip, sender_port));
+        auto result = std::make_pair(std::move(data), std::make_pair(std::move(sender_ip), sender_port));
         std::string s(reinterpret_cast<const char*>(result.first.data()), result.first.size());
         std::cout << "cpp recvfrom " << result.second.first << ":" << result.second.second << " " << result.first.size() << " bytes: " << s << std::endl;
         return result;

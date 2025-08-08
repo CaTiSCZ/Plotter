@@ -5,7 +5,8 @@
 
 namespace py = pybind11;
 
-using BufferedSocket = buffered_socket::BufferedSocket<std::vector<uint8_t> >;
+using BufferedSocket_Container = std::vector<uint8_t>;
+using BufferedSocket = buffered_socket::BufferedSocket<BufferedSocket_Container>;
 
 PYBIND11_MODULE(buffered_socket_cpp, m) {
     py::object py_socket = py::module_::import("socket");
@@ -25,29 +26,25 @@ PYBIND11_MODULE(buffered_socket_cpp, m) {
             self.sendto(std::vector<uint8_t>(pdata, pdata + size), ip, port);
         }, py::arg("data"), py::arg("address"))
         .def("recvfrom", [](BufferedSocket& self, int bufsize) {
-            py::gil_scoped_release release;
-            auto result = self.recvfrom(bufsize);
-            // py::bytes data(reinterpret_cast<const char*>(result.first.data()), result.first.size());
-            // PyObject* obj = PyBytes_FromStringAndSize(
-            //     reinterpret_cast<const char*>(result.first.data()),
-            //     static_cast<Py_ssize_t>(result.first.size())
-            // );
-            // if (!obj)
-            //     throw std::runtime_error("PyBytes_FromStringAndSize failed!");
-            if (result.first.size() == 0)
-                throw std::runtime_error("Empty packet received");
-            if (result.first.data() == nullptr)
-                throw std::runtime_error("null data");
+            std::pair<BufferedSocket_Container, std::pair<std::string, int>> result;
+            {
+                py::gil_scoped_release release;
+                result = std::move(self.recvfrom(bufsize));
+                if (result.first.size() == 0)
+                    throw std::runtime_error("Empty packet received");
+                if (result.first.data() == nullptr)
+                    throw std::runtime_error("null data");
+            }
             std::string s(reinterpret_cast<const char*>(result.first.data()), result.first.size());
-            py::bytes data(s);
+            py::bytes data(reinterpret_cast<const char*>(result.first.data()), result.first.size());
             std::cout << "pyd recvfrom "
-                      << result.second.first  << ":"
-                      << result.second.second << " "
-                      << result.first.size()  << " bytes: "
-                      << s
-                      << std::endl;
-            return 42;
-            //return std::make_tuple(data, std::make_tuple(result.second.first, result.second.second));
+                    << result.second.first  << ":"
+                    << result.second.second << " "
+                    << result.first.size()  << " bytes: "
+                    << s
+                    << std::endl;
+            //return data;
+            return py::make_tuple(data, py::make_tuple(result.second.first, result.second.second));
         })
         .def("settimeout", &BufferedSocket::settimeout)
         .def("get_received_count", &BufferedSocket::get_received_count);

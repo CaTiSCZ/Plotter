@@ -134,7 +134,6 @@ def test_main(Socket = BufferedSocket):
 
     socket_ = Socket()
     bound_to = socket_.bind(port=local_port, use_my_ip=True, device_ip=remote_host)
-    
 
     print(f"Socket spuštěn. Poslouchám na {bound_to[0]}:{bound_to[1]}")
     print("Zmáčkni 's' pro zapnutí/vypnutí odesílání \"Ahoj\" každou sekundu.")
@@ -168,6 +167,7 @@ def test_main(Socket = BufferedSocket):
                 traceback.print_exc()
             else:
                 if packet:
+                    print(packet)
                     #print(f"Received packet [{len(packet)}]: \"{packet}\"")
                     continue
                     data, addr = packet
@@ -207,3 +207,6 @@ def test_main(Socket = BufferedSocket):
         sender.join()
         socket_.close()
         print("[INFO] Vše korektně ukončeno.")
+
+if __name__ == '__main__':
+    test_main()
