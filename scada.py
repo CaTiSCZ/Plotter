@@ -207,6 +207,41 @@ class Plotter(QWidget):
     # emits (ip, packet_order)
     data_ready = pyqtSignal(str, int)
 
+    Colors = [
+        pg.mkColor(255,   0,   0), # red
+        pg.mkColor(  0, 255,   0), # green
+        pg.mkColor(  0,   0, 255), # blue
+        pg.mkColor(255, 255,   0), # yellow
+        pg.mkColor(  0, 255, 255), # azure
+        pg.mkColor(255,   0, 255), # pink
+        pg.mkColor(  0, 192, 192), # tyrkys
+        pg.mkColor(128,   0, 255), # violet
+        pg.mkColor(128, 255,   0), # limet
+        pg.mkColor(  0, 255, 128), # light green
+        pg.mkColor(  0, 128, 255), # light green
+        pg.mkColor(255, 128,   0), # orenge
+        pg.mkColor(255, 215,   0), # gold
+        pg.mkColor(169,  82,  45), # brown
+        pg.mkColor(255, 255, 255), # white
+        pg.mkColor(192, 192, 192), # grey
+        pg.mkColor(255, 255, 224), # ivory
+        pg.mkColor(255, 200, 124), # light orange
+        pg.mkColor(255, 128, 192), # light orange
+        pg.mkColor(255, 102, 102), # salmon
+        pg.mkColor(204, 153, 255), # light violet
+        pg.mkColor(204, 102, 255), # lila
+        pg.mkColor(102, 102, 255), # blue-violet
+        pg.mkColor(  0, 128, 128), # blue-green
+        pg.mkColor(128, 128,   0), # olive
+        pg.mkColor(  0, 128,  64), # dark green
+        pg.mkColor(  0, 128, 192), # dark tyrkys
+        pg.mkColor(255, 102,   0), # dark orange
+        pg.mkColor(128,   0,  32), # bordo
+        pg.mkColor( 70, 130, 180), # steel blue
+        pg.mkColor(210, 180, 140), # light bworn
+        pg.mkColor(107, 142,  35)  # green olive
+    ]
+
     def __init__(self, manager:DeviceManager):
         super().__init__()
         self.manager = manager
@@ -396,7 +431,7 @@ class Plotter(QWidget):
                 for ch in range(dev.channels):
                     key=(ip,ch)
                     if key not in self.curves:
-                        self.curves[key]=self.ax.plot(pen=pg.intColor(hash(key)&0xFFFF,hues=32),name=f'{ip}[{ch}]')
+                        self.curves[key]=self.ax.plot(pen=Plotter.Colors[len(self.curves)],name=f'{ip}[{ch}]')
                     y=np.array(buf.signal[ch+1])[-len(x):]
                     avgs[ch] = np.mean(y[-min(len(y), SAMPLES_PER_PACKET*DEFAULT_AVG_LEN_MS):])
                     self.curves[key].setData(x[-len(y):],y)
