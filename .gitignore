@@ -1,0 +1,4 @@
+# Python dočasné soubory
+__pycache__/
+*.py[cod]
+

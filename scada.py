@@ -16,9 +16,15 @@ Features:
   - UDP I/O via selector-based asyncio loop (Windows compatible)
 """
 from __future__ import annotations
+
+import logging
+from logger import Logging, CallbackHandler, application_logger, logger
+
 import asyncio, struct, socket, sys, time, threading, csv
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
+from contextlib import ExitStack
 from typing import Dict, Tuple, List
 
 import numpy as np
@@ -29,6 +35,8 @@ from PyQt5.QtWidgets import (
     QScrollArea, QRadioButton, QButtonGroup, QFileDialog
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+
+from config_parser import ConfigParser
 
 # Constants
 DEFAULT_CMD_PORT   = 10578
@@ -206,6 +214,7 @@ class DeviceManager:
 class Plotter(QWidget):
     # emits (ip, packet_order)
     data_ready = pyqtSignal(str, int)
+    log_handler_signal = pyqtSignal(str)
 
     Colors = [
         pg.mkColor(255,   0,   0), # red
@@ -244,6 +253,7 @@ class Plotter(QWidget):
 
     def __init__(self, manager:DeviceManager):
         super().__init__()
+        self._logger = logging.getLogger(__class__.__name__ if application_logger is None else f'{application_logger}.{__class__.__name__}')
         self.manager = manager
         self.default_cmd_port = DEFAULT_CMD_PORT
         self.last_order: Dict[str,int] = {}
@@ -312,6 +322,13 @@ class Plotter(QWidget):
         self.timer.start()
 
         self.data_ready.connect(self._check_order)
+
+        self.log_handler_signal.connect(self.log_message)
+        self.log_handler = CallbackHandler(self.log_handler_signal.emit)
+        self.log_handler.setFormatter(logging.Formatter('%(levelname)-8s%(message)-50s - from: %(name)-15s at: %(asctime)s.%(msecs)03d'))
+        self.log_handler.formatter.datefmt='%H:%M:%S'
+        self.log_handler.setLevel(logging.INFO)
+        logger.log_printer.handlers.append(self.log_handler) # global logger
 
     def log_message(self,msg:str): self.log_output.append(f'[{time.strftime("%H:%M:%S")}] {msg}')
 
@@ -449,27 +466,34 @@ class Plotter(QWidget):
                                "\n".join(lines))
 
 if __name__=='__main__':
-    if sys.platform.startswith('win'):
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling,True)
-    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps,True)
-    app=QApplication(sys.argv)
-    manager=DeviceManager()
-    gui=Plotter(manager)
-    def start_loop():
-        loop=asyncio.SelectorEventLoop(); asyncio.set_event_loop(loop)
-        manager.attach_loop(loop)
-        manager.dispatch_loop(gui.data_ready)
-        loop.run_forever()
-    threading.Thread(target=start_loop,daemon=True).start()
-    def autoinit():
-        gui._update_defaults('192.168.137.101:')
-        for i, checkbox in enumerate(gui.device_checks):
-            checkbox.setChecked(i == 0)
-        gui.leader_buttons.button(0).setChecked(True)
-        gui._apply_devices()
-        for i, f in enumerate((gui._ping_all, gui._get_ids, gui._register_all, gui._reset_counter)):
-            QTimer(gui).singleShot(i * 100, f)        
-        gui.sample_spin.setValue(int(1.1*DEFAULT_AVG_LEN_MS))
-    QTimer(gui).singleShot(500, autoinit)
-    gui.show(); sys.exit(app.exec_())
+    with ExitStack() as stack:
+        stack.enter_context(logger:=Logging())
+
+        persistent_storage_path = Path.home() / '.FDDS_SCADA'
+        config_file = persistent_storage_path / 'FDDS_SCADA.ini'
+        stack.enter_context(config:=ConfigParser(config_file))
+        
+        if sys.platform.startswith('win'):
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling,True)
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps,True)
+        app=QApplication(sys.argv)
+        manager=DeviceManager()
+        gui=Plotter(manager)
+        def start_loop():
+            loop=asyncio.SelectorEventLoop(); asyncio.set_event_loop(loop)
+            manager.attach_loop(loop)
+            manager.dispatch_loop(gui.data_ready)
+            loop.run_forever()
+        threading.Thread(target=start_loop,daemon=True).start()
+        def autoinit():
+            gui._update_defaults('192.168.137.101:')
+            for i, checkbox in enumerate(gui.device_checks):
+                checkbox.setChecked(i == 0)
+            gui.leader_buttons.button(0).setChecked(True)
+            gui._apply_devices()
+            for i, f in enumerate((gui._ping_all, gui._get_ids, gui._register_all, gui._reset_counter)):
+                QTimer(gui).singleShot(i * 100, f)        
+            gui.sample_spin.setValue(int(1.1*DEFAULT_AVG_LEN_MS))
+        QTimer(gui).singleShot(500, autoinit)
+        gui.show(); sys.exit(app.exec_())
