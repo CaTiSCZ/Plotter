@@ -407,7 +407,9 @@ class Plotter(QWidget):
                 sent = 0
             else:
                 sent += 1
-            lines.append(f'{ip}: packets = {int(len(x)//SAMPLES_PER_PACKET)}/{sent}/{self.expected_samples}; errs = {errs}; avg = {avgs}')
+            received = int(len(x)//SAMPLES_PER_PACKET)
+            sent = max(sent, received) # sent is updated in data_ready signal, which can be delayed from receiving buffer on heavy load
+            lines.append(f'{ip}: packets = {received}/{sent}/{self.expected_samples}; errs = {errs}; avg = {avgs}')
         self.error_lbl.setText(f'Statistic (ip: received / sent / expected packets (ms); channels parity errors; channels average per {DEFAULT_AVG_LEN_MS} ms):\n' + 
                                "\n".join(lines))
 
