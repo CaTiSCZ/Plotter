@@ -37,7 +37,7 @@ RECV_TIMEOUT_S     = 0.3
 SAMPLES_PER_PACKET = 200
 PACKET_RATE_HZ     = 1000
 SAMPLING_PERIOD    = 1/(SAMPLES_PER_PACKET*PACKET_RATE_HZ)
-BUFFER_LENGTH_S    = 10
+BUFFER_LENGTH_S    = 30
 BUFFER_SIZE        = int(BUFFER_LENGTH_S*SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 DEFAULT_AVG_LEN_MS = 1000
 
@@ -212,6 +212,7 @@ class Plotter(QWidget):
         self.manager = manager
         self.default_cmd_port = DEFAULT_CMD_PORT
         self.last_order: Dict[str,int] = {}
+        self.expected_samples = 0
 
         self.setWindowTitle('Eaton FDDS SCADA')
         self.resize(1400, 800)
@@ -247,7 +248,7 @@ class Plotter(QWidget):
         for label, fn in [('Ping All', self._ping_all), ('Get IDs', self._get_ids), ('Register All', self._register_all)]:
             b = QPushButton(label); b.clicked.connect(fn); btns.addWidget(b)
         btns.addWidget(QLabel('Samples:'))
-        self.sample_spin = QSpinBox(); self.sample_spin.setRange(0,10000); self.sample_spin.setValue(10); btns.addWidget(self.sample_spin)
+        self.sample_spin = QSpinBox(); self.sample_spin.setRange(0,BUFFER_SIZE); self.sample_spin.setValue(10); btns.addWidget(self.sample_spin)
         b=QPushButton('Start Sampling'); b.clicked.connect(self._start_sampling); btns.addWidget(b)
         b=QPushButton('Start New Sampling'); b.clicked.connect(self._start_new_sampling); btns.addWidget(b)
         b=QPushButton('Stop Sampling'); b.clicked.connect(self._stop_sampling); btns.addWidget(b)
@@ -281,9 +282,16 @@ class Plotter(QWidget):
 
     def _check_order(self, ip:str, order:int):
         last = self.last_order.get(ip)
-        if last is not None and order != (last + 1) & 0xFFFF:
-            self.log_message(f'[PKT ORDER] {ip}: expected {(last+1)&0xFFFF}, got {order}')
-        self.last_order[ip] = order
+        if last is not None:
+            expected = (last + 1) & 0xFFFF
+            if order != expected:
+                self.log_message(f'[PKT ORDER] {ip}: expected {expected}, got {order}')
+            next = ((last & ~0xFFFF) | order)
+            if expected > 0xC000 and order <  0x4000:
+                next += 0xFFFF
+        else:
+            next = 0
+        self.last_order[ip] = next
 
     def _update_defaults(self,text:str):
         try:
@@ -327,6 +335,7 @@ class Plotter(QWidget):
 
     def _start_sampling(self):
         n=self.sample_spin.value(); leader_id=self.leader_buttons.checkedId()
+        self.expected_samples = n
         for i,(ip,dev) in enumerate(self.manager.devices.items()):
             if i!=leader_id: dev.start_sampling_trigger(n); self.log_message(f'Trigger on follower {ip} (n={n})')
         if 0<=leader_id<len(self.manager.devices):
@@ -393,8 +402,14 @@ class Plotter(QWidget):
                     self.curves[key].setData(x[-len(y):],y)
                 errs=','.join(str(sum(list(buf.error[c])[-SAMPLES_PER_PACKET:])) for c in range(dev.channels))
             avgs = ', '.join(map(lambda v: f'{v:.3f}', avgs))
-            lines.append(f'{ip}: {errs}; avg = {avgs}')
-        self.error_lbl.setText('Parity errors:\n'+"\n".join(lines))
+            sent = self.last_order.get(ip)
+            if sent is None:
+                sent = 0
+            else:
+                sent += 1
+            lines.append(f'{ip}: packets = {int(len(x)//SAMPLES_PER_PACKET)}/{sent}/{self.expected_samples}; errs = {errs}; avg = {avgs}')
+        self.error_lbl.setText(f'Statistic (ip: received / sent / expected packets (ms); channels parity errors; channels average per {DEFAULT_AVG_LEN_MS} ms):\n' + 
+                               "\n".join(lines))
 
 if __name__=='__main__':
     if sys.platform.startswith('win'):
