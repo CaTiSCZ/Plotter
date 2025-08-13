@@ -49,9 +49,11 @@ def crc16_ccitt(data: bytes, poly: int=0x1021, crc: int=0xFFFF) -> int:
             crc = ((crc<<1)^poly)&0xFFFF if crc&0x8000 else (crc<<1)&0xFFFF
     return crc
 
+_crc_struct = struct.Struct('<H')
+
 def _verify_crc(pkt: bytes) -> bytes|None:
     if not pkt or len(pkt)<2: return None
-    data, recv_crc = pkt[:-2], struct.unpack('<H', pkt[-2:])[0]
+    data, recv_crc = pkt[:-2], _crc_struct.unpack(pkt[-2:])[0]
     return data if crc16_ccitt(data)==recv_crc else None
 
 # ID packet parsing from GrafTest
@@ -111,11 +113,12 @@ class AsyncSocket:
             data, addr = self.sock.recvfrom(4096)
             self.queue.put_nowait((data, addr))
         except: pass
-    def send(self, data:bytes, target:Tuple[str,int]):
+    def sendto(self, data:bytes, target:Tuple[str,int]):
         self.sock.sendto(data, target)
 
 # Single device client
 class Device:
+    PKT_TYPE_ACK = 0
     PKT_TYPE_DATA = 2
     def __init__(self, ip:str, cmd_port:int, data_port:int, loop):
         self.ip, self.cmd_port, self.data_port, self.loop = ip,cmd_port,data_port,loop
@@ -125,14 +128,19 @@ class Device:
         self.cmd_sock.connect((ip, cmd_port))
         self.buffer = DeviceBuffer(self.channels)
         self.id = int(ip.split('.')[3])
+        self.header_struct = struct.Struct('<HH')
         self.data_struct = struct.Struct('<'+'h'*SAMPLES_PER_PACKET)
-    def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True):
+    def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None):
         pkt = struct.pack('<I', code) + payload
-        self.cmd_sock.send(pkt)
+        if socket_ is None:
+            self.cmd_sock.send(pkt)
+        else:
+            socket_.sendto(pkt, (self.ip, self.cmd_port))
         if not expect: return None
-        try: return self.cmd_sock.recv(2048)
+        try: return (socket_ or self.cmd_sock).recv(2048)
         except socket.timeout: return None
-    def ping(self)->bool: return bool(self._send_cmd(0))
+    def ping(self, socket_=None)->bool:
+        return bool(self._send_cmd(0, expect=socket_ is None, socket_=socket_))
     def get_id(self)->dict|None:
         rsp = _verify_crc(self._send_cmd(1) or b'')
         if not rsp: return None
@@ -141,32 +149,41 @@ class Device:
         return info
     def register_receiver(self, addr:str, port:int):
         return self._send_cmd(2, socket.inet_aton(addr)+struct.pack('<H',port))
+    def remove_receiver(self, addr:str, port:int):
+        return self._send_cmd(3, socket.inet_aton(addr)+struct.pack('<H',port))
     def start_sampling(self, n:int=0):
         return self._send_cmd(5, struct.pack('<I',n))
     def start_sampling_trigger(self, n:int=0):
         return self._send_cmd(6, struct.pack('<I',n))
     def stop_sampling(self):
         return self._send_cmd(7, expect=False)
-    def reset_counter(self):
+    def force_trigger(self):
         return self._send_cmd(9, expect=False)
+    def reset_counter(self):
+        return self._send_cmd(10, expect=False)
     def on_raw_packet(self, pkt:bytes):
-        data = _verify_crc(pkt)
-        if not data: return
-        typ, order = struct.unpack('<HH', data[:4])
-        if typ != self.PKT_TYPE_DATA: return
-        #print(f"[DBG] Dev {self.id} dataPacket {order} length {len(pkt)}")
-        off = 4
-        t = [order*SAMPLES_PER_PACKET + k for k in range(SAMPLES_PER_PACKET)]
-        samples = []
-        for _ in range(self.channels):
-            sig = self.data_struct.unpack(data[off:off+2*SAMPLES_PER_PACKET])
-            samples.append(sig); off += 2*SAMPLES_PER_PACKET
-        errs = list(data[off:off+self.channels])
-        self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
+        typ, order = self.header_struct.unpack(pkt[:4])
+        match typ:
+            case self.PKT_TYPE_ACK:
+                print(f"Dev {self.ip} received ACK on DATA socket.")
+                return
+            case self.PKT_TYPE_DATA:
+                data = _verify_crc(pkt)
+                if not data: return
+                #print(f"[DBG] Dev {self.id} dataPacket {order} length {len(pkt)}")
+                off = 4
+                t = [order*SAMPLES_PER_PACKET + k for k in range(SAMPLES_PER_PACKET)]
+                samples = []
+                for _ in range(self.channels):
+                    sig = self.data_struct.unpack(data[off:off+2*SAMPLES_PER_PACKET])
+                    samples.append(sig); off += 2*SAMPLES_PER_PACKET
+                errs = list(data[off:off+self.channels])
+                self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
+                return order
 
 # Manager of multiple devices
 class DeviceManager:
-    MAX_DEVICES = 4
+    MAX_DEVICES = 5
     def __init__(self, data_port:int = DEFAULT_DATA_PORT):
         self.data_port = data_port
         self.devices: Dict[str,Device] = {}
@@ -185,21 +202,24 @@ class DeviceManager:
         self.devices[ip] = Device(ip, cmd_port, self.data_port, self.loop)
     def ping_all(self):
         return {ip: dev.ping() for ip,dev in self.devices.items()}
+    def penetrate_firewall(self):
+        self.broadcast("ping", self.data_socket)
     def get_all_ids(self):
         return {ip: dev.get_id() for ip,dev in self.devices.items()}
     def register_all(self, addr:str, port:int):
         for dev in self.devices.values(): dev.register_receiver(addr, port)
+    def remove_all(self, addr:str, port:int):
+        for dev in self.devices.values(): dev.remove_receiver(addr, port)
     def dispatch_loop(self, signal):
         async def run():
             while True:
                 pkt, (ip, _) = await self.data_socket.queue.get()
+                #print("packet len ", len(pkt), "from ", ip)
                 dev = self.devices.get(ip)
                 if not dev: continue
-                data = _verify_crc(pkt)
-                if not data: continue
-                typ, order = struct.unpack('<HH', data[:4])
-                dev.on_raw_packet(pkt)
-                signal.emit(ip, order)
+                order = dev.on_raw_packet(pkt)
+                if order is not None:
+                    signal.emit(ip, order)
         self.loop.create_task(run())
 
 # Main GUI application
@@ -225,7 +245,7 @@ class Plotter(QWidget):
         self.leader_buttons.setExclusive(True)
 
         for i in range(DeviceManager.MAX_DEVICES):
-            cfg.addWidget(QLabel(f'Device {i+1}'), i, 0)
+            cfg.addWidget(QLabel(f'Device {i}'), i, 0)
             chk = QCheckBox('Enable'); chk.setChecked(True); cfg.addWidget(chk, i, 1)
             self.device_checks.append(chk)
             le = QLineEdit(); le.setPlaceholderText('ip:port')
@@ -244,15 +264,19 @@ class Plotter(QWidget):
         self.apply_btn.clicked.connect(self._apply_devices)
 
         btns = QHBoxLayout(); root.addLayout(btns)
-        for label, fn in [('Ping All', self._ping_all), ('Get IDs', self._get_ids), ('Register All', self._register_all)]:
+        for label, fn in [('Ping All', self._ping_all), ('Get IDs', self._get_ids), ('Register All', self._register_all), ('Remove All', self._remove_all)]:
             b = QPushButton(label); b.clicked.connect(fn); btns.addWidget(b)
         btns.addWidget(QLabel('Samples:'))
         self.sample_spin = QSpinBox(); self.sample_spin.setRange(0,10000); self.sample_spin.setValue(10); btns.addWidget(self.sample_spin)
         b=QPushButton('Start Sampling'); b.clicked.connect(self._start_sampling); btns.addWidget(b)
         b=QPushButton('Start New Sampling'); b.clicked.connect(self._start_new_sampling); btns.addWidget(b)
+        b=QPushButton('Start Sampling on trigger'); b.clicked.connect(self._start_sampling_on_trigger); btns.addWidget(b)
+        b=QPushButton('Start New Sampling on trigger'); b.clicked.connect(self._start_new_sampling_on_trigger); btns.addWidget(b)
+        b=QPushButton('Force trigger'); b.clicked.connect(self._force_trigger); btns.addWidget(b)
         b=QPushButton('Stop Sampling'); b.clicked.connect(self._stop_sampling); btns.addWidget(b)
         b=QPushButton('Reset Counter'); b.clicked.connect(self._reset_counter); btns.addWidget(b)
         b=QPushButton('Clean Graf'); b.clicked.connect(self.clear_plot); btns.addWidget(b)
+        b=QPushButton('Penetrate Firewall'); b.clicked.connect(self._penetrate_firewall); btns.addWidget(b)
         b=QPushButton('Save Data'); b.clicked.connect(self.save_data); btns.addWidget(b)
 
         # Plot area with legend
@@ -287,14 +311,26 @@ class Plotter(QWidget):
 
     def _update_defaults(self,text:str):
         try:
-            if not ':' in text: return
+            if not ':' in text: return            
             ip,port=text.split(':'); octs=ip.split('.')
+            try:
+                if not port:
+                    port = self.default_cmd_port
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect((ip, port))
+                my_ip = s.getsockname()[0]
+                s.close()
+            except socket.error:
+                my_ip = None
             if len(octs)!=4: return
             prefix='.'.join(octs[:3]); base=int(octs[3]); port=self.default_cmd_port
             for i in range(1,DeviceManager.MAX_DEVICES):
                 if self.device_checks[i].isChecked(): self.device_edits[i].setText(f'{prefix}.{base+i}:{port}')
             self.device_edits[0].setText(f'{prefix}.{base}:{port}')
-            self.receiver_edit.setText(f'{prefix}.1:{DEFAULT_DATA_PORT}')
+            if my_ip is None:
+                self.receiver_edit.setText(f'{prefix}.1:{DEFAULT_DATA_PORT}')
+            else:
+                self.receiver_edit.setText(f'{my_ip}:{DEFAULT_DATA_PORT}')
         except: pass
 
     def _apply_devices(self):
@@ -325,13 +361,37 @@ class Plotter(QWidget):
             self.log_message(f'Registered {addr}:{pr}')
         except: self.log_message('Bad receiver address')
 
+    def _remove_all(self):
+        try:
+            addr,pr=self.receiver_edit.text().split(':')
+            self.manager.remove_all(addr,int(pr))
+            self.log_message(f'Removed {addr}:{pr}')
+        except: self.log_message('Bad receiver address')
+
     def _start_sampling(self):
-        n=self.sample_spin.value(); leader_id=self.leader_buttons.checkedId()
+        n=self.sample_spin.value();
+        leader_id=self.leader_buttons.checkedId()
+        leader_ip = self.device_edits[leader_id].text().strip().split(':')[0]
         for i,(ip,dev) in enumerate(self.manager.devices.items()):
-            if i!=leader_id: dev.start_sampling_trigger(n); self.log_message(f'Trigger on follower {ip} (n={n})')
+            if ip!=leader_ip: dev.start_sampling(n); self.log_message(f'Start on follower {ip} (n={n})')
         if 0<=leader_id<len(self.manager.devices):
-            ip=list(self.manager.devices)[leader_id]; self.manager.devices[ip].start_sampling(n)
-            self.log_message(f'Start on leader {ip} (n={n})')
+            time.sleep(0.01)
+            #ip=list(self.manager.devices)[leader_id];
+            self.manager.devices[leader_ip].start_sampling(n)
+            self.log_message(f'Start on leader {leader_ip} (n={n})')
+        else:
+            for ip,dev in self.manager.devices.items(): dev.start_sampling(n); self.log_message(f'Start on {ip} (n={n})')
+
+    def _start_sampling_on_trigger(self):
+        n=self.sample_spin.value();
+        leader_id=self.leader_buttons.checkedId()
+        leader_ip = self.device_edits[leader_id].text().strip().split(':')[0]
+        for i,(ip,dev) in enumerate(self.manager.devices.items()):
+            if ip!=leader_ip: dev.start_sampling(n); self.log_message(f'Start on follower {ip} (n={n})')
+        if 0<=leader_id<len(self.manager.devices):
+            #ip=list(self.manager.devices)[leader_id];
+            self.manager.devices[leader_ip].start_sampling_trigger(n)
+            self.log_message(f'Trigger on leader {leader_ip} (n={n})')
         else:
             for ip,dev in self.manager.devices.items(): dev.start_sampling(n); self.log_message(f'Start on {ip} (n={n})')
 
@@ -339,6 +399,11 @@ class Plotter(QWidget):
         self._reset_counter()
         self.clear_plot()
         QTimer(self).singleShot(100, self._start_sampling)
+
+    def _start_new_sampling_on_trigger(self):
+        self._reset_counter()
+        self.clear_plot()
+        QTimer(self).singleShot(100, self._start_sampling_on_trigger)
 
     def _stop_sampling(self):
         self.manager.broadcast('stop_sampling')
@@ -348,6 +413,14 @@ class Plotter(QWidget):
         self.manager.broadcast('reset_counter')
         self.log_message('Reset counter on all devices')
         self.last_order.clear()
+
+    def _force_trigger(self):
+        self.manager.broadcast('force_trigger')
+        self.log_message('Force trigger on all devices')
+
+    def _penetrate_firewall(self):
+        self.log_message('Trying to penetrate firewall')
+        self.manager.penetrate_firewall()
 
     def clear_plot(self):
         for dev in self.manager.devices.values():
@@ -393,7 +466,7 @@ class Plotter(QWidget):
                     self.curves[key].setData(x[-len(y):],y)
                 errs=','.join(str(sum(list(buf.error[c])[-SAMPLES_PER_PACKET:])) for c in range(dev.channels))
             avgs = ', '.join(map(lambda v: f'{v:.3f}', avgs))
-            lines.append(f'{ip}: {errs}; avg = {avgs}')
+            lines.append(f'{ip}: samples = {len(x)}; errs = {errs}; avg = {avgs}')
         self.error_lbl.setText('Parity errors:\n'+"\n".join(lines))
 
 if __name__=='__main__':
@@ -401,6 +474,7 @@ if __name__=='__main__':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling,True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps,True)
+    print(sys.argv)
     app=QApplication(sys.argv)
     manager=DeviceManager()
     gui=Plotter(manager)
@@ -411,13 +485,18 @@ if __name__=='__main__':
         loop.run_forever()
     threading.Thread(target=start_loop,daemon=True).start()
     def autoinit():
-        gui._update_defaults('192.168.137.101:')
+        gui._update_defaults('192.168.137.100:')
+        debug = len(sys.argv) > 1 and sys.argv[1] == "DEBUG"
         for i, checkbox in enumerate(gui.device_checks):
-            checkbox.setChecked(i == 0)
-        gui.leader_buttons.button(0).setChecked(True)
+            if debug:
+                checkbox.setChecked(i in (0,))
+            else:
+                checkbox.setChecked(i != 0)
+        gui.leader_buttons.button(0 if debug else 1).setChecked(True)
         gui._apply_devices()
+        gui._penetrate_firewall()
         for i, f in enumerate((gui._ping_all, gui._get_ids, gui._register_all, gui._reset_counter)):
             QTimer(gui).singleShot(i * 100, f)        
-        gui.sample_spin.setValue(int(1.1*DEFAULT_AVG_LEN_MS))
+        gui.sample_spin.setValue(int(DEFAULT_AVG_LEN_MS))
     QTimer(gui).singleShot(500, autoinit)
     gui.show(); sys.exit(app.exec_())
