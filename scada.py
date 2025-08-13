@@ -511,7 +511,6 @@ class Plotter(QWidget):
                     self.curves[key].setData(x[-len(y):],y)
                 errs=','.join(str(sum(list(buf.error[c])[-SAMPLES_PER_PACKET:])) for c in range(dev.channels))
             avgs = ', '.join(map(lambda v: f'{v:.3f}', avgs))
-            lines.append(f'{ip}: samples = {len(x)}; errs = {errs}; avg = {avgs}')
             sent = self.last_order.get(ip)
             if sent is None:
                 sent = 0
