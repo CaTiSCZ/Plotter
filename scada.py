@@ -37,7 +37,7 @@ RECV_TIMEOUT_S     = 0.3
 SAMPLES_PER_PACKET = 200
 PACKET_RATE_HZ     = 1000
 SAMPLING_PERIOD    = 1/(SAMPLES_PER_PACKET*PACKET_RATE_HZ)
-BUFFER_LENGTH_S    = 10
+BUFFER_LENGTH_S    = 30
 BUFFER_SIZE        = int(BUFFER_LENGTH_S*SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 DEFAULT_AVG_LEN_MS = 1000
 
@@ -227,11 +227,47 @@ class Plotter(QWidget):
     # emits (ip, packet_order)
     data_ready = pyqtSignal(str, int)
 
+    Colors = [
+        pg.mkColor(255,   0,   0), # red
+        pg.mkColor(  0, 255,   0), # green
+        pg.mkColor(  0,   0, 255), # blue
+        pg.mkColor(255, 255,   0), # yellow
+        pg.mkColor(  0, 255, 255), # azure
+        pg.mkColor(255,   0, 255), # pink
+        pg.mkColor(  0, 192, 192), # tyrkys
+        pg.mkColor(128,   0, 255), # violet
+        pg.mkColor(128, 255,   0), # limet
+        pg.mkColor(  0, 255, 128), # light green
+        pg.mkColor(  0, 128, 255), # light green
+        pg.mkColor(255, 128,   0), # orenge
+        pg.mkColor(255, 215,   0), # gold
+        pg.mkColor(169,  82,  45), # brown
+        pg.mkColor(255, 255, 255), # white
+        pg.mkColor(192, 192, 192), # grey
+        pg.mkColor(255, 255, 224), # ivory
+        pg.mkColor(255, 200, 124), # light orange
+        pg.mkColor(255, 128, 192), # light orange
+        pg.mkColor(255, 102, 102), # salmon
+        pg.mkColor(204, 153, 255), # light violet
+        pg.mkColor(204, 102, 255), # lila
+        pg.mkColor(102, 102, 255), # blue-violet
+        pg.mkColor(  0, 128, 128), # blue-green
+        pg.mkColor(128, 128,   0), # olive
+        pg.mkColor(  0, 128,  64), # dark green
+        pg.mkColor(  0, 128, 192), # dark tyrkys
+        pg.mkColor(255, 102,   0), # dark orange
+        pg.mkColor(128,   0,  32), # bordo
+        pg.mkColor( 70, 130, 180), # steel blue
+        pg.mkColor(210, 180, 140), # light bworn
+        pg.mkColor(107, 142,  35)  # green olive
+    ]
+
     def __init__(self, manager:DeviceManager):
         super().__init__()
         self.manager = manager
         self.default_cmd_port = DEFAULT_CMD_PORT
         self.last_order: Dict[str,int] = {}
+        self.expected_samples = 0
 
         self.setWindowTitle('Eaton FDDS SCADA')
         self.resize(1400, 800)
@@ -267,7 +303,7 @@ class Plotter(QWidget):
         for label, fn in [('Ping All', self._ping_all), ('Get IDs', self._get_ids), ('Register All', self._register_all), ('Remove All', self._remove_all)]:
             b = QPushButton(label); b.clicked.connect(fn); btns.addWidget(b)
         btns.addWidget(QLabel('Samples:'))
-        self.sample_spin = QSpinBox(); self.sample_spin.setRange(0,10000); self.sample_spin.setValue(10); btns.addWidget(self.sample_spin)
+        self.sample_spin = QSpinBox(); self.sample_spin.setRange(0,BUFFER_SIZE); self.sample_spin.setValue(10); btns.addWidget(self.sample_spin)
         b=QPushButton('Start Sampling'); b.clicked.connect(self._start_sampling); btns.addWidget(b)
         b=QPushButton('Start New Sampling'); b.clicked.connect(self._start_new_sampling); btns.addWidget(b)
         b=QPushButton('Start Sampling on trigger'); b.clicked.connect(self._start_sampling_on_trigger); btns.addWidget(b)
@@ -305,9 +341,16 @@ class Plotter(QWidget):
 
     def _check_order(self, ip:str, order:int):
         last = self.last_order.get(ip)
-        if last is not None and order != (last + 1) & 0xFFFF:
-            self.log_message(f'[PKT ORDER] {ip}: expected {(last+1)&0xFFFF}, got {order}')
-        self.last_order[ip] = order
+        if last is not None:
+            expected = (last + 1) & 0xFFFF
+            if order != expected:
+                self.log_message(f'[PKT ORDER] {ip}: expected {expected}, got {order}')
+            next = ((last & ~0xFFFF) | order)
+            if expected > 0xC000 and order <  0x4000:
+                next += 0xFFFF
+        else:
+            next = 0
+        self.last_order[ip] = next
 
     def _update_defaults(self,text:str):
         try:
@@ -369,7 +412,8 @@ class Plotter(QWidget):
         except: self.log_message('Bad receiver address')
 
     def _start_sampling(self):
-        n=self.sample_spin.value();
+        n=self.sample_spin.value()
+        self.expected_samples = n
         leader_id=self.leader_buttons.checkedId()
         leader_ip = self.device_edits[leader_id].text().strip().split(':')[0]
         for i,(ip,dev) in enumerate(self.manager.devices.items()):
@@ -383,7 +427,8 @@ class Plotter(QWidget):
             for ip,dev in self.manager.devices.items(): dev.start_sampling(n); self.log_message(f'Start on {ip} (n={n})')
 
     def _start_sampling_on_trigger(self):
-        n=self.sample_spin.value();
+        n=self.sample_spin.value()
+        self.expected_samples = n
         leader_id=self.leader_buttons.checkedId()
         leader_ip = self.device_edits[leader_id].text().strip().split(':')[0]
         for i,(ip,dev) in enumerate(self.manager.devices.items()):
@@ -460,14 +505,23 @@ class Plotter(QWidget):
                 for ch in range(dev.channels):
                     key=(ip,ch)
                     if key not in self.curves:
-                        self.curves[key]=self.ax.plot(pen=pg.intColor(hash(key)&0xFFFF,hues=32),name=f'{ip}[{ch}]')
+                        self.curves[key]=self.ax.plot(pen=Plotter.Colors[len(self.curves)],name=f'{ip}[{ch}]')
                     y=np.array(buf.signal[ch+1])[-len(x):]
                     avgs[ch] = np.mean(y[-min(len(y), SAMPLES_PER_PACKET*DEFAULT_AVG_LEN_MS):])
                     self.curves[key].setData(x[-len(y):],y)
                 errs=','.join(str(sum(list(buf.error[c])[-SAMPLES_PER_PACKET:])) for c in range(dev.channels))
             avgs = ', '.join(map(lambda v: f'{v:.3f}', avgs))
             lines.append(f'{ip}: samples = {len(x)}; errs = {errs}; avg = {avgs}')
-        self.error_lbl.setText('Parity errors:\n'+"\n".join(lines))
+            sent = self.last_order.get(ip)
+            if sent is None:
+                sent = 0
+            else:
+                sent += 1
+            received = int(len(x)//SAMPLES_PER_PACKET)
+            sent = max(sent, received) # sent is updated in data_ready signal, which can be delayed from receiving buffer on heavy load
+            lines.append(f'{ip}: packets = {received}/{sent}/{self.expected_samples}; errs = {errs}; avg = {avgs}')
+        self.error_lbl.setText(f'Statistic (ip: received / sent / expected packets (ms); channels parity errors; channels average per {DEFAULT_AVG_LEN_MS} ms):\n' + 
+                               "\n".join(lines))
 
 if __name__=='__main__':
     if sys.platform.startswith('win'):
