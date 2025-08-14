@@ -147,6 +147,7 @@ class Device:
         self.id = int(ip.split('.')[3])
         self.header_struct = struct.Struct('<HH')
         self.data_struct = struct.Struct('<'+'h'*SAMPLES_PER_PACKET)
+        self.silent_ping = False
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None):
         pkt = struct.pack('<I', code) + payload
@@ -161,9 +162,10 @@ class Device:
         except socket.timeout:
             return None
         
-    def ping(self, socket_=None)->bool:
-        return bool(self._send_cmd(0, expect=socket_ is None, socket_=socket_))
-    
+    def ping(self, socket_=None, silent=False)->bool:
+        self.silent_ping = silent
+        return bool(self._send_cmd(0, struct.pack('?', silent), expect=socket_ is None, socket_=socket_))
+
     def get_id(self)->dict|None:
         rsp = _verify_crc(self._send_cmd(1) or b'')
         if not rsp:
@@ -210,7 +212,8 @@ class Device:
         typ, order = self.header_struct.unpack(pkt[:4])
         match typ:
             case self.PKT_TYPE_ACK:
-                logging.getLogger().info(f"Dev {self.ip} received ACK on DATA socket.")
+                if not self.silent_ping:
+                    logging.getLogger().info(f"Dev {self.ip} received ACK on DATA socket.")
                 return
             case self.PKT_TYPE_DATA:
                 data = _verify_crc(pkt)
@@ -260,8 +263,8 @@ class DeviceManager:
     def ping_all(self):
         return {ip: dev.ping() for ip,dev in self.devices.items()}
     
-    def penetrate_firewall(self):
-        self.broadcast("ping", self.data_socket)
+    def penetrate_firewall(self, silent = True):
+        self.broadcast("ping", self.data_socket, silent)
 
     def get_all_ids(self):
         return {ip: dev.get_id() for ip,dev in self.devices.items()}
@@ -447,6 +450,11 @@ class Plotter(QWidget):
         self._init_log_file()
         self.log_signal.connect(self.log_output.append)
 
+        penetrator = QTimer(self)
+        penetrator.setInterval(3000)
+        penetrator.timeout.connect(self.manager.penetrate_firewall)
+        penetrator.start()
+
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
         self.timer.timeout.connect(self._update_plot)
@@ -483,7 +491,7 @@ class Plotter(QWidget):
         # Let the user know where logs are stored
         # (safe to call log_message here now that _log_file is set)
         self.log_message(f"Logging to file: {self.log_path}")
-        
+
         if FCN_QT_LOGGING:
             handler = QtLogHandler(self)
             #handler.setFormatter(logging.Formatter('{%(asctime)s} [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
@@ -668,7 +676,7 @@ class Plotter(QWidget):
 
     def _penetrate_firewall(self):
         self.log_message('Trying to penetrate firewall')
-        self.manager.penetrate_firewall()
+        self.manager.penetrate_firewall(False)
 
     def clear_plot(self):
         for dev in self.manager.devices.values():
