@@ -30,6 +30,10 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 
+APPLICATION_NAME = 'Eaton FDDS SCADA'
+APPLICATION_VERSION = '1.2.0'
+APPLICATION_TITLE = f"{APPLICATION_NAME} v{APPLICATION_VERSION}"
+
 # Constants
 DEFAULT_CMD_PORT   = 10578
 DEFAULT_DATA_PORT  = 10577
@@ -269,7 +273,7 @@ class Plotter(QWidget):
         self.last_order: Dict[str,int] = {}
         self.expected_samples = 0
 
-        self.setWindowTitle('Eaton FDDS SCADA')
+        self.setWindowTitle(APPLICATION_TITLE)
         self.resize(1400, 800)
 
         root = QVBoxLayout(self)
