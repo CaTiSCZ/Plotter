@@ -28,7 +28,7 @@ import pyqtgraph as pg
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLineEdit, QLabel, QSpinBox, QCheckBox, QTextEdit,
-    QScrollArea, QRadioButton, QButtonGroup, QFileDialog
+    QScrollArea, QRadioButton, QButtonGroup, QFileDialog, QMessageBox
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 
@@ -208,6 +208,25 @@ class Device:
         payload = struct.pack('<B', param) + struct.pack('<B', 0xAC if save else 0)
         return self._send_cmd(11, payload)
     
+    def get_clock_config(self):
+        pkt = self._send_cmd(15)
+        if not pkt:
+            logging.getLogger().warning(f"Dev {self.ip} failed to get clock config.")
+            return None
+        if (l:=len(pkt)) < 10:
+            logging.getLogger().warning(f"Dev {self.ip} failed to get clock config - too short packet ({l}).")
+            return None
+        packet_type, error, cmd, active_config, stored_config = struct.unpack('<HHIBB', pkt[:10])
+        if packet_type != self.PKT_TYPE_ACK:
+            logging.getLogger().warning(f"Dev {self.ip} failed to get clock config - unexpected packet type ({packet_type}).")
+            return None
+        if cmd != 15:
+            logging.getLogger().warning(f"Dev {self.ip} failed to get clock config - unexpected command ({cmd}).")
+            return None
+        if error != 0:
+            logging.getLogger().warning(f"Can not read stored clock config of {self.ip}, error code ({error}).")
+        return (active_config, stored_config)
+
     def on_raw_packet(self, pkt:bytes):
         typ, order = self.header_struct.unpack(pkt[:4])
         match typ:
@@ -280,6 +299,9 @@ class DeviceManager:
 
     def remove_logger_all(self, addr:str, port:int):
         for dev in self.devices.values(): dev.remove_logger(addr, port)
+
+    def get_clock_config_all(self):
+        return {ip: dev.get_clock_config() for ip, dev in self.devices.items()}
 
     def dispatch_loop(self, signal):
         async def run():
@@ -389,6 +411,14 @@ class Plotter(QWidget):
         self.apply_btn = QPushButton('Apply Device List')
         cfg.addWidget(self.apply_btn, DeviceManager.MAX_DEVICES, 2)
         self.apply_btn.clicked.connect(self._apply_devices)
+
+        self.get_clock_config_btn = QPushButton('Get clock config')
+        cfg.addWidget(self.get_clock_config_btn, DeviceManager.MAX_DEVICES, 4)
+        self.get_clock_config_btn.clicked.connect(self._get_clock_config)
+
+        self.save_clock_config_btn = QPushButton('Save clock config')
+        cfg.addWidget(self.save_clock_config_btn, DeviceManager.MAX_DEVICES, 5)
+        self.save_clock_config_btn.clicked.connect(self._save_clock_config)
 
         btns = QHBoxLayout()
         root.addLayout(btns)
@@ -678,6 +708,43 @@ class Plotter(QWidget):
         self.log_message('Trying to penetrate firewall')
         self.manager.penetrate_firewall(False)
 
+    def _get_clock_config(self):
+        cfgs = self.manager.get_clock_config_all()
+        for k in zip(self.device_clock_sources, self.device_clock_enables):
+            for l in k:
+                l.blockSignals(True)
+        for ip, cfg in cfgs.items():
+            if cfg is None:
+                self.log_message(f"Clock config for {ip}: not available")
+                continue
+            active, stored = cfg
+            for i, edit in enumerate(self.device_edits):
+                line_ip = edit.text().strip().split(':')[0]
+                if line_ip == ip:
+                    self.device_clock_sources[i].setChecked((active & 0x01) != 0)
+                    self.device_clock_enables[i].setChecked((active & 0x02) != 0)
+                    break
+            self.log_message(f"Clock config for {ip}: active={active:02X}, stored={stored:02X}")
+        for k in zip(self.device_clock_sources, self.device_clock_enables):
+            for l in k:
+                l.blockSignals(False)
+
+    def _save_clock_config(self):
+        reply = QMessageBox.question(self, "Save?",
+                                     "Do you really want to save clock configuration to EEPROM?",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        for row in range(DeviceManager.MAX_DEVICES):
+            if not self.device_checks[row].isChecked():
+                continue
+            ip = self.device_edits[row].text().strip().split(':')[0]
+            dev = self.manager.devices.get(ip)
+            if dev is not None:
+                enabled = self.device_clock_enables[row].isChecked()
+                external = self.device_clock_sources[row].isChecked()
+                dev.set_clock_ctrl(external=external, enabled=enabled, save=True)
+
     def clear_plot(self):
         for dev in self.manager.devices.values():
             with dev.buffer.lock:
@@ -799,7 +866,7 @@ if __name__=='__main__':
         gui.leader_buttons.button(0 if debug else 1).setChecked(True)
         gui._apply_devices()
         gui._penetrate_firewall()
-        for i, f in enumerate((gui._ping_all, gui._register_logger_all, gui._get_ids, gui._register_all, gui._reset_counter)):
+        for i, f in enumerate((gui._ping_all, gui._register_logger_all, gui._get_ids, gui._get_clock_config, gui._register_all, gui._reset_counter)):
             QTimer(gui).singleShot(i * 100, f)        
         gui.sample_spin.setValue(int(DEFAULT_AVG_LEN_MS))
     QTimer(gui).singleShot(500, autoinit)
