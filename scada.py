@@ -404,6 +404,8 @@ class Plotter(QWidget):
             self.device_clock_enables.append(cb_clock_out)
             self.device_clock_sources.append(cb_clock_src)
 
+        self.leader_buttons.buttonClicked[int].connect(self._leader_changed)
+
         cfg.addWidget(QLabel('Receiver addr:port'), 0, 6)
         self.receiver_edit = QLineEdit(f'0.0.0.0:{DEFAULT_DATA_PORT}')
         cfg.addWidget(self.receiver_edit, 0, 7)
@@ -825,6 +827,12 @@ class Plotter(QWidget):
         self.log_message(
             f'[ClockCtrl] {ip}: source={"EXT" if external else "INT"}, enable={"ON" if enabled else "OFF"}'
         )
+
+    def _leader_changed(self, leader_id):
+        for row in range(DeviceManager.MAX_DEVICES):
+            if self.device_checks[row].isChecked():
+                self.device_clock_sources[row].setChecked(row != leader_id)
+                self.device_clock_enables[row].setChecked(row == leader_id)
 
 class QtLogHandler(logging.Handler):
     def __init__(self, plotter):
