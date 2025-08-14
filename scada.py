@@ -193,20 +193,20 @@ class Device:
         return self._send_cmd(6, struct.pack('<I',n))
     
     def stop_sampling(self):
-        return self._send_cmd(7, expect=False)
+        return self._send_cmd(7)
     
     def force_trigger(self):
-        return self._send_cmd(9, expect=False)
+        return self._send_cmd(9)
     
     def reset_counter(self):
-        return self._send_cmd(10, expect=False)
+        return self._send_cmd(10)
 
     def set_clock_ctrl(self, enabled: bool, external: bool, save: bool = False):
         """Enable/disable clock output."""
         """Select external (True) vs internal (False) clock source."""
         param = (1 if external else 0) | ((1 if enabled else 0) << 1)
         payload = struct.pack('<B', param) + struct.pack('<B', 0xAC if save else 0)
-        return self._send_cmd(11, payload, expect=False)
+        return self._send_cmd(11, payload)
     
     def on_raw_packet(self, pkt:bytes):
         typ, order = self.header_struct.unpack(pkt[:4])
@@ -754,7 +754,6 @@ class Plotter(QWidget):
         enabled = self.device_clock_enables[row].isChecked()
         external = self.device_clock_sources[row].isChecked()
 
-        param = (1 if external else 0) | ((1 if enabled else 0) << 1)
         dev.set_clock_ctrl(external=external, enabled=enabled)
         self.log_message(
             f'[ClockCtrl] {ip}: source={"EXT" if external else "INT"}, enable={"ON" if enabled else "OFF"}'
