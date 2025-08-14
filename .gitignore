@@ -8,3 +8,6 @@ __pycache__/
 # Pyinstaller generated files
 build
 dist
+
+# scada logs
+logs
