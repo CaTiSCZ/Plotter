@@ -191,6 +191,13 @@ class Device:
     
     def reset_counter(self):
         return self._send_cmd(10, expect=False)
+
+    def set_clock_ctrl(self, enabled: bool, external: bool, save: bool = False):
+        """Enable/disable clock output."""
+        """Select external (True) vs internal (False) clock source."""
+        param = (1 if external else 0) | ((1 if enabled else 0) << 1)
+        payload = struct.pack('<B', param) + struct.pack('<B', 0xAC if save else 0)
+        return self._send_cmd(11, payload, expect=False)
     
     def on_raw_packet(self, pkt:bytes):
         typ, order = self.header_struct.unpack(pkt[:4])
@@ -325,6 +332,8 @@ class Plotter(QWidget):
         self.device_checks: List[QCheckBox] = []
         self.leader_buttons = QButtonGroup(self)
         self.leader_buttons.setExclusive(True)
+        self.device_clock_enables: List[QCheckBox] = []
+        self.device_clock_sources: List[QCheckBox] = []
 
         for i in range(DeviceManager.MAX_DEVICES):
             cfg.addWidget(QLabel(f'Device {i}'), i, 0)
@@ -342,9 +351,19 @@ class Plotter(QWidget):
             cfg.addWidget(rb, i, 3)
             self.leader_buttons.addButton(rb, i)
 
-        cfg.addWidget(QLabel('Receiver addr:port'), 0, 4)
+            cb_clock_out = QCheckBox('Clock Out')
+            cb_clock_src = QCheckBox('Ext Clock')
+            # Default unchecked; connect signals with row binding
+            cb_clock_out.stateChanged.connect(lambda state, row=i: self._update_clock_ctrl(row))
+            cb_clock_src.stateChanged.connect(lambda state, row=i: self._update_clock_ctrl(row))
+            cfg.addWidget(cb_clock_out, i, 4)
+            cfg.addWidget(cb_clock_src, i, 5)
+            self.device_clock_enables.append(cb_clock_out)
+            self.device_clock_sources.append(cb_clock_src)
+
+        cfg.addWidget(QLabel('Receiver addr:port'), 0, 6)
         self.receiver_edit = QLineEdit(f'0.0.0.0:{DEFAULT_DATA_PORT}')
-        cfg.addWidget(self.receiver_edit, 0, 5)
+        cfg.addWidget(self.receiver_edit, 0, 7)
 
         self.apply_btn = QPushButton('Apply Device List')
         cfg.addWidget(self.apply_btn, DeviceManager.MAX_DEVICES, 2)
@@ -673,6 +692,29 @@ class Plotter(QWidget):
             lines.append(f'{ip}: packets = {received}/{sent}/{self.expected_samples}; errs = {errs}; avg = {avgs}')
         self.error_lbl.setText(f'Statistic (ip: received / sent / expected packets (ms); channels parity errors; channels average per {DEFAULT_AVG_LEN_MS} ms):\n' + 
                                "\n".join(lines))
+    
+    def _update_clock_ctrl(self, row: int):
+        """Compose (source, enable) bitfield and send a single command."""
+        txt = self.device_edits[row].text().strip()
+        if not txt:
+            self.log_message(f'[ClockCtrl] Row {row}: no IP set')
+            return
+
+        ip = txt.split(':')[0]
+        dev = self.manager.devices.get(ip)
+        if not dev:
+            self.log_message(f'[ClockCtrl] {ip}: device not applied yet')
+            return
+
+        enabled = self.device_clock_enables[row].isChecked()
+        external = self.device_clock_sources[row].isChecked()
+
+        param = (1 if external else 0) | ((1 if enabled else 0) << 1)
+        dev.set_clock_ctrl(external=external, enabled=enabled)
+        self.log_message(
+            f'[ClockCtrl] {ip}: source={"EXT" if external else "INT"}, enable={"ON" if enabled else "OFF"}'
+        )
+
 
 class QtLogHandler(logging.Handler):
     def __init__(self, plotter):
