@@ -21,6 +21,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Tuple, List
 from datetime import datetime
+import logging
 
 import numpy as np
 import pyqtgraph as pg
@@ -45,6 +46,9 @@ SAMPLING_PERIOD    = 1/(SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 BUFFER_LENGTH_S    = 30
 BUFFER_SIZE        = int(BUFFER_LENGTH_S*SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 DEFAULT_AVG_LEN_MS = 1000
+
+# Features
+FCN_QT_LOGGING = False  # Enable Qt logging handler
 
 # CRC-16/CCITT checksum
 def crc16_ccitt(data: bytes, poly: int=0x1021, crc: int=0xFFFF) -> int:
@@ -439,6 +443,13 @@ class Plotter(QWidget):
         # Let the user know where logs are stored
         # (safe to call log_message here now that _log_file is set)
         self.log_message(f"Logging to file: {self.log_path}")
+
+        if FCN_QT_LOGGING:
+            handler = QtLogHandler(self)
+            #handler.setFormatter(logging.Formatter('{%(asctime)s} [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
+            handler.setFormatter(logging.Formatter('{QT} [%(levelname)s] %(message)s'))
+            logging.getLogger().addHandler(handler)
+            logging.getLogger().setLevel(logging.DEBUG)  # or INFO
     
     def closeEvent(self, event):
         try:
@@ -662,6 +673,19 @@ class Plotter(QWidget):
             lines.append(f'{ip}: packets = {received}/{sent}/{self.expected_samples}; errs = {errs}; avg = {avgs}')
         self.error_lbl.setText(f'Statistic (ip: received / sent / expected packets (ms); channels parity errors; channels average per {DEFAULT_AVG_LEN_MS} ms):\n' + 
                                "\n".join(lines))
+
+class QtLogHandler(logging.Handler):
+    def __init__(self, plotter):
+        super().__init__()
+        self.plotter = plotter
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Call your existing log_message method
+            self.plotter.log_message(msg)
+        except Exception:
+            self.handleError(record)
 
 if __name__=='__main__':
     if sys.platform.startswith('win'):
