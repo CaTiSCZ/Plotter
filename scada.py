@@ -48,7 +48,7 @@ BUFFER_SIZE        = int(BUFFER_LENGTH_S*SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 DEFAULT_AVG_LEN_MS = 1000
 
 # Features
-FCN_QT_LOGGING = False  # Enable Qt logging handler
+FCN_QT_LOGGING = True  # Enable Qt logging handler
 
 # CRC-16/CCITT checksum
 def crc16_ccitt(data: bytes, poly: int=0x1021, crc: int=0xFFFF) -> int:
@@ -203,7 +203,7 @@ class Device:
         typ, order = self.header_struct.unpack(pkt[:4])
         match typ:
             case self.PKT_TYPE_ACK:
-                print(f"Dev {self.ip} received ACK on DATA socket.")
+                logging.getLogger().info(f"Dev {self.ip} received ACK on DATA socket.")
                 return
             case self.PKT_TYPE_DATA:
                 data = _verify_crc(pkt)
@@ -762,4 +762,3 @@ if __name__=='__main__':
     QTimer(gui).singleShot(500, autoinit)
     gui.show()
     sys.exit(app.exec_())
-    
