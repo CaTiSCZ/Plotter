@@ -295,6 +295,7 @@ class DeviceManager:
 class Plotter(QWidget):
     # emits (ip, packet_order)
     data_ready = pyqtSignal(str, int)
+    log_signal = pyqtSignal(str)
 
     Colors = [
         pg.mkColor(255,   0,   0), # red
@@ -444,6 +445,7 @@ class Plotter(QWidget):
         root.addWidget(scroll)
 
         self._init_log_file()
+        self.log_signal.connect(self.log_output.append)
 
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
@@ -456,7 +458,7 @@ class Plotter(QWidget):
         #self.log_output.append(f'[{time.strftime("%H:%M:%S")}] {msg}')
         timestamp = time.strftime("%H:%M:%S")
         line = f'[{timestamp}] {msg}'
-        self.log_output.append(line)
+        self.log_signal.emit(line)
         try:
             if hasattr(self, "_log_file") and self._log_file:
                 self._log_file.write(line + "\n")
@@ -481,7 +483,7 @@ class Plotter(QWidget):
         # Let the user know where logs are stored
         # (safe to call log_message here now that _log_file is set)
         self.log_message(f"Logging to file: {self.log_path}")
-
+        
         if FCN_QT_LOGGING:
             handler = QtLogHandler(self)
             #handler.setFormatter(logging.Formatter('{%(asctime)s} [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
