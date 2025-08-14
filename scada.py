@@ -135,6 +135,7 @@ class AsyncSocket:
 class Device:
     PKT_TYPE_ACK = 0
     PKT_TYPE_DATA = 2
+    PKT_TYPE_LOG  = 4
 
     def __init__(self, ip:str, cmd_port:int, data_port:int, loop):
         self.ip, self.cmd_port, self.data_port, self.loop = ip,cmd_port,data_port,loop
@@ -174,8 +175,14 @@ class Device:
     def register_receiver(self, addr:str, port:int):
         return self._send_cmd(2, socket.inet_aton(addr)+struct.pack('<H',port))
     
+    def register_logger(self, addr:str, port:int):
+        return self._send_cmd(2, socket.inet_aton(addr)+struct.pack('<HB',port, 1))
+
     def remove_receiver(self, addr:str, port:int):
         return self._send_cmd(3, socket.inet_aton(addr)+struct.pack('<H',port))
+    
+    def remove_logger(self, addr:str, port:int):
+        return self._send_cmd(3, socket.inet_aton(addr)+struct.pack('<HB',port, 1))
     
     def start_sampling(self, n:int=0):
         return self._send_cmd(5, struct.pack('<I',n))
@@ -220,6 +227,10 @@ class Device:
                 errs = list(data[off:off+self.channels])
                 self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
                 return order
+            case self.PKT_TYPE_LOG:
+                log_msg = pkt[4:].decode('utf-8').strip()
+                logging.getLogger().info(f"Dev {self.ip} log[{order}]: {log_msg}")
+                return
 
 # Manager of multiple devices
 class DeviceManager:
@@ -260,6 +271,12 @@ class DeviceManager:
 
     def remove_all(self, addr:str, port:int):
         for dev in self.devices.values(): dev.remove_receiver(addr, port)
+
+    def register_logger_all(self, addr:str, port:int):
+        for dev in self.devices.values(): dev.register_logger(addr, port)
+
+    def remove_logger_all(self, addr:str, port:int):
+        for dev in self.devices.values(): dev.remove_logger(addr, port)
 
     def dispatch_loop(self, signal):
         async def run():
@@ -372,10 +389,12 @@ class Plotter(QWidget):
         btns = QHBoxLayout()
         root.addLayout(btns)
 
-        for label, fn in (('Ping All'       , self._ping_all    ),
-                          ('Get IDs'        , self._get_ids     ),
-                          ('Register All'   , self._register_all),
-                          ('Remove All'     , self._remove_all  )):
+        for label, fn in (('Ping All'               , self._ping_all            ),
+                          ('Get IDs'                , self._get_ids             ),
+                          ('Register All'           , self._register_all        ),
+                          ('Remove All'             , self._remove_all          ),
+                          ('Register logger All'    , self._register_logger_all ),
+                          ('Remove logger All'      , self._remove_logger_all   )):
             b = QPushButton(label)
             b.clicked.connect(fn)
             btns.addWidget(b)
@@ -571,6 +590,22 @@ class Plotter(QWidget):
         except:
             self.log_message('Bad receiver address')
 
+    def _register_logger_all(self):
+        try:
+            addr,pr=self.receiver_edit.text().split(':')
+            self.manager.register_logger_all(addr,int(pr))
+            self.log_message(f'Registered logger{addr}:{pr}')
+        except:
+            self.log_message('Bad logger receiver address')
+
+    def _remove_logger_all(self):
+        try:
+            addr,pr=self.receiver_edit.text().split(':')
+            self.manager.remove_logger_all(addr,int(pr))
+            self.log_message(f'Removed logger {addr}:{pr}')
+        except:
+            self.log_message('Bad logger receiver address')
+
     def _start_sampling(self):
         n = self.sample_spin.value()
         self.expected_samples = n
@@ -715,7 +750,6 @@ class Plotter(QWidget):
             f'[ClockCtrl] {ip}: source={"EXT" if external else "INT"}, enable={"ON" if enabled else "OFF"}'
         )
 
-
 class QtLogHandler(logging.Handler):
     def __init__(self, plotter):
         super().__init__()
@@ -756,7 +790,7 @@ if __name__=='__main__':
         gui.leader_buttons.button(0 if debug else 1).setChecked(True)
         gui._apply_devices()
         gui._penetrate_firewall()
-        for i, f in enumerate((gui._ping_all, gui._get_ids, gui._register_all, gui._reset_counter)):
+        for i, f in enumerate((gui._ping_all, gui._register_logger_all, gui._get_ids, gui._register_all, gui._reset_counter)):
             QTimer(gui).singleShot(i * 100, f)        
         gui.sample_spin.setValue(int(DEFAULT_AVG_LEN_MS))
     QTimer(gui).singleShot(500, autoinit)
