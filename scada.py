@@ -543,14 +543,14 @@ class Plotter(QWidget):
     def _check_order(self, ip:str, order:int):
         last = self.last_order.get(ip)
         if last is not None:
-            expected = (last + 1) & 0xFFFF
+            expected = (full_expected := (last + 1)) & 0xFFFF
             if order != expected:
-                self.log_message(f'[PKT ORDER] {ip}: expected {expected}, got {order}')
+                self.log_message(f'[PKT ORDER] {ip}: got {order}, expected {expected} ({full_expected})')
             next = ((last & ~0xFFFF) | order)
             if expected > 0xC000 and order <  0x4000:
-                next += 0xFFFF
+                next += 0x10000
         else:
-            next = 0
+            next = order + 1
         self.last_order[ip] = next
 
     def _update_defaults(self,text:str):
