@@ -614,7 +614,7 @@ class Plotter(QWidget):
 
     def _get_ids(self):
         for ip,info in self.manager.get_all_ids().items():
-            self.log_message(f'ID {ip}: ' + (f"channels={info['channels_count']}" if info else 'FAIL'))
+            self.log_message(f'ID {ip}: ' + (f"FW {info['fw_id']} v{info['fw_ver_major']}.{info['fw_ver_minor']} {info['fw_config']} from {info['build_time']}; channels={info['channels_count']}" if info else 'FAIL'))
 
     def _register_all(self):
         try:
