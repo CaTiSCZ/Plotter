@@ -16,10 +16,11 @@ Features:
   - UDP I/O via selector-based asyncio loop (Windows compatible)
 """
 from __future__ import annotations
-import asyncio, struct, socket, sys, time, threading, csv
+import asyncio, struct, socket, sys, time, threading, csv, os
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Tuple, List
+from datetime import datetime
 
 import numpy as np
 import pyqtgraph as pg
@@ -400,6 +401,8 @@ class Plotter(QWidget):
         scroll.setWidget(self.log_output)
         root.addWidget(scroll)
 
+        self._init_log_file()
+
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
         self.timer.timeout.connect(self._update_plot)
@@ -408,7 +411,43 @@ class Plotter(QWidget):
         self.data_ready.connect(self._check_order)
 
     def log_message(self,msg:str):
-        self.log_output.append(f'[{time.strftime("%H:%M:%S")}] {msg}')
+        #self.log_output.append(f'[{time.strftime("%H:%M:%S")}] {msg}')
+        timestamp = time.strftime("%H:%M:%S")
+        line = f'[{timestamp}] {msg}'
+        self.log_output.append(line)
+        try:
+            if hasattr(self, "_log_file") and self._log_file:
+                self._log_file.write(line + "\n")
+                self._log_file.flush()
+        except Exception as _e:
+            # Avoid recursive logging on file errors
+            pass
+    
+    def _init_log_file(self):
+        try:
+            logs_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)), "logs")
+        except NameError:
+            # Fallback if __file__ is not defined
+            logs_dir = os.path.abspath("logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        safe_app = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in APPLICATION_NAME)
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        #self.log_path = os.path.join(logs_dir, f"{safe_app}_{ts}.log")
+        self.log_path = os.path.join(logs_dir, f"{ts}.log")
+        # Open once and reuse
+        self._log_file = open(self.log_path, "a", encoding="utf-8")
+        # Let the user know where logs are stored
+        # (safe to call log_message here now that _log_file is set)
+        self.log_message(f"Logging to file: {self.log_path}")
+    
+    def closeEvent(self, event):
+        try:
+            if hasattr(self, "_log_file") and self._log_file:
+                self._log_file.flush()
+                self._log_file.close()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def _check_order(self, ip:str, order:int):
         last = self.last_order.get(ip)
