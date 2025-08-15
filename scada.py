@@ -16,7 +16,7 @@ Features:
   - UDP I/O via selector-based asyncio loop (Windows compatible)
 """
 from __future__ import annotations
-import asyncio, struct, socket, sys, time, threading, csv, os
+import asyncio, struct, socket, sys, time, threading, csv, os, tempfile
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Tuple, List
@@ -509,10 +509,17 @@ class Plotter(QWidget):
 
     def _init_log_file(self):
         try:
-            logs_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)), "logs")
+            path = os.path.abspath(os.path.dirname(__file__))
+            tempdir = os.path.abspath(tempfile.gettempdir())
+            if os.path.commonpath([path, tempdir]) == tempdir:
+                raise NameError("Log file path is within the temp directory")
+            logs_dir = os.path.join(path, "logs")
         except NameError:
-            # Fallback if __file__ is not defined
-            logs_dir = os.path.abspath("logs")
+            # Fallback if __file__ is not defined or in temporary directory
+            if len(sys.argv) >= 1:
+                logs_dir = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "logs")
+            else:
+                logs_dir = os.path.abspath("logs")
         os.makedirs(logs_dir, exist_ok=True)
         safe_app = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in APPLICATION_NAME)
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
