@@ -4,7 +4,7 @@ from queue import Queue
 from threading import Lock
 from contextlib import AbstractContextManager
 
-DEFAULT_LOG_FORMAT = "%(asctime)s.%(msecs)03d\t%(levelname)-8s\t%(threadName)-24s\t%(name)-10s\t%(message)s"
+DEFAULT_LOG_FORMAT = "%(asctime)s\t%(levelname)-8s\t%(threadName)-24s\t%(name)-10s\t%(message)s"
 
 TCP_HANDLER_DEFAULT_HOST_IP = "localhost"
 TCP_HANDLER_DEFAULT_HOST_PORT = 12344
