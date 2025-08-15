@@ -16,12 +16,14 @@ Features:
   - UDP I/O via selector-based asyncio loop (Windows compatible)
 """
 from __future__ import annotations
+import logging
+import logger
 import asyncio, struct, socket, sys, time, threading, csv, os, tempfile
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Tuple, List
 from datetime import datetime
-import logging
+from contextlib import ExitStack
 
 import numpy as np
 import pyqtgraph as pg
@@ -34,7 +36,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 
 APPLICATION_NAME = 'Eaton FDDS SCADA'
-APPLICATION_VERSION = '1.3.2'
+APPLICATION_VERSION = '1.4.0'
 APPLICATION_TITLE = f"{APPLICATION_NAME} v{APPLICATION_VERSION}"
 
 # Constants
@@ -98,6 +100,7 @@ def parse_id_packet(data):
 @dataclass
 class DeviceBuffer:
     def __init__(self, channels:int=3):
+        self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.lock = threading.Lock()
         self.time   = deque(maxlen=BUFFER_SIZE)
         self.signal = [deque(maxlen=BUFFER_SIZE) for _ in range(channels+1)]
@@ -114,6 +117,7 @@ class DeviceBuffer:
 # Async UDP socket
 class AsyncSocket:
     def __init__(self, loop, local_port:int, label:str):
+        self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.loop = loop
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8*1024*1024)
@@ -139,6 +143,7 @@ class Device:
     PKT_TYPE_LOG  = 4
 
     def __init__(self, ip:str, cmd_port:int, data_port:int, loop):
+        self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.ip, self.cmd_port, self.data_port, self.loop = ip,cmd_port,data_port,loop
         self.channels = 3
         self.cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -212,20 +217,20 @@ class Device:
     def get_clock_config(self):
         pkt = self._send_cmd(15)
         if not pkt:
-            logging.getLogger().warning(f"Dev {self.ip} failed to get clock config.")
+            self._logger.warning(f"Dev {self.ip} failed to get clock config.")
             return None
         if (l:=len(pkt)) < 10:
-            logging.getLogger().warning(f"Dev {self.ip} failed to get clock config - too short packet ({l}).")
+            self._logger.warning(f"Dev {self.ip} failed to get clock config - too short packet ({l}).")
             return None
         packet_type, error, cmd, active_config, stored_config = struct.unpack('<HHIBB', pkt[:10])
         if packet_type != self.PKT_TYPE_ACK:
-            logging.getLogger().warning(f"Dev {self.ip} failed to get clock config - unexpected packet type ({packet_type}).")
+            self._logger.warning(f"Dev {self.ip} failed to get clock config - unexpected packet type ({packet_type}).")
             return None
         if cmd != 15:
-            logging.getLogger().warning(f"Dev {self.ip} failed to get clock config - unexpected command ({cmd}).")
+            self._logger.warning(f"Dev {self.ip} failed to get clock config - unexpected command ({cmd}).")
             return None
         if error != 0:
-            logging.getLogger().warning(f"Can not read stored clock config of {self.ip}, error code ({error}).")
+            self._logger.warning(f"Can not read stored clock config of {self.ip}, error code ({error}).")
         return (active_config, stored_config)
 
     def on_raw_packet(self, pkt:bytes):
@@ -233,7 +238,7 @@ class Device:
         match typ:
             case self.PKT_TYPE_ACK:
                 if not self.silent_ping:
-                    logging.getLogger().info(f"Dev {self.ip} received ACK on DATA socket.")
+                    self._logger.info(f"Dev {self.ip} received ACK on DATA socket.")
                 return
             case self.PKT_TYPE_DATA:
                 data = _verify_crc(pkt)
@@ -252,13 +257,14 @@ class Device:
                 return order
             case self.PKT_TYPE_LOG:
                 log_msg = pkt[4:].decode('utf-8').strip()
-                logging.getLogger().info(f"Dev {self.ip} log[{order}]: {log_msg}")
+                self._logger.info(f"Dev {self.ip} log[{order}]: {log_msg}")
                 return
 
 # Manager of multiple devices
 class DeviceManager:
     MAX_DEVICES = 5
     def __init__(self, data_port:int = DEFAULT_DATA_PORT):
+        self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.data_port = data_port
         self.devices: Dict[str,Device] = {}
         self.loop = None
@@ -359,6 +365,8 @@ class Plotter(QWidget):
     ]
 
     def __init__(self, manager:DeviceManager):
+        self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
+        self._logger.debug("Plotter GUI start")
         super().__init__()
         self.manager = manager
         self.default_cmd_port = DEFAULT_CMD_PORT
@@ -481,7 +489,6 @@ class Plotter(QWidget):
         root.addWidget(scroll)
 
         self.log_signal.connect(self.log_output.append)
-        self._init_log_file()
 
         penetrator = QTimer(self)
         penetrator.setInterval(3000)
@@ -495,58 +502,7 @@ class Plotter(QWidget):
 
         self.data_ready.connect(self._check_order)
 
-    def log_message(self,msg:str):
-        #self.log_output.append(f'[{time.strftime("%H:%M:%S")}] {msg}')
-        timestamp = time.strftime("%H:%M:%S")
-        line = f'[{timestamp}] {msg}'
-        self.log_signal.emit(line)
-        try:
-            if hasattr(self, "_log_file") and self._log_file:
-                self._log_file.write(line + "\n")
-                self._log_file.flush()
-        except Exception as _e:
-            # Avoid recursive logging on file errors
-            print("Logging exception:", _e)
-
-    def _init_log_file(self):
-        try:
-            path = os.path.abspath(os.path.dirname(__file__))
-            tempdir = os.path.abspath(tempfile.gettempdir())
-            if os.path.commonpath([path, tempdir]) == tempdir:
-                raise NameError("Log file path is within the temp directory")
-            logs_dir = os.path.join(path, "logs")
-        except NameError:
-            # Fallback if __file__ is not defined or in temporary directory
-            if len(sys.argv) >= 1:
-                logs_dir = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "logs")
-            else:
-                logs_dir = os.path.abspath("logs")
-        os.makedirs(logs_dir, exist_ok=True)
-        safe_app = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in APPLICATION_NAME)
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        #self.log_path = os.path.join(logs_dir, f"{safe_app}_{ts}.log")
-        self.log_path = os.path.join(logs_dir, f"{ts}.log")
-        # Open once and reuse
-        self._log_file = open(self.log_path, "a", encoding="utf-8")
-        # Let the user know where logs are stored
-        # (safe to call log_message here now that _log_file is set)
-        self.log_message(f"Logging to file: {self.log_path}")
-        print(f"Logging to file: {self.log_path}")
-
-        if FCN_QT_LOGGING:
-            handler = QtLogHandler(self)
-            #handler.setFormatter(logging.Formatter('{%(asctime)s} [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
-            handler.setFormatter(logging.Formatter('{QT} [%(levelname)s] %(message)s'))
-            logging.getLogger().addHandler(handler)
-            logging.getLogger().setLevel(logging.DEBUG)  # or INFO
-    
     def closeEvent(self, event):
-        try:
-            if hasattr(self, "_log_file") and self._log_file:
-                self._log_file.flush()
-                self._log_file.close()
-        except Exception:
-            pass
         super().closeEvent(event)
 
     def _check_order(self, ip:str, order:int):
@@ -554,7 +510,7 @@ class Plotter(QWidget):
         if last is not None:
             expected = (full_expected := (last + 1)) & 0xFFFF
             if order != expected:
-                self.log_message(f'[PKT ORDER] {ip}: got {order}, expected {expected} ({full_expected})')
+                self._logger.warning(f'[PKT ORDER]\t{ip}: got {order:5}, expected {expected:5} ({full_expected:15})')
             next = ((last & ~0xFFFF) | order)
             if expected > 0xC000 and order <  0x4000:
                 next += 0x10000
@@ -614,48 +570,48 @@ class Plotter(QWidget):
                 self.manager.add_device(ip,port)
                 count += 1
             except:
-                self.log_message(f'Bad entry: {txt}')
-        self.log_message(f'Applied {count} devices')
+                self._logger.warning(f'Bad entry: {txt}')
+        self._logger.info(f'Applied {count} devices')
 
     def _ping_all(self):
         for ip,ok in self.manager.ping_all().items():
-            self.log_message(f'Ping {ip}: ' + ('OK' if ok else 'FAIL'))
+            self._logger.info(f'Ping {ip}: ' + ('OK' if ok else 'FAIL'))
 
     def _get_ids(self):
         for ip,info in self.manager.get_all_ids().items():
-            self.log_message(f'ID {ip}: ' + (f"FW {info['fw_id']} v{info['fw_ver_major']}.{info['fw_ver_minor']} {info['fw_config']} from {info['build_time']}; channels={info['channels_count']}" if info else 'FAIL'))
+            self._logger.info(f'ID {ip}: ' + (f"FW {info['fw_id']} v{info['fw_ver_major']}.{info['fw_ver_minor']} {info['fw_config']} from {info['build_time']}; channels={info['channels_count']}" if info else 'FAIL'))
 
     def _register_all(self):
         try:
             addr,pr=self.receiver_edit.text().split(':')
             self.manager.register_all(addr,int(pr))
-            self.log_message(f'Registered {addr}:{pr}')
+            self._logger.info(f'Registered {addr}:{pr}')
         except:
-            self.log_message('Bad receiver address')
+            self._logger.warning('Bad receiver address')
 
     def _remove_all(self):
         try:
             addr,pr=self.receiver_edit.text().split(':')
             self.manager.remove_all(addr,int(pr))
-            self.log_message(f'Removed {addr}:{pr}')
+            self._logger.info(f'Removed {addr}:{pr}')
         except:
-            self.log_message('Bad receiver address')
+            self._logger.warning('Bad receiver address')
 
     def _register_logger_all(self):
         try:
             addr,pr=self.receiver_edit.text().split(':')
             self.manager.register_logger_all(addr,int(pr))
-            self.log_message(f'Registered logger{addr}:{pr}')
+            self._logger.info(f'Registered logger {addr}:{pr}')
         except:
-            self.log_message('Bad logger receiver address')
+            self._logger.warning('Bad logger receiver address')
 
     def _remove_logger_all(self):
         try:
             addr,pr=self.receiver_edit.text().split(':')
             self.manager.remove_logger_all(addr,int(pr))
-            self.log_message(f'Removed logger {addr}:{pr}')
+            self._logger.info(f'Removed logger {addr}:{pr}')
         except:
-            self.log_message('Bad logger receiver address')
+            self._logger.warning('Bad logger receiver address')
 
     def _start_sampling(self):
         n = self.sample_spin.value()
@@ -665,15 +621,15 @@ class Plotter(QWidget):
         for i, (ip, dev) in enumerate(self.manager.devices.items()):
             if ip != leader_ip:
                 dev.start_sampling(n)
-                self.log_message(f'Start on follower {ip} (n={n})')
+                self._logger.info(f'Start on follower {ip} (n={n})')
         if 0 <= leader_id < len(self.manager.devices):
             time.sleep(0.01)
             self.manager.devices[leader_ip].start_sampling(n)
-            self.log_message(f'Start on leader {leader_ip} (n={n})')
+            self._logger.info(f'Start on leader {leader_ip} (n={n})')
         else:
             for ip, dev in self.manager.devices.items():
                 dev.start_sampling(n)
-                self.log_message(f'Start on {ip} (n={n})')
+                self._logger.info(f'Start on {ip} (n={n})')
 
     def _start_sampling_on_trigger(self):
         n = self.sample_spin.value()
@@ -683,14 +639,14 @@ class Plotter(QWidget):
         for i, (ip, dev) in enumerate(self.manager.devices.items()):
             if ip != leader_ip:
                 dev.start_sampling(n)
-                self.log_message(f'Start on follower {ip} (n={n})')
+                self._logger.info(f'Start on follower {ip} (n={n})')
         if 0 <= leader_id < len(self.manager.devices):
             self.manager.devices[leader_ip].start_sampling_trigger(n)
-            self.log_message(f'Trigger on leader {leader_ip} (n={n})')
+            self._logger.info(f'Trigger on leader {leader_ip} (n={n})')
         else:
             for ip, dev in self.manager.devices.items():
                 dev.start_sampling(n)
-                self.log_message(f'Start on {ip} (n={n})')
+                self._logger.info(f'Start on {ip} (n={n})')
 
     def _start_new_sampling(self):
         self._reset_counter()
@@ -704,19 +660,19 @@ class Plotter(QWidget):
 
     def _stop_sampling(self):
         self.manager.broadcast('stop_sampling')
-        self.log_message('Stopped all sampling')
+        self._logger.info('Stopped all sampling')
 
     def _reset_counter(self):
         self.manager.broadcast('reset_counter')
-        self.log_message('Reset counter on all devices')
+        self._logger.info('Reset counter on all devices')
         self.last_order.clear()
 
     def _force_trigger(self):
         self.manager.broadcast('force_trigger')
-        self.log_message('Force trigger on all devices')
+        self._logger.info('Force trigger on all devices')
 
     def _penetrate_firewall(self):
-        self.log_message('Trying to penetrate firewall')
+        self._logger.info('Trying to penetrate firewall')
         self.manager.penetrate_firewall(False)
 
     def _get_clock_config(self):
@@ -726,7 +682,7 @@ class Plotter(QWidget):
                 l.blockSignals(True)
         for ip, cfg in cfgs.items():
             if cfg is None:
-                self.log_message(f"Clock config for {ip}: not available")
+                self._logger.warning(f"Clock config for {ip}: not available")
                 continue
             active, stored = cfg
             for i, edit in enumerate(self.device_edits):
@@ -735,7 +691,7 @@ class Plotter(QWidget):
                     self.device_clock_sources[i].setChecked((active & 0x01) != 0)
                     self.device_clock_enables[i].setChecked((active & 0x02) != 0)
                     break
-            self.log_message(f"Clock config for {ip}: active={active:02X}, stored={stored:02X}")
+            self._logger.info(f"Clock config for {ip}: active={active:02X}, stored={stored:02X}")
         for k in zip(self.device_clock_sources, self.device_clock_enables):
             for l in k:
                 l.blockSignals(False)
@@ -765,7 +721,7 @@ class Plotter(QWidget):
         self.ax.clear()
         self.curves.clear()
         self._update_plot()
-        self.log_message('Graf cleaned')
+        self._logger.info('Graf cleaned')
 
     def save_data(self):
         path, _ = QFileDialog.getSaveFileName(self, 'Save Data', '', 'CSV Files (*.csv)')
@@ -789,7 +745,7 @@ class Plotter(QWidget):
         exporter = pyqtgraph.exporters.ImageExporter(self.ax)
         exporter.export(fname)
         files.append(fname)
-        self.log_message('Saved data: ' + ', '.join(files))
+        self._logger.info('Saved data: ' + ', '.join(files))
 
     def _update_plot(self):
         lines = []
@@ -824,20 +780,20 @@ class Plotter(QWidget):
         """Compose (source, enable) bitfield and send a single command."""
         txt = self.device_edits[row].text().strip()
         if not txt:
-            self.log_message(f'[ClockCtrl] Row {row}: no IP set')
+            self._logger.warning(f'[ClockCtrl] Row {row}: no IP set')
             return
 
         ip = txt.split(':')[0]
         dev = self.manager.devices.get(ip)
         if not dev:
-            self.log_message(f'[ClockCtrl] {ip}: device not applied yet')
+            self._logger.warning(f'[ClockCtrl] {ip}: device not applied yet')
             return
 
         enabled = self.device_clock_enables[row].isChecked()
         external = self.device_clock_sources[row].isChecked()
 
         dev.set_clock_ctrl(external=external, enabled=enabled)
-        self.log_message(
+        self._logger.info(
             f'[ClockCtrl] {ip}: source={"EXT" if external else "INT"}, enable={"ON" if enabled else "OFF"}'
         )
 
@@ -847,49 +803,47 @@ class Plotter(QWidget):
                 self.device_clock_sources[row].setChecked(row != leader_id)
                 self.device_clock_enables[row].setChecked(row == leader_id)
 
-class QtLogHandler(logging.Handler):
-    def __init__(self, plotter):
-        super().__init__()
-        self.plotter = plotter
+def main(argv):
+    with ExitStack() as stack:
+        stack.enter_context(logging_:=logger.Logging())
 
-    def emit(self, record):
-        try:
-            msg = self.format(record)
-            # Call your existing log_message method
-            self.plotter.log_message(msg)
-        except Exception:
-            self.handleError(record)
+        if sys.platform.startswith('win'):
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling,True)
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps,True)
+        app=QApplication(argv)
+        manager=DeviceManager()
+        gui=Plotter(manager)
+        gui_log_handler = logger.CallbackHandler(sink_text=gui.log_signal.emit)
+        gui_log_handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d\t%(levelname)-8s\t%(name)-10s\t%(message)s"))
+        gui_log_handler.formatter.datefmt='%H:%M:%S'
+        gui_log_handler.setLevel(logging.DEBUG)
+        logging_.log_printer.add_handler(gui_log_handler)
+        logging_.logger.critical(f"Logging to file: {logging_.log_path}") # This has to be in console, so critical
+        def start_loop():
+            loop=asyncio.SelectorEventLoop()
+            asyncio.set_event_loop(loop)
+            manager.attach_loop(loop)
+            manager.dispatch_loop(gui.data_ready)
+            loop.run_forever()
+        threading.Thread(target=start_loop,daemon=True).start()
+        def autoinit():
+            gui._update_defaults('192.168.137.100:')
+            debug = len(argv) > 1 and argv[1] == "DEBUG"
+            for i, checkbox in enumerate(gui.device_checks):
+                if debug:
+                    checkbox.setChecked(i in (0,))
+                else:
+                    checkbox.setChecked(i != 0)
+            gui.leader_buttons.button(0 if debug else 1).setChecked(True)
+            gui._apply_devices()
+            gui._penetrate_firewall()
+            for i, f in enumerate((gui._ping_all, gui._register_logger_all, gui._get_ids, gui._get_clock_config, gui._register_all, gui._reset_counter)):
+                QTimer(gui).singleShot(i * 100, f)        
+            gui.sample_spin.setValue(int(DEFAULT_AVG_LEN_MS))
+        QTimer(gui).singleShot(500, autoinit)
+        gui.show()
+        return app.exec_()
 
 if __name__=='__main__':
-    if sys.platform.startswith('win'):
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling,True)
-    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps,True)
-    print(sys.argv)
-    app=QApplication(sys.argv)
-    manager=DeviceManager()
-    gui=Plotter(manager)
-    def start_loop():
-        loop=asyncio.SelectorEventLoop()
-        asyncio.set_event_loop(loop)
-        manager.attach_loop(loop)
-        manager.dispatch_loop(gui.data_ready)
-        loop.run_forever()
-    threading.Thread(target=start_loop,daemon=True).start()
-    def autoinit():
-        gui._update_defaults('192.168.137.100:')
-        debug = len(sys.argv) > 1 and sys.argv[1] == "DEBUG"
-        for i, checkbox in enumerate(gui.device_checks):
-            if debug:
-                checkbox.setChecked(i in (0,))
-            else:
-                checkbox.setChecked(i != 0)
-        gui.leader_buttons.button(0 if debug else 1).setChecked(True)
-        gui._apply_devices()
-        gui._penetrate_firewall()
-        for i, f in enumerate((gui._ping_all, gui._register_logger_all, gui._get_ids, gui._get_clock_config, gui._register_all, gui._reset_counter)):
-            QTimer(gui).singleShot(i * 100, f)        
-        gui.sample_spin.setValue(int(DEFAULT_AVG_LEN_MS))
-    QTimer(gui).singleShot(500, autoinit)
-    gui.show()
-    sys.exit(app.exec_())
+    sys.exit(main(sys.argv))
