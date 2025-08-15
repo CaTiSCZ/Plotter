@@ -25,6 +25,7 @@ import logging
 
 import numpy as np
 import pyqtgraph as pg
+import pyqtgraph.exporters
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLineEdit, QLabel, QSpinBox, QCheckBox, QTextEdit,
@@ -33,7 +34,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 
 APPLICATION_NAME = 'Eaton FDDS SCADA'
-APPLICATION_VERSION = '1.3.1'
+APPLICATION_VERSION = '1.3.2'
 APPLICATION_TITLE = f"{APPLICATION_NAME} v{APPLICATION_VERSION}"
 
 # Constants
@@ -784,6 +785,10 @@ class Plotter(QWidget):
                 for t, row in zip(times, cols):
                     w.writerow([t * SAMPLING_PERIOD, *row])
             files.append(fname)
+        fname = f"{base}.png"
+        exporter = pyqtgraph.exporters.ImageExporter(self.ax)
+        exporter.export(fname)
+        files.append(fname)
         self.log_message('Saved data: ' + ', '.join(files))
 
     def _update_plot(self):
