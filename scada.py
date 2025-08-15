@@ -515,7 +515,7 @@ class Plotter(QWidget):
             if expected > 0xC000 and order <  0x4000:
                 next += 0x10000
         else:
-            next = order + 1
+            next = order
         self.last_order[ip] = next
 
     def _update_defaults(self,text:str):
