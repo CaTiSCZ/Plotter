@@ -33,7 +33,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 
 APPLICATION_NAME = 'Eaton FDDS SCADA'
-APPLICATION_VERSION = '1.3.0'
+APPLICATION_VERSION = '1.3.1'
 APPLICATION_TITLE = f"{APPLICATION_NAME} v{APPLICATION_VERSION}"
 
 # Constants
@@ -479,8 +479,8 @@ class Plotter(QWidget):
         scroll.setWidget(self.log_output)
         root.addWidget(scroll)
 
-        self._init_log_file()
         self.log_signal.connect(self.log_output.append)
+        self._init_log_file()
 
         penetrator = QTimer(self)
         penetrator.setInterval(3000)
@@ -505,8 +505,8 @@ class Plotter(QWidget):
                 self._log_file.flush()
         except Exception as _e:
             # Avoid recursive logging on file errors
-            pass
-    
+            print("Logging exception:", _e)
+
     def _init_log_file(self):
         try:
             logs_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)), "logs")
@@ -523,6 +523,7 @@ class Plotter(QWidget):
         # Let the user know where logs are stored
         # (safe to call log_message here now that _log_file is set)
         self.log_message(f"Logging to file: {self.log_path}")
+        print(f"Logging to file: {self.log_path}")
 
         if FCN_QT_LOGGING:
             handler = QtLogHandler(self)
