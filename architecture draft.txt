@@ -22,7 +22,8 @@ Plotter
 
 DeviceManager
     parameters:
-        sockets: [AsyncSocket]
+        cmd_socket: AsyncSocket
+	data_socket: AsyncSocket
     init:
         register _packetHandler to all sockets.onPacketReceived
     properties:
