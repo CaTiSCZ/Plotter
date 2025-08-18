@@ -419,6 +419,10 @@ class Plotter(QWidget):
         self.receiver_edit = QLineEdit(f'0.0.0.0:{DEFAULT_DATA_PORT}')
         cfg.addWidget(self.receiver_edit, 0, 7)
 
+        cfg.addWidget(QLabel('Measurement number'), 2, 6)
+        self.measurement_number_edit = QLineEdit(f'1')
+        cfg.addWidget(self.measurement_number_edit, 2, 7)
+
         self.apply_btn = QPushButton('Apply Device List')
         cfg.addWidget(self.apply_btn, DeviceManager.MAX_DEVICES, 2)
         self.apply_btn.clicked.connect(self._apply_devices)
@@ -434,12 +438,13 @@ class Plotter(QWidget):
         btns = QHBoxLayout()
         root.addLayout(btns)
 
-        for label, fn in (('Ping All'               , self._ping_all            ),
-                          ('Get IDs'                , self._get_ids             ),
-                          ('Register All'           , self._register_all        ),
-                          ('Remove All'             , self._remove_all          ),
-                          ('Register logger All'    , self._register_logger_all ),
-                          ('Remove logger All'      , self._remove_logger_all   )):
+        for label, fn in (#('Ping All'               , self._ping_all            ),
+                          #('Get IDs'                , self._get_ids             ),
+                          #('Register All'           , self._register_all        ),
+                          #('Remove All'             , self._remove_all          ),
+                          #('Register logger All'    , self._register_logger_all ),
+                          #('Remove logger All'      , self._remove_logger_all   )
+                          ):
             b = QPushButton(label)
             b.clicked.connect(fn)
             btns.addWidget(b)
@@ -450,16 +455,18 @@ class Plotter(QWidget):
         self.sample_spin.setValue(10)
         btns.addWidget(self.sample_spin)
 
-        for label, fn in (('Start Sampling'                 , self._start_sampling                  ),
+        for label, fn in (#('Start Sampling'                 , self._start_sampling                  ),
                           ('Start New Sampling'             , self._start_new_sampling              ),
-                          ('Start Sampling on trigger'      , self._start_sampling_on_trigger       ),
+                          #('Start Sampling on trigger'      , self._start_sampling_on_trigger       ),
                           ('Start New Sampling on trigger'  , self._start_new_sampling_on_trigger   ),
+                          ('Save Measurement'               , self.save_measurement                 ),
                           ('Force trigger'                  , self._force_trigger                   ),
                           ('Stop Sampling'                  , self._stop_sampling                   ),
                           ('Reset Counter'                  , self._reset_counter                   ),
                           ('Clean Graf'                     , self.clear_plot                       ),
-                          ('Penetrate Firewall'             , self._penetrate_firewall              ),
-                          ('Save Data'                      , self.save_data                        ) ):
+                          #('Penetrate Firewall'             , self._penetrate_firewall              ),
+                          ('Save Data'                      , self.save_data                        )
+                          ):
             b=QPushButton(label)
             b.clicked.connect(fn)
             btns.addWidget(b)
@@ -722,15 +729,26 @@ class Plotter(QWidget):
         self.curves.clear()
         self._update_plot()
         self._logger.info('Graf cleaned')
+    
+    def save_measurement(self):
+        measurement_nr = int(self.measurement_number_edit.text())
+        file_name = os.path.join(f'RICE_mereni', str(measurement_nr).zfill(4))
+        self.save_data(file_prefix=file_name)
+        measurement_nr += 1
+        self.measurement_number_edit.setText(str(measurement_nr))
 
-    def save_data(self):
-        path, _ = QFileDialog.getSaveFileName(self, 'Save Data', '', 'CSV Files (*.csv)')
-        if not path:
-            return
-        base = path.rstrip('.csv')
+    def save_data(self, file_prefix=None):
+        if not file_prefix:
+            path, _ = QFileDialog.getSaveFileName(self, 'Save Data', '', 'CSV Files (*.csv)')
+            if not path:
+                return
+            base = path.rstrip('.csv')
+        else:
+            base = file_prefix
+
         files = []
         for idx, (ip, dev) in enumerate(self.manager.devices.items()):
-            fname = f"{base}_dev{idx}_{ip.replace('.', '_')}.csv"
+            fname = f"{base}_dev{idx}.csv"
             with open(fname, 'w', newline='') as f:
                 w = csv.writer(f)
                 header = ['time'] + [f'ch{c}' for c in range(dev.channels)]
@@ -837,12 +855,14 @@ def main(argv):
                     checkbox.setChecked(i != 0)
             gui.leader_buttons.button(0 if debug else 1).setChecked(True)
             gui._apply_devices()
-            gui._penetrate_firewall()
-            for i, f in enumerate((gui._ping_all, gui._register_logger_all, gui._get_ids, gui._get_clock_config, gui._register_all, gui._reset_counter)):
+            #gui._penetrate_firewall()
+            #for i, f in enumerate((gui._ping_all, gui._register_logger_all, gui._get_ids, gui._get_clock_config, gui._register_all, gui._reset_counter)):
+            for i, f in enumerate((gui._ping_all, gui._get_ids, gui._register_all, gui._reset_counter)):
                 QTimer(gui).singleShot(i * 100, f)        
             gui.sample_spin.setValue(int(DEFAULT_AVG_LEN_MS))
         QTimer(gui).singleShot(500, autoinit)
-        gui.show()
+        #gui.show()
+        gui.showMaximized()
         return app.exec_()
 
 if __name__=='__main__':
