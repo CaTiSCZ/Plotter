@@ -2,3 +2,12 @@
 __pycache__/
 *.py[cod]
 
+# cppimport generated files
+*.rendered.*
+
+# Pyinstaller generated files
+build
+dist
+
+# scada logs
+logs
