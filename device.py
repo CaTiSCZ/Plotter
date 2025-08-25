@@ -8,6 +8,7 @@ from collections.abc import Callable
 from typing import Any
 import socket
 from event import Event
+import numpy as np
 
     # ---------------------- CMD a packety -------------------
 class PACKET(IntEnum):
@@ -46,6 +47,13 @@ SAVE_KEY = 0xAC
 RESET_KEY = 0xFE
 
 class Device:
+
+    RAW_DATA_TYPE = np.int16
+    SAMPLES_PER_PACKET = 200
+    PACKETS_PER_SECOND = 1000
+    DEFAULT_BUFFER_SIZE = 10 * SAMPLES_PER_PACKET * PACKETS_PER_SECOND
+
+
     @dataclass
     class CommandRecord:
         timer: threading.Timer
@@ -92,10 +100,13 @@ class Device:
         self.timeout = 1
 
         self.send_command_lock = threading.Lock()
+        self.buffer_lock = threading.Lock()
 
         self.is_sampling = False
         self.id = {}
+        self.channels_count = None
         self.channel_info = []
+        self.buffer_size = Device.DEFAULT_BUFFER_SIZE
 
 
         self.event_ACK = Event()
@@ -103,6 +114,7 @@ class Device:
         self.event_data = Event()
         self.event_trigger = Event()
         self.event_log = Event()
+        self.event_shrink_buffer = Event()
 
 
     def _keep_alive (self):
@@ -153,6 +165,7 @@ class Device:
                     return
                 unpacked = STRUCT.ID.unpack_from(packet_view[offset : min_lenght])
                 old_id = self.id
+                
                 self.id = {
                     'mcu_hw_id': unpacked[0],
                     'mcu_hw_ver_major': unpacked[1],
@@ -170,9 +183,9 @@ class Device:
                     'build_time': unpacked[15].decode('ascii').rstrip('\x00'),
                     'channels_count': unpacked[16],
                 }
-                self.channels_count = self.id['channels_count']
+                channels_count = self.id['channels_count']
                 offset = min_lenght
-                min_lenght += self.channels_count * STRUCT.CHANNEL.size
+                min_lenght += channels_count * STRUCT.CHANNEL.size
                 if len(packet) < min_lenght:
                     self._logger.error(f"Packet received: Too short ID packet ({packet_lenght}).")
                     if record.on_timeout is not None:
@@ -181,12 +194,13 @@ class Device:
                 old_channel_info = self.channel_info
                 self.channel_info = []
                 unpacker = STRUCT.CHANNEL.iter_unpack(packet_view[offset:])
-                for i in range (self.channels_count):
+                for i in range (channels_count):
                     info = Device.ChannelInfo(*next(unpacker))
                     info.unit = info.unit.decode('ascii').rstrip('\x00')
                     self.channel_info.append(info)
                 self._logger.info(f"Packet received: ID packet received")
                 #volat funkci zajišťující správný přepočet dat
+                self._init_buffer(channels_count = channels_count)
                 if record.on_ack is not None:
                     record.on_ack(*record.on_ack_args, **record.on_ack_kwargs)
                 self.event_ID.emit(self, error, old_id, self.id, old_channel_info, self.channel_info)
@@ -227,7 +241,41 @@ class Device:
         self._logger.info(msg or f"Send command: received ACK for {cmd}")
         if on_ack is not None:
             on_ack(error, data, *on_ack_args, **on_ack_kwargs)
-        
+
+    def _init_buffer(self, *, channels_count = None, buffer_size = None):
+
+        with self.buffer_lock:
+            if channels_count is None and buffer_size is None:
+                self._logger.critical("Init buffer: Both channels_count and buffer_size cannot be None")
+                raise ValueError("Both channels_count and buffer_size cannot be None")
+            if channels_count is not None and buffer_size is not None:
+                self._logger.critical("Init buffer: Both channels_count and buffer_size cannot change")
+                raise ValueError("Both channels_count and buffer_size cannot change")
+
+
+            #domyslet logiku která část bufferu se mění aby se to nekřížilo s None    
+
+
+
+
+
+
+            if self.channels_count is None and buffer_size is not None:
+                self.buffer_size = buffer_size
+            elif self.channels_count is None:    
+                self.raw_buffer = np.zeros((channels_count, 3 * self.buffer_size), dtype=Device.RAW_DATA_TYPE)
+                self.channels_count = channels_count
+            
+            elif channels_count > self.channels_count:
+                self.raw_buffer = np.concatenate((self.raw_buffer, np.zeros((channels_count - self.channels_count, 3 * self.buffer_size), dtype=Device.RAW_DATA_TYPE)), axis=0)
+                self.channels_count = channels_count
+
+            elif buffer_size > self.buffer_size:
+                self.raw_buffer = np.concatenate((self.raw_buffer, np.zeros((self.channels_count, 3 * (buffer_size - self.buffer_size)), dtype=Device.RAW_DATA_TYPE)), axis=1)
+            else:
+                raw = self.raw_buffer
+                self.event_shrink_buffer.emit(self, raw)
+                self.raw_buffer = self.raw_buffer[:channel_count]
 
     def send_command(self, cmd: int, data: bytes = b'', on_timeout = None, on_timeout_args = [], on_timeout_kwargs = {}, on_ack = None, on_ack_args = [], on_ack_kwargs = {}):
         with self.send_command_lock:
