@@ -1,6 +1,5 @@
 import logging
 from logger import application_logger
-from async_socket import AsyncSocket
 import threading
 import struct
 from enum import IntEnum
@@ -8,6 +7,7 @@ from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Any
 import socket
+from event import Event
 
     # ---------------------- CMD a packety -------------------
 class PACKET(IntEnum):
@@ -94,6 +94,16 @@ class Device:
         self.send_command_lock = threading.Lock()
 
         self.is_sampling = False
+        self.id = {}
+        self.channel_info = []
+
+
+        self.event_ACK = Event()
+        self.event_ID = Event()
+        self.event_data = Event()
+        self.event_trigger = Event()
+        self.event_log = Event()
+
 
     def _keep_alive (self):
         pass
@@ -116,6 +126,7 @@ class Device:
                 record = self._cancel_timeout(cmd)
                 if record.on_ack is not None:
                     record.on_ack(cmd, error, packet_view[min_lenght:], *record.on_ack_args, **record.on_ack_kwargs)
+                self.event_ACK.emit(self, cmd, error, packet_view[min_lenght:])
 
             case PACKET.ID_packet:
                 cmd = CMD.GET_ID
@@ -141,6 +152,7 @@ class Device:
                         record.on_timeout(*record.on_timeout_args, **record.on_timeout_kwargs)
                     return
                 unpacked = STRUCT.ID.unpack_from(packet_view[offset : min_lenght])
+                old_id = self.id
                 self.id = {
                     'mcu_hw_id': unpacked[0],
                     'mcu_hw_ver_major': unpacked[1],
@@ -166,6 +178,7 @@ class Device:
                     if record.on_timeout is not None:
                         record.on_timeout(*record.on_timeout_args, **record.on_timeout_kwargs)
                     return
+                old_channel_info = self.channel_info
                 self.channel_info = []
                 unpacker = STRUCT.CHANNEL.iter_unpack(packet_view[offset:])
                 for i in range (self.channels_count):
@@ -176,15 +189,18 @@ class Device:
                 #volat funkci zajišťující správný přepočet dat
                 if record.on_ack is not None:
                     record.on_ack(*record.on_ack_args, **record.on_ack_kwargs)
+                self.event_ID.emit(self, error, old_id, self.id, old_channel_info, self.channel_info)
 
             case PACKET.DATA_packet:
-                pass
+                self.event_data.emit(self, error, packet_view[min_lenght:])
             case PACKET.TRIGGER_packet:
                 self._logger.info(f"Packet received: TRIGGER packet received")
+                self.event_trigger.emit(self, error, packet_view[min_lenght:])
             case PACKET.LOG_packet:
                 packet_num = error
                 msg = packet_view[min_lenght:].decode('ascii').rstrip('\x00')
                 self._logger.info(f"LOG [{packet_num:5}]: {msg}")
+                self.event_log.emit(self, packet_num, msg)
 
     def _timeout(self, cmd):
         with self.send_command_lock:
