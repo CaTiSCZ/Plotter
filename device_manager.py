@@ -44,7 +44,7 @@ class DeviceManager:
     def register_receiver(self):
         for device in self._devices.values():
             device.register_receiver()
-
+            # přidat argumenty sem i dál
     def connect(self):
         pass
 
