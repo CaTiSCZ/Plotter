@@ -20,7 +20,7 @@ class BufferedSocket:
         self._timeout = 5.0
         self._received_count = 0
 
-    def bind(self, port: int, use_my_ip: bool = False, device_ip: str = "192.168.1.100", device_port: int = "9999"): 
+    def bind(self, port: int, use_my_ip: bool = False, device_ip: str = "192.168.1.100", device_port: int = 9999): 
         self.close()
         with self._sock_lock:
             if use_my_ip:

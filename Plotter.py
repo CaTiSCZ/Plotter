@@ -194,21 +194,21 @@ class Plotter(QWidget):
         
         self.cmd_label = QLabel("CMD:")
         self.command_port_edit = QLineEdit(str(self.udp_ack_port))
-        self.command_port_edit.returnPressed.connect(lambda: self.log_message("TO DO"))
+        self.command_port_edit.returnPressed.connect(self.update_ports)
         grid.addWidget(self.cmd_label, 1, 0, alignment=Qt.AlignRight)
         grid.addWidget(self.command_port_edit, 1, 1, alignment=Qt.AlignLeft)
         grid.addWidget(self.listen_all_checkbox, 0, 2, 1, 4)
 
         self.data_label = QLabel("DATA:")
         self.data_port_edit = QLineEdit(str(self.udp_data_port))
-        self.data_port_edit.returnPressed.connect(lambda: self.log_message("TO DO"))
+        self.data_port_edit.returnPressed.connect(self.update_ports)
         grid.addWidget(self.data_label, 1,2, alignment=Qt.AlignRight)
         grid.addWidget(self.data_port_edit, 1, 3, alignment=Qt.AlignLeft)
 
 
         self.confirm_client_button = QPushButton("Use")
         grid.addWidget(self.confirm_client_button, 2,0, 1,4, alignment=Qt.AlignRight)
-        self.confirm_client_button.clicked.connect(lambda: self.log_message("TO DO"))
+        self.confirm_client_button.clicked.connect(self.update_ports)
 
 
 #force trigger
@@ -295,15 +295,15 @@ class Plotter(QWidget):
 
 # device adresses
         self.dev_enable = []
-        self.div_ip_edit = []
+        self.dev_ip_edit = []
         device_count = 5
         for i in range (device_count):
             self.dev_enable.append(QCheckBox(f"Device {i+1}:"))
             self.dev_enable[-1].setChecked(True)
             self.dev_enable[-1].stateChanged.connect(self._device_selected_changed) 
             grid.addWidget(self.dev_enable[-1], i+1, 13)
-            self.div_ip_edit.append(QLineEdit(f"{self.udp_device_addr}:{self.udp_device_port}"))
-            grid.addWidget(self.div_ip_edit[-1], i+1, 14, 1, 1)
+            self.dev_ip_edit.append(QLineEdit(f"{self.udp_device_addr}:{self.udp_device_port}"))
+            grid.addWidget(self.dev_ip_edit[-1], i+1, 14, 1, 1)
 
         self.select_all_checkbox = QCheckBox("Select All")
         self.select_all_checkbox.setChecked(True)
@@ -316,7 +316,7 @@ class Plotter(QWidget):
         self.confirm_generator_button = QPushButton("Use")
         grid.addWidget(self.confirm_generator_button, device_count + 1, 13, 1, 1, alignment=Qt.AlignCenter)
         #self.generator_ip_edit.returnPressed.connect(lambda: self.log_message("TO DO"))
-        self.confirm_generator_button.clicked.connect(lambda: self.log_message("TO DO"))
+        self.confirm_generator_button.clicked.connect(self.add_device)
 
         self.connect_generator_button = QPushButton("Connect")
         grid.addWidget(self.connect_generator_button, device_count + 1, 14,1,1, alignment=Qt.AlignCenter)
@@ -380,7 +380,7 @@ class Plotter(QWidget):
             (self.register_text_edit, 100),
             (self.remove_text_edit, 100),
             (self.num_packets_spinbox, 50)
-        ] + list((k, 100) for k in self.div_ip_edit):
+        ] + list((k, 100) for k in self.dev_ip_edit):
             widget.setFixedWidth(width)
             widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
@@ -419,6 +419,20 @@ class Plotter(QWidget):
         self.select_all_checkbox.setChecked(all_checked)
         self.select_all_checkbox.blockSignals(False)
 
+    def add_device(self):
+        self._logger.debug("Adding device...")
+        for en, addr in zip(self.dev_enable,self.dev_ip_edit):
+            if en.isChecked():
+                ip, port = addr.text().split(":")
+                self.device_manager.add_device((ip, int(port)))
+    
+    def update_ports(self):
+        int(self.command_port_edit.text())
+        int(self.data_port_edit.text())
+        ip, port = self.dev_ip_edit[0].text().split(":")
+        self.cmd_socket.socket.bind((int(self.command_port_edit.text())), use_my_ip = True, device_ip = ip, device_port = int(port))
+        self.data_socket.socket.bind((int(self.data_port_edit.text())), use_my_ip = True, device_ip = ip, device_port = int(port))
+
     def log_message(self, msg: str):
         #timestamp = time.strftime("%H:%M:%S")
         #self.log_output.append(f"[{timestamp}] {msg}")
@@ -428,6 +442,7 @@ class Plotter(QWidget):
     def show(self):
         res = super().show()
         self.isShown = True
+        self.update_ports()
         return res
 
     def closeEvent(self, event):

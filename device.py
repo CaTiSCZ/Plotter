@@ -52,6 +52,7 @@ class Device:
     SAMPLES_PER_PACKET = 200
     PACKETS_PER_SECOND = 1000
     DEFAULT_BUFFER_SIZE = 10 * SAMPLES_PER_PACKET * PACKETS_PER_SECOND
+    BUFFER_EXTEND = 3
 
 
     @dataclass
@@ -136,7 +137,7 @@ class Device:
                     return  
                 cmd = STRUCT.CMD.unpack_from(packet, offset)[0]
                 record = self._cancel_timeout(cmd)
-                if record.on_ack is not None:
+                if record is not None and record.on_ack is not None:
                     record.on_ack(cmd, error, packet_view[min_lenght:], *record.on_ack_args, **record.on_ack_kwargs)
                 self.event_ACK.emit(self, cmd, error, packet_view[min_lenght:])
 
@@ -148,19 +149,19 @@ class Device:
                         pass
                     case None:
                         self._logger.error(f"Packet received: Too short ID packet ({packet_lenght}).")
-                        if record.on_timeout is not None:
+                        if record is not None and record.on_timeout is not None:
                             record.on_timeout(*record.on_timeout_args, **record.on_timeout_kwargs)
                         return
                     case (received_crc, expected_crc):
                         self._logger.error(f"Packet received: ID packet with invalid CRC; reveived: {received_crc}, expected: {expected_crc}")
-                        if record.on_timeout is not None:
+                        if record is not None and record.on_timeout is not None:
                             record.on_timeout(*record.on_timeout_args, **record.on_timeout_kwargs)
                         return
                 offset = min_lenght
                 min_lenght += STRUCT.ID.size
                 if packet_lenght < min_lenght:
                     self._logger.error(f"Packet received: Too short ID packet ({packet_lenght}).")
-                    if record.on_timeout is not None:
+                    if record is not None and record.on_timeout is not None:
                         record.on_timeout(*record.on_timeout_args, **record.on_timeout_kwargs)
                     return
                 unpacked = STRUCT.ID.unpack_from(packet_view[offset : min_lenght])
@@ -188,12 +189,12 @@ class Device:
                 min_lenght += channels_count * STRUCT.CHANNEL.size
                 if len(packet) < min_lenght:
                     self._logger.error(f"Packet received: Too short ID packet ({packet_lenght}).")
-                    if record.on_timeout is not None:
+                    if record is not None and record.on_timeout is not None:
                         record.on_timeout(*record.on_timeout_args, **record.on_timeout_kwargs)
                     return
                 old_channel_info = self.channel_info
                 self.channel_info = []
-                unpacker = STRUCT.CHANNEL.iter_unpack(packet_view[offset:])
+                unpacker = STRUCT.CHANNEL.iter_unpack(packet_view[offset:min_lenght])
                 for i in range (channels_count):
                     info = Device.ChannelInfo(*next(unpacker))
                     info.unit = info.unit.decode('ascii').rstrip('\x00')
@@ -201,7 +202,7 @@ class Device:
                 self._logger.info(f"Packet received: ID packet received")
                 #volat funkci zajišťující správný přepočet dat
                 self._init_buffer(channels_count = channels_count)
-                if record.on_ack is not None:
+                if record is not None and record.on_ack is not None:
                     record.on_ack(*record.on_ack_args, **record.on_ack_kwargs)
                 self.event_ID.emit(self, error, old_id, self.id, old_channel_info, self.channel_info)
 
@@ -212,7 +213,7 @@ class Device:
                 self.event_trigger.emit(self, error, packet_view[min_lenght:])
             case PACKET.LOG_packet:
                 packet_num = error
-                msg = packet_view[min_lenght:].decode('ascii').rstrip('\x00')
+                msg = packet[min_lenght:].decode('ascii').rstrip('\x00')
                 self._logger.info(f"LOG [{packet_num:5}]: {msg}")
                 self.event_log.emit(self, packet_num, msg)
 
@@ -228,9 +229,10 @@ class Device:
                 record = self.sent_commands[cmd]
                 record.timer.cancel()
                 del self.sent_commands[cmd]
+                return record 
         except KeyError:
             self._logger.info("Packet received: unexpected response for {cmd}")
-        return record        
+        return None
 
     def on_timeout(self, cmd, msg = None, on_timeout = None, on_timeout_args = [], on_timeout_kwargs = {}):
         self._logger.warning(msg or f"Send command: no answer for {cmd}" )
@@ -243,39 +245,33 @@ class Device:
             on_ack(error, data, *on_ack_args, **on_ack_kwargs)
 
     def _init_buffer(self, *, channels_count = None, buffer_size = None):
-
         with self.buffer_lock:
-            if channels_count is None and buffer_size is None:
+            if buffer_size is None and channels_count is None:
                 self._logger.critical("Init buffer: Both channels_count and buffer_size cannot be None")
                 raise ValueError("Both channels_count and buffer_size cannot be None")
-            if channels_count is not None and buffer_size is not None:
-                self._logger.critical("Init buffer: Both channels_count and buffer_size cannot change")
-                raise ValueError("Both channels_count and buffer_size cannot change")
-
-
-            #domyslet logiku která část bufferu se mění aby se to nekřížilo s None    
-
-
-
-
-
-
-            if self.channels_count is None and buffer_size is not None:
+            elif channels_count is not None:
+                if buffer_size is not None:
+                    self._logger.critical("Init buffer: Both channels_count and buffer_size cannot change")
+                    raise ValueError("Both channels_count and buffer_size cannot change")
+                elif self.channels_count is None:
+                    self.raw_buffer = np.zeros((channels_count, Device.BUFFER_EXTEND * self.buffer_size), dtype=Device.RAW_DATA_TYPE)
+                elif channels_count > self.channels_count:
+                    self.raw_buffer = np.concatenate((self.raw_buffer, np.zeros((channels_count - self.channels_count, Device.BUFFER_EXTEND * self.buffer_size), dtype=Device.RAW_DATA_TYPE)), axis=0)
+                elif channels_count < self.channels_count:
+                    raw = self.raw_buffer
+                    self.event_shrink_buffer.emit(self, raw)
+                    self.raw_buffer = self.raw_buffer[:channels_count]
+                self.channels_count = channels_count
+            elif buffer_size is not None:
+                if self.channels_count is not None:
+                    if buffer_size > self.buffer_size:
+                        self.raw_buffer = np.concatenate((self.raw_buffer, np.zeros((self.channels_count, Device.BUFFER_EXTEND * (buffer_size - self.buffer_size)), dtype=Device.RAW_DATA_TYPE)), axis=1)
+                    elif buffer_size < self.buffer_size:
+                        raw = self.raw_buffer
+                        self.event_shrink_buffer.emit(self, raw)
+                        self.raw_buffer = self.raw_buffer[:, :Device.BUFFER_EXTEND * buffer_size]
                 self.buffer_size = buffer_size
-            elif self.channels_count is None:    
-                self.raw_buffer = np.zeros((channels_count, 3 * self.buffer_size), dtype=Device.RAW_DATA_TYPE)
-                self.channels_count = channels_count
-            
-            elif channels_count > self.channels_count:
-                self.raw_buffer = np.concatenate((self.raw_buffer, np.zeros((channels_count - self.channels_count, 3 * self.buffer_size), dtype=Device.RAW_DATA_TYPE)), axis=0)
-                self.channels_count = channels_count
 
-            elif buffer_size > self.buffer_size:
-                self.raw_buffer = np.concatenate((self.raw_buffer, np.zeros((self.channels_count, 3 * (buffer_size - self.buffer_size)), dtype=Device.RAW_DATA_TYPE)), axis=1)
-            else:
-                raw = self.raw_buffer
-                self.event_shrink_buffer.emit(self, raw)
-                self.raw_buffer = self.raw_buffer[:channel_count]
 
     def send_command(self, cmd: int, data: bytes = b'', on_timeout = None, on_timeout_args = [], on_timeout_kwargs = {}, on_ack = None, on_ack_args = [], on_ack_kwargs = {}):
         with self.send_command_lock:

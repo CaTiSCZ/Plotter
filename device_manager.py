@@ -1,5 +1,7 @@
 import logging
 from logger import application_logger
+from device import Device
+from event import Event
 
 class DeviceManager:
     SAMPLES_PER_PACKET = 200
@@ -13,36 +15,59 @@ class DeviceManager:
         self._data_socket = data_socket
         self._cmd_socket.register(self._packet_handler)   
         self._data_socket.register(self._packet_handler)
-         
-    
+        self._devices = {}
+
+        self.event_device_added = Event()
+        #self.event_device_removed = Event()
+
     def _packet_handler(self, socket, data, addr):
-        pass    
+        try:
+            device = self._devices[addr]
+            device.packet_received(data)
+        except KeyError:
+            self._logger.warning(f"Packet handler:Received packet from unknown device: {addr}")
+
+    def add_device(self, addr):
+        device = Device(self._cmd_socket, addr)
+        self._devices[addr] = device
+        self._logger.info(f"Device added: {addr}")
+        self.event_device_added.emit(self, device)
 
     def ping(self):
-        pass
+        for device in self._devices.values():
+            device.ping()
 
     def get_id(self):
-        pass
+        for device in self._devices.values():
+            device.get_id()
 
     def register_receiver(self):
-        pass
+        for device in self._devices.values():
+            device.register_receiver()
+
     def connect(self):
         pass
 
     def remove_receiver(self):
-        pass
+        for device in self._devices.values():
+            device.remove_receiver()
     
     def get_receivers(self):
-        pass
+        for device in self._devices.values():
+            device.get_receivers()
     
     def start_sampling(self):
-        pass
+        for device in self._devices.values():
+            device.start_sampling()
 
     def start_on_trigger(self):
-        pass
+        for device in self._devices.values():
+            device.start_on_trigger()
 
     def stop_sampling(self):
-        pass
+        for device in self._devices.values():
+            device.stop_sampling()
  
     def send_trigger(self):
-        pass
+        for device in self._devices.values():
+            device.send_trigger()
