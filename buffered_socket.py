@@ -2,10 +2,14 @@ import socket
 import threading
 import queue
 import time
+import logging
+import logger
 
 
 class BufferedSocket:
     def __init__(self, max_size = 4096):
+        self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
+
         self.max_size = max_size
         self._addr = None
         self._sock = None
@@ -29,9 +33,9 @@ class BufferedSocket:
                     tmp_sock.connect((device_ip, device_port))  
                     local_ip = tmp_sock.getsockname()[0]
                     tmp_sock.close()
-                    print(f"[INFO buffered socket] Detekovaná vlastní IP: {local_ip}")
+                    self._logger.info(f"Bind: My IP: {local_ip}")
                 except Exception as e:
-                    raise RuntimeError(f"Chyba při zjišťování vlastní IP: {e}")
+                    raise RuntimeError(f"Cannot determine my IP: {e}")
             else:
                 local_ip = "0.0.0.0"
 
@@ -44,7 +48,7 @@ class BufferedSocket:
 
     def _start(self):
         if not self._sock:
-            raise RuntimeError("Nejdřív zavolej bind() pro nastavení IP a portu.")
+            raise RuntimeError("Start: Need to call bind() first to set IP and port.")
 
         self._running = True
         if self._listener_thread is None or not self._listener_thread.is_alive():
@@ -62,7 +66,7 @@ class BufferedSocket:
                     self._sock.close()
                     self._sock = None
         except Exception as e:
-            print(f"[CHYBA buffered socket] při zavírání socketu: {e}")
+            self._logger.error(f"Error closing socket: {e}")
         if self._listener_thread and self._listener_thread.is_alive():
             self._listener_thread.join(timeout=2)
         if self._sender_thread and self._sender_thread.is_alive():
@@ -83,9 +87,9 @@ class BufferedSocket:
             except (socket.error, OSError) as e:
                 if self._running:
                     if isinstance(e, ConnectionResetError):
-                        print(f"[VAROVÁNÍ buffered socket] Připojení resetováno hostitelem (pravděpodobně port není aktivní): {e}")
+                        self._logger.warning(f"Listen loop: {e}")
                         continue  # místo break
-                    print(f"[CHYBA buffered socket] při příjmu dat: {e}")
+                    self._logger.error(f"Listen loop: {e}")
                 break
 
     def _send_loop(self):
@@ -102,7 +106,7 @@ class BufferedSocket:
                 continue
             except (socket.error, OSError) as e:
                 if self._running:
-                    print(f"[CHYBA buffered socket] při odesílání dat: {e}")
+                    self._logger.error(f"send loop: {e}")
                 break
 
     def sendto(self, data: bytes, addr):
@@ -116,14 +120,14 @@ class BufferedSocket:
             data, addr = self._receive_buffer.get(timeout=self._timeout)
             return data[:bufsize], addr  # <<< zde aplikujeme bufsize limit
         except queue.Empty:
-            raise socket.timeout("recvfrom timeout vypršel")
+            raise socket.timeout("recvfrom: timeout")
 
     def get_received_count(self):
         return self._receive_buffer.qsize()
 
 
 if __name__ == '__main__':
-
+    logging_ = logger.Logging()
     # Konfigurace adres
     local_host = '127.0.0.1'
     local_port = 5000
