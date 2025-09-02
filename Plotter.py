@@ -246,23 +246,23 @@ class Plotter(QWidget):
         grid.addWidget(self.get_id_button, 1, 7, 1, 2, alignment=Qt.AlignCenter)
 # get receiver
         self.get_receivers_button = QPushButton("Get receivers")
-        self.get_receivers_button.clicked.connect(self.device_manager.get_receivers)
+        self.get_receivers_button.clicked.connect(lambda: self.device_manager.get_receivers(0))
         grid.addWidget(self.get_receivers_button, 1, 9, 1, 2, alignment=Qt.AlignCenter)
 # register receiver
         self.register_text_edit = QLineEdit(f"0.0.0.0:{self.udp_data_port}")
-        self.register_text_edit.returnPressed.connect(self.device_manager.register_receiver)
+        self.register_text_edit.returnPressed.connect(lambda: self.device_manager.register_receiver(self.register_text_edit.text(), 0))
         grid.addWidget(QLabel("Register receiver:"), 3, 5, 1, 3)
         grid.addWidget(self.register_text_edit, 4, 5, 1, 2)
         self.register_button = QPushButton("Register")
-        self.register_button.clicked.connect(self.device_manager.register_receiver)
+        self.register_button.clicked.connect(lambda: self.device_manager.register_receiver(self.register_text_edit.text(), 0))
         grid.addWidget(self.register_button, 4, 7)
 # remove receiver
         self.remove_text_edit = QLineEdit(f"0.0.0.0:{self.udp_data_port}")
-        self.remove_text_edit.returnPressed.connect(self.device_manager.remove_receiver)
+        self.remove_text_edit.returnPressed.connect(lambda: self.device_manager.remove_receiver(self.remove_text_edit.text(), 0))
         grid.addWidget(QLabel("Remove receiver:"), 3, 8, 1, 3)
         grid.addWidget(self.remove_text_edit, 4, 8, 1, 2)
         self.remove_button = QPushButton("Remove")
-        self.remove_button.clicked.connect(self.device_manager.remove_receiver)
+        self.remove_button.clicked.connect(lambda: self.device_manager.remove_receiver(self.remove_text_edit.text(), 0))
         grid.addWidget(self.remove_button, 4, 10)
 
 
@@ -278,11 +278,11 @@ class Plotter(QWidget):
         grid.addWidget(self.num_packets_spinbox, 0, 12)
 # start sampling
         self.start_sampling_button = QPushButton("Start sampling")
-        self.start_sampling_button.clicked.connect(self.device_manager.start_sampling)
+        self.start_sampling_button.clicked.connect(lambda: self.start_sampling(False))
         grid.addWidget(self.start_sampling_button, 1, 11, 1, 2, alignment=Qt.AlignCenter)
 # start on trigger
         self.trigger_sampling_button = QPushButton("Start sampling on trigger")
-        self.trigger_sampling_button.clicked.connect(self.device_manager.start_on_trigger)
+        self.trigger_sampling_button.clicked.connect(lambda: self.start_sampling(True))
         grid.addWidget(self.trigger_sampling_button, 2, 11, 1, 2, alignment=Qt.AlignCenter)
 # stop sampling
         self.stop_sampling_button = QPushButton("Stop sampling")
@@ -435,6 +435,13 @@ class Plotter(QWidget):
         ip, port = self.dev_ip_edit[0].text().split(":")
         self.cmd_socket.socket.bind((int(self.command_port_edit.text())), use_my_ip = True, device_ip = ip, device_port = int(port))
         self.data_socket.socket.bind((int(self.data_port_edit.text())), use_my_ip = True, device_ip = ip, device_port = int(port))
+
+    def start_sampling(self, on_trigger):
+        self.num_packets = self.num_packets_spinbox.value()
+        if on_trigger:
+            self.device_manager.start_on_trigger(self.num_packets)
+        else:
+            self.device_manager.start_sampling(self.num_packets)
 
     def show(self):
         res = super().show()

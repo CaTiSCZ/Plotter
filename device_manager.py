@@ -41,28 +41,28 @@ class DeviceManager:
         for device in self._devices.values():
             device.get_id()
 
-    def register_receiver(self):
+    def register_receiver(self, addr, source):
         for device in self._devices.values():
-            device.register_receiver()
-            # přidat argumenty sem i dál
+            device.register_receiver(addr, source)
+
     def connect(self):
         pass
 
-    def remove_receiver(self):
+    def remove_receiver(self, addr, source):
         for device in self._devices.values():
-            device.remove_receiver()
-    
-    def get_receivers(self):
-        for device in self._devices.values():
-            device.get_receivers()
-    
-    def start_sampling(self):
-        for device in self._devices.values():
-            device.start_sampling()
+            device.remove_receiver(addr, source)
 
-    def start_on_trigger(self):
+    def get_receivers(self, source):
         for device in self._devices.values():
-            device.start_on_trigger()
+            device.get_receivers(source)
+
+    def start_sampling(self, packet_count):
+        for device in self._devices.values():
+            device.start_sampling(packet_count)
+
+    def start_on_trigger(self, packet_count):
+        for device in self._devices.values():
+            device.start_on_trigger(packet_count)
 
     def stop_sampling(self):
         for device in self._devices.values():

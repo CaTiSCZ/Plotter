@@ -400,7 +400,7 @@ class Device:
         self.received_packets = 0
         self.packet_count = packet_count
         data = struct.pack('<I', self.packet_count)
-        if self.channels_count == 0:
+        if self.channels_count is None or self.channels_count == 0:
             def repeat():
                 if self.channels_count == 0:
                     self._logger.error(f"{name}: device with 0 channels")
