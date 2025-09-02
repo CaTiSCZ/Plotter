@@ -2,7 +2,7 @@ import logging
 from logger import application_logger
 import threading
 import struct
-from enum import IntEnum
+from enum import IntEnum, unique
 from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Any
@@ -15,6 +15,7 @@ class IntEnumName(IntEnum):
     def __str__(self):
         return self.name
 
+@unique
 class PACKET(IntEnumName):
     ACK_packet              =  0
     ID_packet               =  1
@@ -22,6 +23,7 @@ class PACKET(IntEnumName):
     TRIGGER_packet          =  3
     LOG_packet              =  4
 
+@unique
 class CMD(IntEnumName):
     PING                    =  0
     GET_ID                  =  1
