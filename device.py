@@ -11,14 +11,18 @@ from event import Event
 import numpy as np
 
     # ---------------------- CMD a packety -------------------
-class PACKET(IntEnum):
+class IntEnumName(IntEnum):
+    def __str__(self):
+        return self.name
+
+class PACKET(IntEnumName):
     ACK_packet              =  0
     ID_packet               =  1
     DATA_packet             =  2
     TRIGGER_packet          =  3
     LOG_packet              =  4
 
-class CMD(IntEnum):
+class CMD(IntEnumName):
     PING                    =  0
     GET_ID                  =  1
     REGISTER_RECEIVER       =  2
