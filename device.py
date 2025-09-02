@@ -279,10 +279,10 @@ class Device:
                 if cmd in self.sent_commands:
                     self._logger.warning(f"Send command: Command {cmd} in progres.")
                     return
-                self.sent_commands[cmd] = Device.CommandRecord(threading.Timer(self.timeout, self._timeout),
+                self.sent_commands[cmd] = Device.CommandRecord(t:= threading.Timer(self.timeout, self._timeout, args=(cmd,)),
                                                                on_timeout, on_timeout_args, on_timeout_kwargs,
                                                                on_ack, on_ack_args, on_ack_kwargs)
-
+                t.start()
             packet = struct.pack('<I', cmd) + data
             self.cmd_socket.sendto(packet, self.addr)
 
