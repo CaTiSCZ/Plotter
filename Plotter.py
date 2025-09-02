@@ -1,5 +1,6 @@
 import logging
-from logger import Logging, application_logger, GuiHandler
+import logger
+from contextlib import ExitStack
 
 import numpy as np
 import pyqtgraph as pg
@@ -29,11 +30,12 @@ UDP_PORT_DATA = 10577  # port pro příjem dat
 
 # -------------------- GUI s více tlačítky ----------------------
 class Plotter(QWidget):
-    
+    log_signal = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         self.isShown = False
-        self._logger = logging.getLogger(__class__.__name__ if application_logger is None else f'{application_logger}.{__class__.__name__}')
+        self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self._logger.debug("Plotter GUI start")
 
         self.cmd_socket = AsyncSocket(BufferedSocket())
@@ -333,6 +335,7 @@ class Plotter(QWidget):
         log_scroll_area.setWidget(self.log_output)
         log_scroll_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         grid.addWidget(log_scroll_area, 0, 17, 6, 1) 
+        self.log_signal.connect(self.log_output.append)
         
         grid.setColumnStretch(17, 1)
         for col in range(17):
@@ -433,12 +436,6 @@ class Plotter(QWidget):
         self.cmd_socket.socket.bind((int(self.command_port_edit.text())), use_my_ip = True, device_ip = ip, device_port = int(port))
         self.data_socket.socket.bind((int(self.data_port_edit.text())), use_my_ip = True, device_ip = ip, device_port = int(port))
 
-    def log_message(self, msg: str):
-        #timestamp = time.strftime("%H:%M:%S")
-        #self.log_output.append(f"[{timestamp}] {msg}")
-        if self.isShown:
-            self.log_output.append(msg)
-
     def show(self):
         res = super().show()
         self.isShown = True
@@ -457,16 +454,19 @@ class Plotter(QWidget):
         event.accept()
 
 def main(argv):
-    with Logging() as logger:
+    with ExitStack() as stack:
+        stack.enter_context(logging_:=logger.Logging())
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
         QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
         app = QApplication(sys.argv)
         app.setFont(QFont("Segoe UI", 9)) 
         plotter = Plotter()
-        gui_log = GuiHandler(plotter.log_message)
-        gui_log.setFormatter(logging.Formatter('%(levelname)-8s%(message)-50s - from: %(name)-15s at: %(asctime)s.%(msecs)03d'))
-        gui_log.formatter.datefmt='%H:%M:%S'
-        logger.log_printer.handlers.append(gui_log)
+        gui_log_handler = logger.CallbackHandler(sink_text=plotter.log_signal.emit)
+        gui_log_handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d\t%(levelname)-8s\t%(name)-10s\t%(message)s"))
+        gui_log_handler.formatter.datefmt='%H:%M:%S'
+        gui_log_handler.setLevel(logging.DEBUG)
+        logging_.log_printer.add_handler(gui_log_handler)
+        logging_.logger.critical(f"Logging to file: {logging_.log_path}") # This has to be in console, so critical
         plotter.show()
         return app.exec_()
 
