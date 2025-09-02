@@ -5,15 +5,16 @@ import socket
 
 
 class AsyncSocket:
-    def __init__(self, socket, max_size = 4096):
+    def __init__(self, socket, max_size = 4096, name = "AsyncSocket"):
         self.socket = socket
         self.max_size = max_size
+        self.name = name
 
         self._on_packet = None
         self._running = True
         
 
-        self._listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self._listener_thread = threading.Thread(target=self._listen_loop, daemon=True, name=f"{self.name}_listener")
         self._listener_thread.start()
 
     def _listen_loop(self):

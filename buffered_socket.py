@@ -7,7 +7,7 @@ import logger
 
 
 class BufferedSocket:
-    def __init__(self, max_size = 4096):
+    def __init__(self, max_size = 4096, name = "BufferedSocket"):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
 
         self.max_size = max_size
@@ -23,6 +23,8 @@ class BufferedSocket:
         self._sender_thread = None
         self._timeout = 5.0
         self._received_count = 0
+
+        self.name = name
 
     def bind(self, port: int, use_my_ip: bool = False, device_ip: str = "192.168.1.100", device_port: int = 9999): 
         self.close()
@@ -52,10 +54,10 @@ class BufferedSocket:
 
         self._running = True
         if self._listener_thread is None or not self._listener_thread.is_alive():
-            self._listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
+            self._listener_thread = threading.Thread(target=self._listen_loop, daemon=True, name=f"{self.name}_listener")
             self._listener_thread.start()
         if self._sender_thread is None or not self._sender_thread.is_alive():
-            self._sender_thread = threading.Thread(target=self._send_loop, daemon=True)
+            self._sender_thread = threading.Thread(target=self._send_loop, daemon=True, name=f"{self.name}_sender")
             self._sender_thread.start()
 
     def close(self):

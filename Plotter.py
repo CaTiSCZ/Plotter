@@ -38,9 +38,9 @@ class Plotter(QWidget):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self._logger.debug("Plotter GUI start")
 
-        self.cmd_socket = AsyncSocket(BufferedSocket())
-        self.data_socket = AsyncSocket(BufferedSocket())
-        
+        self.cmd_socket = AsyncSocket(BufferedSocket(name="cmd_buffered"), name="cmd_async")
+        self.data_socket = AsyncSocket(BufferedSocket(name="data_buffered"), name="data_async")
+
         self.udp_device_addr = UDP_DEVICE_IP
         self.udp_device_port = UDP_PORT_SEND #generátor
         self.udp_ack_port = UDP_PORT_RECV #klient pro ack
