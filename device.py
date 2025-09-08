@@ -114,6 +114,12 @@ class Device:
         self.channels_count = None
         self.channel_info = []
         self.buffer_size = Device.DEFAULT_BUFFER_SIZE
+        self.buffer_start_index = self.buffer_size
+        self.buffer_overflow_counter = 0
+        self.last_packet_num = None
+        self.packet_counter = 0
+        self.packet_counter_cycle = 0
+        self.data_packet_size = 0
 
 
         self.event_ACK = Event()
@@ -128,24 +134,24 @@ class Device:
         pass
 
     def packet_received (self, packet):
-        min_lenght = STRUCT.HEADER.size
-        if (packet_lenght:=len(packet)) < min_lenght:
-            self._logger.warning(f"Packet received: Too short packet ({packet_lenght}).")
+        min_length = STRUCT.HEADER.size
+        if (packet_length:=len(packet)) < min_length:
+            self._logger.warning(f"Packet received: Too short packet ({packet_length}).")
             return
         packet_view = memoryview(packet)
         packet_type, error = STRUCT.HEADER.unpack_from(packet, 0)
         match packet_type:
             case PACKET.ACK_packet:
-                offset = min_lenght
-                min_lenght += STRUCT.CMD.size
-                if packet_lenght < min_lenght:
-                    self._logger.warning(f"Packet received: Too short ACK packet ({packet_lenght}).")
+                offset = min_length
+                min_length += STRUCT.CMD.size
+                if packet_length < min_length:
+                    self._logger.warning(f"Packet received: Too short ACK packet ({packet_length}).")
                     return  
                 cmd = STRUCT.CMD.unpack_from(packet, offset)[0]
                 record = self._cancel_timeout(cmd)
                 if record is not None and record.on_ack is not None:
-                    record.on_ack(cmd, error, packet_view[min_lenght:], *record.on_ack_args, **record.on_ack_kwargs)
-                self.event_ACK.emit(self, cmd, error, packet_view[min_lenght:])
+                    record.on_ack(cmd, error, packet_view[min_length:], *record.on_ack_args, **record.on_ack_kwargs)
+                self.event_ACK.emit(self, cmd, error, packet_view[min_length:])
 
             case PACKET.ID_packet:
                 cmd = CMD.GET_ID
@@ -154,7 +160,7 @@ class Device:
                     case True:
                         pass
                     case None:
-                        self._logger.error(f"Packet received: Too short ID packet ({packet_lenght}).")
+                        self._logger.error(f"Packet received: Too short ID packet ({packet_length}).")
                         if record is not None and record.on_timeout is not None:
                             record.on_timeout(*record.on_timeout_args, **record.on_timeout_kwargs)
                         return
@@ -163,14 +169,14 @@ class Device:
                         if record is not None and record.on_timeout is not None:
                             record.on_timeout(*record.on_timeout_args, **record.on_timeout_kwargs)
                         return
-                offset = min_lenght
-                min_lenght += STRUCT.ID.size
-                if packet_lenght < min_lenght:
-                    self._logger.error(f"Packet received: Too short ID packet ({packet_lenght}).")
+                offset = min_length
+                min_length += STRUCT.ID.size
+                if packet_length < min_length:
+                    self._logger.error(f"Packet received: Too short ID packet ({packet_length}).")
                     if record is not None and record.on_timeout is not None:
                         record.on_timeout(*record.on_timeout_args, **record.on_timeout_kwargs)
                     return
-                unpacked = STRUCT.ID.unpack_from(packet_view[offset : min_lenght])
+                unpacked = STRUCT.ID.unpack_from(packet_view[offset : min_length])
                 old_id = self.id
                 
                 self.id = {
@@ -191,16 +197,16 @@ class Device:
                     'channels_count': unpacked[16],
                 }
                 channels_count = self.id['channels_count']
-                offset = min_lenght
-                min_lenght += channels_count * STRUCT.CHANNEL.size
-                if len(packet) < min_lenght:
-                    self._logger.error(f"Packet received: Too short ID packet ({packet_lenght}).")
+                offset = min_length
+                min_length += channels_count * STRUCT.CHANNEL.size
+                if len(packet) < min_length:
+                    self._logger.error(f"Packet received: Too short ID packet ({packet_length}).")
                     if record is not None and record.on_timeout is not None:
                         record.on_timeout(*record.on_timeout_args, **record.on_timeout_kwargs)
                     return
                 old_channel_info = self.channel_info
                 self.channel_info = []
-                unpacker = STRUCT.CHANNEL.iter_unpack(packet_view[offset:min_lenght])
+                unpacker = STRUCT.CHANNEL.iter_unpack(packet_view[offset:min_length])
                 for i in range (channels_count):
                     info = Device.ChannelInfo(*next(unpacker))
                     info.unit = info.unit.decode('ascii').rstrip('\x00')
@@ -213,13 +219,40 @@ class Device:
                 self.event_ID.emit(self, error, old_id, self.id, old_channel_info, self.channel_info)
 
             case PACKET.DATA_packet:
-                self.event_data.emit(self, error, packet_view[min_lenght:])
+                offset = min_length
+                min_length += self.data_packet_size
+                if packet_length < min_length:
+                    self._logger.error(f"Packet received: Too short DATA packet ({packet_length}).")
+                    return
+                match Device._verify_crc(packet_view):
+                    case True:
+                        pass
+                    case None:
+                        self._logger.error(f"Packet received: Too short DATA packet ({packet_length}).")
+                        return
+                    case (received_crc, expected_crc):
+                        self._logger.error(f"Packet received: DATA packet with invalid CRC; reveived: {received_crc}, expected: {expected_crc}")
+                        return
+                packet_num = error
+                if self.last_packet_num is not None:
+                    if self.last_packet_num - packet_num > 60000:
+                        self.packet_counter_cycle += 1
+                    elif self.last_packet_num - packet_num < -60000:
+                        self.packet_counter_cycle -= 1
+                self.last_packet_num = packet_num
+                packet_num = packet_num + self.packet_counter_cycle * 65536
+                buffer_write_index = self.buffer_start_index + packet_num * Device.SAMPLES_PER_PACKET - self.buffer_overflow_counter * 2 *self.buffer_size
+                packet_np = np.frombuffer(packet, dtype=Device.RAW_DATA_TYPE, offset = offset, count = Device.SAMPLES_PER_PACKET * self.channels_count)
+                channels_data = packet_np.reshape((self.channels_count, Device.SAMPLES_PER_PACKET))
+                self.raw_buffer[:, buffer_write_index:buffer_write_index + Device.SAMPLES_PER_PACKET] = channels_data
+
+                self.event_data.emit(self, packet_num, packet_view[min_length:])
             case PACKET.TRIGGER_packet:
                 self._logger.info(f"Packet received: TRIGGER packet received")
-                self.event_trigger.emit(self, error, packet_view[min_lenght:])
+                self.event_trigger.emit(self, error, packet_view[min_length:])
             case PACKET.LOG_packet:
                 packet_num = error
-                msg = packet[min_lenght:].decode('ascii').rstrip('\x00')
+                msg = packet[min_length:].decode('ascii').rstrip('\x00')
                 self._logger.info(f"LOG [{packet_num:5}]: {msg}")
                 self.event_log.emit(self, packet_num, msg)
 
@@ -268,6 +301,7 @@ class Device:
                     self.event_shrink_buffer.emit(self, raw)
                     self.raw_buffer = self.raw_buffer[:channels_count]
                 self.channels_count = channels_count
+                self.data_packet_size = STRUCT.CRC.size + self.channels_count * (Device.RAW_DATA_TYPE().nbytes * Device.SAMPLES_PER_PACKET + 1) + self.channels_count % 2
             elif buffer_size is not None:
                 if self.channels_count is not None:
                     if buffer_size > self.buffer_size:
