@@ -71,8 +71,9 @@ class Logging(AbstractContextManager):
         try:
             path = os.path.abspath(os.path.dirname(__file__))
             tempdir = os.path.abspath(tempfile.gettempdir())
-            if os.path.commonpath([path, tempdir]) == tempdir:
-                raise NameError("Log file path is within the temp directory")
+            if path[0] == tempdir[0]:  # only check if on the same drive (Windows)
+                if os.path.commonpath([path, tempdir]) == tempdir:
+                    raise NameError("Log file path is within the temp directory")
             logs_dir = os.path.join(path, "logs")
         except NameError as e:
             # Fallback if __file__ is not defined or in temporary directory

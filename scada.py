@@ -444,6 +444,7 @@ class Plotter(QWidget):
                           #('Remove All'             , self._remove_all          ),
                           #('Register logger All'    , self._register_logger_all ),
                           #('Remove logger All'      , self._remove_logger_all   )
+                          ('Apply config'            , self._apply_config        ),
                           ):
             b = QPushButton(label)
             b.clicked.connect(fn)
@@ -820,6 +821,12 @@ class Plotter(QWidget):
             if self.device_checks[row].isChecked():
                 self.device_clock_sources[row].setChecked(row != leader_id)
                 self.device_clock_enables[row].setChecked(row == leader_id)
+    
+    def _apply_config(self):
+        #self._penetrate_firewall()
+        #for i, f in enumerate((self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._register_all, self._reset_counter)):
+        for i, f in enumerate((self._ping_all, self._get_ids, self._register_all, self._reset_counter)):
+            QTimer(self).singleShot(i * 100, f)
 
 def main(argv):
     with ExitStack() as stack:
@@ -855,10 +862,7 @@ def main(argv):
                     checkbox.setChecked(i != 0)
             gui.leader_buttons.button(0 if debug else 1).setChecked(True)
             gui._apply_devices()
-            #gui._penetrate_firewall()
-            #for i, f in enumerate((gui._ping_all, gui._register_logger_all, gui._get_ids, gui._get_clock_config, gui._register_all, gui._reset_counter)):
-            for i, f in enumerate((gui._ping_all, gui._get_ids, gui._register_all, gui._reset_counter)):
-                QTimer(gui).singleShot(i * 100, f)        
+            gui._apply_config()
             gui.sample_spin.setValue(int(DEFAULT_AVG_LEN_MS))
         QTimer(gui).singleShot(500, autoinit)
         #gui.show()
