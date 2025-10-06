@@ -9,6 +9,7 @@ from typing import Any
 import socket
 from event import Event
 import numpy as np
+from queue import Queue, Empty
 
     # ---------------------- CMD a packety -------------------
 class IntEnumName(IntEnum):
@@ -55,6 +56,7 @@ RESET_KEY = 0xFE
 class Device:
 
     RAW_DATA_TYPE = np.int16
+    DATA_TYPE = np.float64
     SAMPLES_PER_PACKET = 200
     PACKETS_PER_SECOND = 1000
     DEFAULT_BUFFER_SIZE = 10 * SAMPLES_PER_PACKET * PACKETS_PER_SECOND
@@ -115,11 +117,21 @@ class Device:
         self.channel_info = []
         self.buffer_size = Device.DEFAULT_BUFFER_SIZE
         self.buffer_start_index = self.buffer_size
+        self.raw_buffer_read_index = self.buffer_start_index
+        self.raw_buffer_write_max = self.buffer_start_index
+        self.raw_buffer_read_size = 0
+        self.buffer_read_index = self.buffer_start_index
+        self.buffer_read_size = 0
         self.buffer_overflow_counter = 0
         self.last_packet_num = None
         self.packet_counter = 0
         self.packet_counter_cycle = 0
         self.data_packet_size = 0
+        self.max_packet_num = -1
+        self.out_of_order_packets = Queue()
+        self.lost_packets = 0
+        self.error_packets = 0
+
 
 
         self.event_ACK = Event()
@@ -207,10 +219,16 @@ class Device:
                 old_channel_info = self.channel_info
                 self.channel_info = []
                 unpacker = STRUCT.CHANNEL.iter_unpack(packet_view[offset:min_length])
+                offsets = channels_count * [0]
+                gains = channels_count * [0]
                 for i in range (channels_count):
                     info = Device.ChannelInfo(*next(unpacker))
                     info.unit = info.unit.decode('ascii').rstrip('\x00')
+                    offsets[i] = info.offset
+                    gains[i] = info.gain
                     self.channel_info.append(info)
+                self.offset = np.array(offsets)
+                self.gain = np.array(gains)
                 self._logger.info(f"Packet received: ID packet received")
                 #volat funkci zajišťující správný přepočet dat
                 self._init_buffer(channels_count = channels_count)
@@ -223,16 +241,20 @@ class Device:
                 min_length += self.data_packet_size
                 if packet_length < min_length:
                     self._logger.error(f"Packet received: Too short DATA packet ({packet_length}).")
+                    self.error_packets += 1
                     return
                 match Device._verify_crc(packet_view):
                     case True:
                         pass
                     case None:
                         self._logger.error(f"Packet received: Too short DATA packet ({packet_length}).")
+                        self.error_packets += 1
                         return
                     case (received_crc, expected_crc):
                         self._logger.error(f"Packet received: DATA packet with invalid CRC; reveived: {received_crc}, expected: {expected_crc}")
+                        self.error_packets += 1
                         return
+                  
                 packet_num = error
                 if self.last_packet_num is not None:
                     if self.last_packet_num - packet_num > 60000:
@@ -241,12 +263,32 @@ class Device:
                         self.packet_counter_cycle -= 1
                 self.last_packet_num = packet_num
                 packet_num = packet_num + self.packet_counter_cycle * 65536
-                buffer_write_index = self.buffer_start_index + packet_num * Device.SAMPLES_PER_PACKET - self.buffer_overflow_counter * 2 *self.buffer_size
-                packet_np = np.frombuffer(packet, dtype=Device.RAW_DATA_TYPE, offset = offset, count = Device.SAMPLES_PER_PACKET * self.channels_count)
-                channels_data = packet_np.reshape((self.channels_count, Device.SAMPLES_PER_PACKET))
-                self.raw_buffer[:, buffer_write_index:buffer_write_index + Device.SAMPLES_PER_PACKET] = channels_data
-
-                self.event_data.emit(self, packet_num, packet_view[min_length:])
+                
+                with self.buffer_lock:
+                    self.packet_counter += 1
+                    buffer_write_index = self.buffer_size + packet_num * Device.SAMPLES_PER_PACKET - self.buffer_overflow_counter * 2 * self.buffer_size
+                    packet_np = np.frombuffer(packet, dtype=Device.RAW_DATA_TYPE, offset = offset, count = Device.SAMPLES_PER_PACKET * self.channels_count)
+                    channels_data = packet_np.reshape((self.channels_count, Device.SAMPLES_PER_PACKET))
+                    buffer_write_end = buffer_write_index + Device.SAMPLES_PER_PACKET
+                    self.raw_buffer[:, buffer_write_index:buffer_write_end] = channels_data
+                    if buffer_write_end == self.buffer_size * 3:
+                        self.buffer_overflow_counter += 1
+                        self.raw_buffer[:, 0:self.buffer_size] = self.raw_buffer[:, 2*self.buffer_size:]
+                        self.buffer_start_index = 0
+                        self.raw_buffer_write_max = self.buffer_size
+                        self.raw_buffer_read_size = self.buffer_size
+                    else:
+                        self.raw_buffer_write_max = max(self.raw_buffer_write_max, buffer_write_end)
+                        self.raw_buffer_read_size = min(self.raw_buffer_write_max - self.buffer_start_index, self.buffer_size)
+                    self.raw_buffer_read_index = self.raw_buffer_write_max - self.raw_buffer_read_size
+                    if packet_num - self.max_packet_num > 1:
+                        self.lost_packets += packet_num - self.max_packet_num - 1
+                    self.max_packet_num = max(self.max_packet_num, packet_num)
+                    if packet_num < self.max_packet_num:
+                        self.out_of_order_packets.put(buffer_write_index)
+                        self.lost_packets -= 1
+                    
+                self.event_data.emit(self, packet_num, channels_data, buffer_write_index)
             case PACKET.TRIGGER_packet:
                 self._logger.info(f"Packet received: TRIGGER packet received")
                 self.event_trigger.emit(self, error, packet_view[min_length:])
@@ -311,7 +353,29 @@ class Device:
                         self.event_shrink_buffer.emit(self, raw)
                         self.raw_buffer = self.raw_buffer[:, :Device.BUFFER_EXTEND * buffer_size]
                 self.buffer_size = buffer_size
+            self.buffer = np.zeros((self.channels_count, Device.BUFFER_EXTEND * self.buffer_size), dtype=Device.DATA_TYPE)
 
+    def get_data(self):
+        def calc(begin, end):
+            self.buffer[:, begin:end] = self.raw_buffer[:, begin:end] * self.gain[:, np.newaxis] + self.offset[:, np.newaxis]
+        with self.buffer_lock:
+            new_data_size = self.raw_buffer_write_max - (self.buffer_read_index + self.buffer_read_size)
+            if new_data_size > 0:
+                calc(self.raw_buffer_write_max - new_data_size, self.raw_buffer_write_max)
+            elif new_data_size < 0:
+                new_data_size += 3 * self.buffer_size
+                self.buffer[:, self.buffer_start_index:self.buffer_start_index + self.buffer_read_size] = self.buffer[:, self.buffer_read_index:self.buffer_read_index + self.buffer_read_size]
+                calc(self.raw_buffer_write_max - new_data_size, self.raw_buffer_write_max)
+            while True:
+                try:
+                    buffer_write_index = self.out_of_order_packets.get_nowait()
+                    calc(buffer_write_index, buffer_write_index + Device.SAMPLES_PER_PACKET)
+                    self.out_of_order_packets.task_done()
+                except Empty:
+                    break
+            self.buffer_read_index = self.raw_buffer_read_index
+            self.buffer_read_size = self.raw_buffer_read_size
+            return self.buffer[:, self.buffer_read_index:self.buffer_read_index + self.buffer_read_size]
 
     def send_command(self, cmd: int, data: bytes = b'', on_timeout = None, on_timeout_args = [], on_timeout_kwargs = {}, on_ack = None, on_ack_args = [], on_ack_kwargs = {}):
         with self.send_command_lock:
