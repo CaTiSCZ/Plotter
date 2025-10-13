@@ -33,6 +33,18 @@ class DeviceManager:
         self._logger.info(f"Device added: {addr}")
         self.event_device_added.emit(self, device)
 
+    def get_data(self):
+        data = []
+        max_t = 0
+        min_t = float('inf')
+        for device in self._devices.values():
+            dev = device.get_data()
+            data.append(dev)
+            max_t = max(max_t, dev[1])
+            min_t = min(min_t, dev[1]-dev[2])
+
+        
+
     def ping(self):
         for device in self._devices.values():
             device.ping()

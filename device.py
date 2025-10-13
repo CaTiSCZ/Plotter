@@ -375,7 +375,7 @@ class Device:
                     break
             self.buffer_read_index = self.raw_buffer_read_index
             self.buffer_read_size = self.raw_buffer_read_size
-            return self.buffer[:, self.buffer_read_index:self.buffer_read_index + self.buffer_read_size]
+            return (self.buffer[:, self.buffer_read_index:self.buffer_read_index + self.buffer_read_size], self.max_packet_num, self.buffer_read_size)
 
     def send_command(self, cmd: int, data: bytes = b'', on_timeout = None, on_timeout_args = [], on_timeout_kwargs = {}, on_ack = None, on_ack_args = [], on_ack_kwargs = {}):
         with self.send_command_lock:
