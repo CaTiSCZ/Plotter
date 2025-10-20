@@ -51,6 +51,11 @@ class Plotter(QWidget):
 # === Device Manager ===
         self.device_manager = DeviceManager(self.cmd_socket, self.data_socket)
 
+# === Křivky pro grafy ===
+        self.curves_mv = []  # Křivky pro jednotku mV (levá osa)
+        self.curves_a = []   # Křivky pro jednotku A (pravá osa)
+        self.channel_units = []  # Ukládá jednotky kanálů v pořadí
+
 
 
 # === Inicializace okna ===
@@ -67,11 +72,26 @@ class Plotter(QWidget):
         self.plot_widget = pg.GraphicsLayoutWidget()
         self.plot = self.plot_widget.addPlot(title="Signals from all chanels")
         self.plot.setLabel('bottom', 'Time', units='s')
-        self.plot.setLabel('left', 'Amplitude + offset', units='')
+        self.plot.setLabel('left', 'Voltage', units='mV')
         self.plot.enableAutoRange(x=True, y=True)
         self.plot.showGrid(x=True, y=True, alpha=0.5)
         self.plot.setMouseEnabled(x=True, y=True)
         self.layout.addWidget(self.plot_widget)
+
+# Druhá osa Y
+        self.right_axis = pg.ViewBox()
+        self.plot.showAxis('right')
+        self.plot.scene().addItem(self.right_axis)
+        self.plot.getAxis('right').linkToView(self.right_axis)
+        self.right_axis.setXLink(self.plot)
+        self.plot.setLabel('right', 'Current', units='A')
+        
+        def update_views():
+            self.right_axis.setGeometry(self.plot.getViewBox().sceneBoundingRect())
+            self.right_axis.linkedViewChanged(self.plot.getViewBox(), self.right_axis.XAxis)
+
+        self.plot.getViewBox().sigResized.connect(update_views)
+
 
 # === 2. řádek ===
         row2 = QGridLayout()
@@ -101,8 +121,6 @@ class Plotter(QWidget):
         self.clear_err_button.clicked.connect(lambda: self.log_message("TO DO"))
         row2.addWidget(self.clear_err_button, 0, 3)
 
-
-
 # --- Y Min ---
         self.y_min_label = QLabel("Y min:")
         self.y_min_spinbox = QDoubleSpinBox()
@@ -131,9 +149,7 @@ class Plotter(QWidget):
         row2.addWidget(self.x_range_spinbox, 0, 9, alignment=Qt.AlignLeft)
         self.x_range_spinbox.valueChanged.connect(lambda: self.log_message("TO DO"))        
 
-
 # x auto range        
-
         self.auto_x_range = True
         self.auto_x_range_checkbox = QCheckBox("Whole buffer")
         self.auto_x_range_checkbox.setChecked(True)
@@ -187,7 +203,6 @@ class Plotter(QWidget):
         grid = QGridLayout()
 
 # === Sloupec 0: GENERÁTOR & KLIENT IP ===
-
 #ploter ports
         grid.addWidget(QLabel("Plotter ports:"), 0, 0, 1, 5)
 
@@ -387,9 +402,158 @@ class Plotter(QWidget):
             widget.setFixedWidth(width)
             widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
-
-
         self.layout.addLayout(grid)
+
+# === Timer pro aktualizaci grafu ===
+        self.plot_timer = QTimer()
+        self.plot_timer.timeout.connect(self._update_plot_data)
+        # Timer se spustí až po přidání zařízení
+        self.plot_timer_running = False
+
+# === Registrace událostí ===
+        self.device_manager.event_device_added.connect(self._on_device_added)
+
+    def _init_curves(self):
+        # Vyčistíme staré křivky
+        for curve in self.curves_mv + self.curves_a:
+            if curve in self.plot.listDataItems():
+                self.plot.removeItem(curve)
+            if hasattr(self, 'right_axis') and curve in self.right_axis.addedItems:
+                self.right_axis.removeItem(curve)
+        
+        self.curves_mv.clear()
+        self.curves_a.clear()
+        
+        # Získáme informace o jednotkách kanálů
+        units = self.device_manager.channels_unit()
+        self.channel_units = [unit[0] for unit in units]  # Ukládáme pouze jednotky
+        
+        colors = ['r', 'g', 'b', 'c', 'm', 'y', 'k', 'w']  # Základní barvy pro křivky
+        
+        # Vytvoříme křivky pro každý kanál podle jeho jednotky
+        for i, (unit, label) in enumerate(units):
+            color = colors[i % len(colors)]
+            
+            if unit == 'mV':
+                # Křivka pro napětí na levé ose
+                curve = self.plot.plot(pen=pg.mkPen(color, width=2), name=label)
+                self.curves_mv.append(curve)
+            elif unit == 'A':
+                # Křivka pro proud na pravé ose
+                curve = pg.PlotCurveItem(pen=pg.mkPen(color, width=2), name=label)
+                self.right_axis.addItem(curve)
+                self.curves_a.append(curve)
+            else:
+                # Pro jiné jednotky použijeme levou osu jako výchozí s čárkovaným stylem
+                self._logger.warning(f"Neznámá jednotka '{unit}' pro kanál '{label}', použita levá osa s čárkovaným stylem")
+                dash_pen = pg.mkPen(color, width=3, style=2)
+                curve = self.plot.plot(pen=dash_pen, name=f"{label} (neznámá jednotka)")
+                self.curves_mv.append(curve)
+        
+        self._logger.info(f"Inicializovány křivky: {len(self.curves_mv)} na levé ose (mV), {len(self.curves_a)} na pravé ose (A)")
+
+    def _update_plot_data(self):
+        """Aktualizuje data v grafu podle jednotek kanálů"""
+        try:
+            # Aktualizujeme statistiky paketů
+            self._update_packet_stats()
+            
+            # Pokud nejsou inicializované křivky, neděláme nic
+            if not self.curves_mv and not self.curves_a:
+                return
+                
+            # Získáme data ze všech zařízení
+            channels_data = self.device_manager.get_data()
+            
+            if not channels_data:
+                return
+            
+            # Kontrola, jestli máme správný počet křivek
+            total_curves = len(self.curves_mv) + len(self.curves_a)
+            if len(channels_data) != total_curves:
+                self._logger.warning(f"Nesoulad počtu kanálů: data={len(channels_data)}, křivky={total_curves}")
+                return
+            
+            # Kontrola, jestli máme správný počet jednotek
+            if len(self.channel_units) != len(channels_data):
+                self._logger.warning(f"Nesoulad počtu jednotek: units={len(self.channel_units)}, data={len(channels_data)}")
+                return
+            
+            # Aktualizujeme data pro křivky podle jednotek
+            mv_index = 0
+            a_index = 0
+            
+            for i, (time_data, channel_data) in enumerate(channels_data):
+                # Kontrola rozměrů dat
+                if len(time_data) == 0 or len(channel_data) == 0:
+                    continue
+                    
+                if len(time_data) != len(channel_data):
+                    self._logger.warning(f"Nesoulad rozměrů pro kanál {i}: time={len(time_data)}, data={len(channel_data)}")
+                    continue
+                
+                # Omezení velikosti dat pro výkon
+                max_points = 10000  # Maximální počet bodů pro zobrazení
+                if 0 and len(time_data) > max_points:
+                    # Vzorkování dat
+                    step = len(time_data) // max_points
+                    time_data = time_data[::step]
+                    channel_data = channel_data[::step]
+                
+                if i < len(self.channel_units):
+                    unit = self.channel_units[i]
+                    
+                    if unit == 'mV' and mv_index < len(self.curves_mv):
+                        # Aktualizace křivky na levé ose (mV)
+                        self.curves_mv[mv_index].setData(time_data, channel_data)
+                        mv_index += 1
+                    elif unit == 'A' and a_index < len(self.curves_a):
+                        # Aktualizace křivky na pravé ose (A)
+                        self.curves_a[a_index].setData(time_data, channel_data)
+                        a_index += 1
+                    else:
+                        # Pro neznámé jednotky použijeme levou osu
+                        if mv_index < len(self.curves_mv):
+                            self.curves_mv[mv_index].setData(time_data, channel_data)
+                            mv_index += 1
+                            
+        except Exception as e:
+            self._logger.error(f"Chyba při aktualizaci grafu: {e}")
+            # Zastavíme timer při opakovaných chybách
+            if hasattr(self, 'plot_error_count'):
+                self.plot_error_count += 1
+                if self.plot_error_count > 10:
+                    self._logger.error("Příliš mnoho chyb při aktualizaci grafu, zastavuji timer")
+                    self.plot_timer.stop()
+                    self.plot_timer_running = False
+            else:
+                self.plot_error_count = 1
+
+    def _update_packet_stats(self):
+        """Aktualizuje statistiky paketů z připojených zařízení"""
+        total_lost = 0
+        total_errors = 0
+        total_received = 0
+        
+        for device in self.device_manager._devices.values():
+            total_lost += device.lost_packets
+            total_errors += device.error_packets
+            total_received += device.packet_counter
+            
+        self.lost_packets_value.setText(str(total_lost))
+        self.err_packets_value.setText(str(total_errors))
+        self.recv_packets_value.setText(str(total_received))
+
+    def _on_device_added(self, *args):
+        """Callback volaný při přidání nového zařízení"""
+        self._logger.info(f"Zařízení přidáno, reinicializace křivek")
+        self._init_curves()
+        
+        # Spustíme timer pro aktualizaci grafu, pokud ještě neběží
+        if not self.plot_timer_running:
+            self.plot_timer.start(100)  # Aktualizace každých 100ms (10 FPS)
+            self.plot_timer_running = True
+            self._logger.info("Timer pro aktualizaci grafu spuštěn")
 
     def _select_all_devices(self, checked):
         self._logger.debug("select all")
@@ -428,6 +592,10 @@ class Plotter(QWidget):
             if en.isChecked():
                 ip, port = addr.text().split(":")
                 self.device_manager.add_device((ip, int(port)))
+        
+        # Po přidání zařízení požádáme o ID pro inicializaci
+        self._logger.debug("Requesting device IDs...")
+        self.device_manager.get_id()
     
     def update_ports(self):
         int(self.command_port_edit.text())
@@ -451,6 +619,10 @@ class Plotter(QWidget):
 
     def closeEvent(self, event):
         self._logger.debug("Ukončuji aplikaci...")
+
+        # Zastavíme timer
+        if hasattr(self, 'plot_timer'):
+            self.plot_timer.stop()
 
         self.data_socket.socket.close()
         self.cmd_socket.socket.close()

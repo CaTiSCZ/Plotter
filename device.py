@@ -132,7 +132,11 @@ class Device:
         self.lost_packets = 0
         self.error_packets = 0
 
-
+        # Inicializace prázdných bufferů
+        self.raw_buffer = np.array([])
+        self.buffer = np.array([])
+        self.gain = np.array([])
+        self.offset = np.array([])
 
         self.event_ACK = Event()
         self.event_ID = Event()
@@ -358,6 +362,16 @@ class Device:
     def get_data(self):
         def calc(begin, end):
             self.buffer[:, begin:end] = self.raw_buffer[:, begin:end] * self.gain[:, np.newaxis] + self.offset[:, np.newaxis]
+        
+        # Kontrola, jestli je zařízení správně inicializované
+        if self.channels_count is None or self.channels_count == 0:
+            self._logger.debug("get_data: Zařízení není inicializované (channels_count)")
+            return (np.array([]), 0, 0, 0)
+            
+        if not hasattr(self, 'buffer') or not hasattr(self, 'raw_buffer'):
+            self._logger.debug("get_data: Buffer není inicializovaný")
+            return (np.array([]), 0, 0, 0)
+            
         with self.buffer_lock:
             new_data_size = self.raw_buffer_write_max - (self.buffer_read_index + self.buffer_read_size)
             if new_data_size > 0:
@@ -375,7 +389,10 @@ class Device:
                     break
             self.buffer_read_index = self.raw_buffer_read_index
             self.buffer_read_size = self.raw_buffer_read_size
-            return (self.buffer[:, self.buffer_read_index:self.buffer_read_index + self.buffer_read_size], self.max_packet_num, self.buffer_read_size)
+            return (self.buffer[:, self.buffer_read_index:self.buffer_read_index + self.buffer_read_size], 
+                    self.max_packet_num * Device.SAMPLES_PER_PACKET, 
+                    self.buffer_read_size,
+                    self.channels_count)
 
     def send_command(self, cmd: int, data: bytes = b'', on_timeout = None, on_timeout_args = [], on_timeout_kwargs = {}, on_ack = None, on_ack_args = [], on_ack_kwargs = {}):
         with self.send_command_lock:

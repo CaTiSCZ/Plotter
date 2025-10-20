@@ -2,10 +2,12 @@ import logging
 from logger import application_logger
 from device import Device
 from event import Event
+import numpy as np
 
 class DeviceManager:
     SAMPLES_PER_PACKET = 200
-    PACKET_RATE_HZ = 1000 
+    PACKET_RATE_HZ = 1000
+    SAMPLE_RATE_HZ = SAMPLES_PER_PACKET * PACKET_RATE_HZ
     BUFFER_LENGTH_SECONDS = 10 
     def __init__(self, cmd_socket, data_socket):
         self._logger = logging.getLogger(__class__.__name__ if application_logger is None else f'{application_logger}.{__class__.__name__}')
@@ -33,8 +35,23 @@ class DeviceManager:
         self._logger.info(f"Device added: {addr}")
         self.event_device_added.emit(self, device)
 
+    def channels_unit(self):
+        units = []
+        for name, device in self._devices.items():
+            # Kontrola, jestli je zařízení správně inicializované
+            if device.channels_count is None or not device.channel_info:
+                continue
+            for channel in range(device.channels_count):
+                if channel < len(device.channel_info):
+                    unit = device.channel_info[channel].unit
+                    units.append((unit, f"{name}.ch{channel}[{unit}]"))
+                else:
+                    self._logger.critical(f"Zařízení {name} nemá informace o kanálu {channel}")
+        return units
+
     def get_data(self):
         data = []
+        channels_plot = []
         max_t = 0
         min_t = float('inf')
         for device in self._devices.values():
@@ -42,8 +59,20 @@ class DeviceManager:
             data.append(dev)
             max_t = max(max_t, dev[1])
             min_t = min(min_t, dev[1]-dev[2])
-
         
+        # Pokud se nepodařilo získat žádná data
+        if not data or min_t == float('inf') or max_t <= min_t:
+            self._logger.debug(f"Žádná validní data: data={len(data)}, min_t={min_t}, max_t={max_t}")
+            return []
+
+        time = np.arange(min_t/self.SAMPLE_RATE_HZ, max_t/self.SAMPLE_RATE_HZ, 1/self.SAMPLE_RATE_HZ)
+        for device in data:
+            start_index = int(device[1] - device[2] - min_t)
+            end_index = int(device[1] - min_t)
+            t = time[start_index:end_index]
+            for channel in range(device[3]):
+                channels_plot.append((t, device[0][channel, :]))
+        return channels_plot
 
     def ping(self):
         for device in self._devices.values():
