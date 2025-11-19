@@ -179,6 +179,10 @@ class Device:
         info = parse_id_packet(rsp)
         self.channels = info['channels_count']
         return info
+
+    def set_id(self, new_id:int):
+        payload = struct.pack('<B', new_id)
+        return self._send_cmd(13, payload)
     
     def register_receiver(self, addr:str, port:int):
         return self._send_cmd(2, socket.inet_aton(addr)+struct.pack('<H',port))
@@ -262,7 +266,7 @@ class Device:
 
 # Manager of multiple devices
 class DeviceManager:
-    MAX_DEVICES = 5
+    MAX_DEVICES = 6
     def __init__(self, data_port:int = DEFAULT_DATA_PORT):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.data_port = data_port
@@ -380,6 +384,7 @@ class Plotter(QWidget):
         cfg = QGridLayout()
         root.addLayout(cfg)
 
+        self.device_labels: List[QLabel] = []
         self.device_edits: List[QLineEdit] = []
         self.device_checks: List[QCheckBox] = []
         self.leader_buttons = QButtonGroup(self)
@@ -388,7 +393,10 @@ class Plotter(QWidget):
         self.device_clock_sources: List[QCheckBox] = []
 
         for i in range(DeviceManager.MAX_DEVICES):
-            cfg.addWidget(QLabel(f'Device {i}'), i, 0)
+            lb = QLabel(f'Device {i}')
+            cfg.addWidget(lb, i, 0)
+            self.device_labels.append(lb)
+
             chk = QCheckBox('Enable')
             chk.setChecked(True)
             cfg.addWidget(chk, i, 1)
@@ -584,6 +592,13 @@ class Plotter(QWidget):
     def _ping_all(self):
         for ip,ok in self.manager.ping_all().items():
             self._logger.info(f'Ping {ip}: ' + ('OK' if ok else 'FAIL'))
+            for dch, de, dl in zip(self.device_checks, self.device_edits, self.device_labels):
+                if not dch.isChecked():
+                    dl.setStyleSheet("")
+                    continue
+                dev_ip = de.text().strip().split(':')[0]
+                if dev_ip == ip:
+                    dl.setStyleSheet('background-color: green' if ok else 'background-color: red')
 
     def _get_ids(self):
         for ip,info in self.manager.get_all_ids().items():
