@@ -98,15 +98,19 @@ class MultiSignalTestGenerator:
                 self.sock.sendto(response, addr)
 
             elif command_type == GET_ID:
+                self.print("Přijat požadavek na ID.")
                 self._send_identification_packet(addr)
                 
             elif command_type == REGISTER_RECEIVER:
+                self.print("Přijat požadavek na registraci příjemce.")
                 self._register_receiver(cmd_data, addr)
 
             elif command_type == REMOVE_RECEIVER:
+                self.print("Přijat požadavek na odstranění příjemce.")
                 self._remove_receiver(cmd_data, addr)
 
             elif command_type == GET_RECEIVERS:
+                self.print("Přijat požadavek na seznam příjemců.")
                 self._send_receivers_list(addr)
 
             elif command_type == START_SAMPLING or command_type == START_ON_TRIGGER: 
@@ -142,6 +146,7 @@ class MultiSignalTestGenerator:
                 self.wait_for_response = False
 
             elif command_type == FORSE_TRIGGER:
+                self.print("[INFO] Přijat FORSE TRIGGER(CMD 9)")
                 self.wait_for_trigger == False
                 self._trigger()
 

@@ -31,6 +31,8 @@ UDP_PORT_DATA = 10577  # port pro příjem dat
 # -------------------- GUI s více tlačítky ----------------------
 class Plotter(QWidget):
     log_signal = pyqtSignal(str)
+    _start_timer_signal = pyqtSignal()
+    _init_curves_signal = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -409,9 +411,17 @@ class Plotter(QWidget):
         self.plot_timer.timeout.connect(self._update_plot_data)
         # Timer se spustí až po přidání zařízení
         self.plot_timer_running = False
+        self._start_timer_signal.connect(self._start_plot_timer)
 
 # === Registrace událostí ===
         self.device_manager.event_device_added.connect(self._on_device_added)
+        self._init_curves_signal.connect(self._init_curves)
+
+    def _start_plot_timer(self):
+        if not self.plot_timer_running:
+            self.plot_timer.start(100)  # Aktualizace každých 100ms (10 FPS)
+            self.plot_timer_running = True
+            self._logger.info("Plot timer started")
 
     def _init_curves(self):
         # Vyčistíme staré křivky
@@ -544,16 +554,17 @@ class Plotter(QWidget):
         self.err_packets_value.setText(str(total_errors))
         self.recv_packets_value.setText(str(total_received))
 
-    def _on_device_added(self, *args):
+    def _on_device_added(self, manager, device):
         """Callback volaný při přidání nového zařízení"""
-        self._logger.info(f"Zařízení přidáno, reinicializace křivek")
-        self._init_curves()
-        
-        # Spustíme timer pro aktualizaci grafu, pokud ještě neběží
-        if not self.plot_timer_running:
-            self.plot_timer.start(100)  # Aktualizace každých 100ms (10 FPS)
-            self.plot_timer_running = True
-            self._logger.info("Timer pro aktualizaci grafu spuštěn")
+        def on_id_received(error, old_id, new_id, old_channel_info, new_channel_info):
+            if new_channel_info != old_channel_info:
+                self._logger.info(f"Device added: {device.addr}, curves initialized")
+                self._init_curves_signal.emit()
+                # Spustíme timer pro aktualizaci grafu, pokud ještě neběží
+                self._start_timer_signal.emit()
+
+        self._logger.debug(f"Requesting device ID {device.addr}")
+        device.get_id(on_ack=on_id_received)
 
     def _select_all_devices(self, checked):
         self._logger.debug("select all")
@@ -594,8 +605,8 @@ class Plotter(QWidget):
                 self.device_manager.add_device((ip, int(port)))
         
         # Po přidání zařízení požádáme o ID pro inicializaci
-        self._logger.debug("Requesting device IDs...")
-        self.device_manager.get_id()
+        #self._logger.debug("Requesting device IDs...")
+        #self.device_manager.get_id()
     
     def update_ports(self):
         int(self.command_port_edit.text())

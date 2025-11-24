@@ -106,7 +106,7 @@ class Device:
         self.addr = addr
 
         self.sent_commands = {}
-        self.timeout = 1
+        self.timeout = 5
 
         self.send_command_lock = threading.Lock()
         self.buffer_lock = threading.Lock()
@@ -237,7 +237,7 @@ class Device:
                 #volat funkci zajišťující správný přepočet dat
                 self._init_buffer(channels_count = channels_count)
                 if record is not None and record.on_ack is not None:
-                    record.on_ack(*record.on_ack_args, **record.on_ack_kwargs)
+                    record.on_ack(error, old_id, self.id, old_channel_info, self.channel_info, *record.on_ack_args, **record.on_ack_kwargs)
                 self.event_ID.emit(self, error, old_id, self.id, old_channel_info, self.channel_info)
 
             case PACKET.DATA_packet:
@@ -316,7 +316,7 @@ class Device:
                 del self.sent_commands[cmd]
                 return record 
         except KeyError:
-            self._logger.info("Packet received: unexpected response for {cmd}")
+            self._logger.info(f"Packet received: unexpected response for {cmd}")
         return None
 
     def on_timeout(self, cmd, msg = None, on_timeout = None, on_timeout_args = [], on_timeout_kwargs = {}):
