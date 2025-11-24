@@ -518,7 +518,8 @@ class Device:
             self.is_sampling = True
             if on_ack is not None:
                 on_ack(error, requested_packets, *on_ack_args, **on_ack_kwargs)
-        self.received_packets = 0
+        self.packet_counter = 0
+        self.lost_packets = 0
         self.packet_count = packet_count
         data = struct.pack('<I', self.packet_count)
         if self.channels_count is None or self.channels_count == 0:
@@ -553,8 +554,8 @@ class Device:
         if self.is_sampling:
             def _on_ack(cmd, error, data):
                 sent_packets = struct.unpack_from('<I', data, 0)[0]
-                if self.received_packets != sent_packets:
-                    self._logger.warning(f"Stop sampling: received packets ({self.received_packets}) not equal to sent packets ({sent_packets})")
+                if self.packet_counter != sent_packets:
+                    self._logger.warning(f"Stop sampling: received packets ({self.packet_counter}) not equal to sent packets ({sent_packets})")
                 else:
                     self._logger.info(f"Stop sampling acknowledged, sent packets: {sent_packets}")
                 self.is_sampling = False
