@@ -30,6 +30,8 @@ def _assign_id(new_id: int):
     except socket.timeout:
         print("No response received (timeout).")
     
+    threading.Event().wait(2)
+
     # Reset device
     payload = struct.pack('<B', 0xFE)
     pkt = struct.pack('<I', 14) + payload

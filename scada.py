@@ -49,6 +49,7 @@ SAMPLING_PERIOD    = 1/(SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 BUFFER_LENGTH_S    = 30
 BUFFER_SIZE        = int(BUFFER_LENGTH_S*SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 DEFAULT_AVG_LEN_MS = 1000
+CCU_DEVICE_INDEX   = -1
 
 # Features
 FCN_QT_LOGGING = True  # Enable Qt logging handler
@@ -145,7 +146,7 @@ class Device:
     def __init__(self, ip:str, cmd_port:int, data_port:int, loop):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.ip, self.cmd_port, self.data_port, self.loop = ip,cmd_port,data_port,loop
-        self.channels = 3
+        self.channels = 2
         self.cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.cmd_sock.settimeout(RECV_TIMEOUT_S)
         self.cmd_sock.connect((ip, cmd_port))
@@ -210,6 +211,9 @@ class Device:
     
     def reset_counter(self):
         return self._send_cmd(10)
+    
+    def reset_device(self):
+        return self._send_cmd(14, struct.pack('<B', 0xFE))
 
     def set_clock_ctrl(self, enabled: bool, external: bool, save: bool = False):
         """Enable/disable clock output."""
@@ -470,11 +474,12 @@ class Plotter(QWidget):
                           ('Start New Sampling on trigger'  , self._start_new_sampling_on_trigger   ),
                           ('Save Measurement'               , self.save_measurement                 ),
                           ('Force trigger'                  , self._force_trigger                   ),
-                          ('Stop Sampling'                  , self._stop_sampling                   ),
-                          ('Reset Counter'                  , self._reset_counter                   ),
-                          ('Clean Graf'                     , self.clear_plot                       ),
+                          #('Stop Sampling'                  , self._stop_sampling                   ),
+                          #('Reset Counter'                  , self._reset_counter                   ),
+                          #('Clean Graf'                     , self.clear_plot                       ),
                           #('Penetrate Firewall'             , self._penetrate_firewall              ),
-                          ('Save Data'                      , self.save_data                        )
+                          #('Save Data'                      , self.save_data                        ),
+                          ('Reset devices'                   , self._reset_devices                   ),
                           ):
             b=QPushButton(label)
             b.clicked.connect(fn)
@@ -489,6 +494,20 @@ class Plotter(QWidget):
         self.ax.setLabel('left','Amplitude')
         self.ax.addLegend()
         self.curves: Dict[Tuple[str,int], pg.PlotDataItem] = {}
+
+        # Detection plot
+        self.plot_widget.nextRow()  # move to next row in the graphics layout
+        self.ax_bits = self.plot_widget.addPlot(title='Detection result')
+        self.ax_bits.showGrid(x=True, y=True, alpha=0.3)
+        self.ax_bits.setLabel('bottom', 'Time', units='s')
+        self.ax_bits.setLabel('left', 'Bit value')
+        self.ax_bits.addLegend()
+        # Link x-axis so both plots share the same time base and zoom/pan together
+        self.ax_bits.setXLink(self.ax)
+        # curves for individual bits (bit index -> PlotDataItem)
+        self.bit_curves: Dict[int, pg.PlotDataItem] = {}
+        # Optional: set a comfortable y-range for bit+offsets
+        self.ax_bits.setYRange(0, 1)
 
         self.error_lbl = QLabel()
         self.error_lbl.setStyleSheet('font-family: monospace')
@@ -506,10 +525,11 @@ class Plotter(QWidget):
 
         self.log_signal.connect(self.log_output.append)
 
-        penetrator = QTimer(self)
-        penetrator.setInterval(3000)
-        penetrator.timeout.connect(self.manager.penetrate_firewall)
-        penetrator.start()
+        # Not needed
+        #penetrator = QTimer(self)
+        #penetrator.setInterval(3000)
+        #penetrator.timeout.connect(self.manager.penetrate_firewall)
+        #penetrator.start()
 
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
@@ -611,6 +631,15 @@ class Plotter(QWidget):
             self._logger.info(f'Registered {addr}:{pr}')
         except:
             self._logger.warning('Bad receiver address')
+    
+    def _register_ccu(self):
+        try:
+            addr,pr=self.device_edits[CCU_DEVICE_INDEX].text().split(':')
+            port=DEFAULT_DATA_PORT
+            self.manager.register_all(addr,port)
+            self._logger.info(f'Registered {addr}:{port}')
+        except:
+            self._logger.warning('Bad receiver address')
 
     def _remove_all(self):
         try:
@@ -697,6 +726,10 @@ class Plotter(QWidget):
     def _penetrate_firewall(self):
         self._logger.info('Trying to penetrate firewall')
         self.manager.penetrate_firewall(False)
+    
+    def _reset_devices(self):
+        self.manager.broadcast('reset_device')
+        self._logger.info('Reset devices')
 
     def _get_clock_config(self):
         cfgs = self.manager.get_clock_config_all()
@@ -743,6 +776,12 @@ class Plotter(QWidget):
                 for dq in dev.buffer.error: dq.clear()
         self.ax.clear()
         self.curves.clear()
+
+        if hasattr(self, 'ax_bits'):
+            self.ax_bits.clear()
+        if hasattr(self, 'bit_curves'):
+            self.bit_curves.clear()
+
         self._update_plot()
         self._logger.info('Graf cleaned')
     
@@ -783,11 +822,12 @@ class Plotter(QWidget):
 
     def _update_plot(self):
         lines = []
-        for ip, dev in self.manager.devices.items():
+        for (ip, dev) in self.manager.devices.items():
             buf = dev.buffer
             if not buf.time:
                 continue
             with buf.lock:
+                # Data processing + statistics
                 x = np.array(buf.signal[0]) * SAMPLING_PERIOD
                 avgs = [0] * dev.channels
                 for ch in range(dev.channels):
@@ -798,6 +838,31 @@ class Plotter(QWidget):
                     avgs[ch] = np.mean(y[-min(len(y), SAMPLES_PER_PACKET * DEFAULT_AVG_LEN_MS):])
                     self.curves[key].setData(x[-len(y):], y)
                 errs = ','.join(str(sum(list(buf.error[c])[-SAMPLES_PER_PACKET:])) for c in range(dev.channels))
+
+                # Result processing
+                if (dev == self.manager.devices.items[CCU_DEVICE_INDEX] and dev.channels > 0 and hasattr(self, 'ax_bits')):
+                    # Use first data channel (signal[1]) as byte source
+                    y_src = np.array(buf.signal[1])[-len(x):]
+                    # Convert to unsigned bytes; mask to 8 bits
+                    byte_values = y_src.astype(np.int32) & 0xFF
+
+                    num_bits = 8
+                    center = (num_bits - 1) / 2.0
+                    offset_step = 0.1  # vertical spacing between bit lines
+
+                    for bit_idx in range(num_bits):
+                        if bit_idx not in self.bit_curves:
+                            color = Plotter.Colors[len(self.bit_curves) % len(Plotter.Colors)]
+                            self.bit_curves[bit_idx] = self.ax_bits.plot(pen=color, name=f'bit{bit_idx}')
+
+                        bit_vals = ((byte_values >> bit_idx) & 1).astype(float)
+                        # Slight offset so bits with same logical value are still visible
+                        offset = (bit_idx - center) * offset_step
+                        y_bits = bit_vals + offset
+
+                        self.bit_curves[bit_idx].setData(x[-len(y_bits):], y_bits)
+
+            # Statistics
             avgs = ', '.join(map(lambda v: f'{v:.3f}', avgs))
             sent = self.last_order.get(ip)
             if sent is None:
@@ -840,7 +905,7 @@ class Plotter(QWidget):
     def _apply_config(self):
         #self._penetrate_firewall()
         #for i, f in enumerate((self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._register_all, self._reset_counter)):
-        for i, f in enumerate((self._ping_all, self._get_ids, self._register_all, self._reset_counter)):
+        for i, f in enumerate((self._ping_all, self._get_ids, self._register_all, self._register_ccu, self._reset_counter)):
             QTimer(self).singleShot(i * 100, f)
 
 def main(argv):
