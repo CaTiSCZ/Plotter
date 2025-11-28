@@ -46,4 +46,6 @@ if __name__ == "__main__":
         print("Usage: python assign_id.py <ID>")
         sys.exit(1)
     id = int(sys.argv[1])
+    if len(sys.argv) == 3:
+        TARGET_IP = sys.argv[2]
     _assign_id(id)
