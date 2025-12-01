@@ -1,8 +1,10 @@
 import logging
+import threading
 from logger import application_logger
 from device import Device
 from event import Event
 import numpy as np
+import time
 
 class DeviceManager:
     SAMPLES_PER_PACKET = 200
@@ -12,12 +14,17 @@ class DeviceManager:
     def __init__(self, cmd_socket, data_socket):
         self._logger = logging.getLogger(__class__.__name__ if application_logger is None else f'{application_logger}.{__class__.__name__}')
         self._logger.debug("Device manager start")
+
         
         self._cmd_socket = cmd_socket
         self._data_socket = data_socket
         self._cmd_socket.register(self._packet_handler)   
         self._data_socket.register(self._packet_handler)
         self._devices = {}
+
+        self.data_timeout_processor_running = True
+        self.data_timeout_processor = threading.Thread(target=self._data_timeout_handler)
+        self.data_timeout_processor.start()
 
         self.event_device_added = Event()
         #self.event_device_removed = Event()
@@ -28,6 +35,18 @@ class DeviceManager:
             device.packet_received(data)
         except KeyError:
             self._logger.warning(f"Packet handler:Received packet from unknown device: {addr}")
+
+    def _data_timeout_handler(self):
+        last_value = self._data_socket.socket.get_buffered_items_count()
+        while self.data_timeout_processor_running:
+            value = self._data_socket.socket.get_buffered_items_count()
+            self._logger.debug(f"Buffered items count: {value}")
+            if value == 0 and last_value != 0:
+                self._logger.info("Data buffer emptied, sampling finished")
+                for device in self._devices.values():
+                    device.sampling_finished()
+            last_value = value
+            time.sleep(0.1)
 
     def add_device(self, addr):
         device = Device(self._cmd_socket, addr)
@@ -112,3 +131,11 @@ class DeviceManager:
     def send_trigger(self):
         for device in self._devices.values():
             device.send_trigger()
+    
+    def reset_counters(self):
+        for device in self._devices.values():
+            device.reset_counters()
+
+    def stop(self):
+        self.data_timeout_processor_running = False
+        self.data_timeout_processor.join()

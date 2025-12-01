@@ -131,6 +131,7 @@ class Device:
         self.out_of_order_packets = Queue()
         self.lost_packets = 0
         self.error_packets = 0
+        self.pending_ack_on_stop_sampling = None
 
         # Inicializace prázdných bufferů
         self.raw_buffer = np.array([])
@@ -164,9 +165,13 @@ class Device:
                     self._logger.warning(f"Packet received: Too short ACK packet ({packet_length}).")
                     return  
                 cmd = STRUCT.CMD.unpack_from(packet, offset)[0]
+                
                 record = self._cancel_timeout(cmd)
-                if record is not None and record.on_ack is not None:
+                if record is not None and record.on_ack is not None and cmd != CMD.STOP_SAMPLING:
                     record.on_ack(cmd, error, packet_view[min_length:], *record.on_ack_args, **record.on_ack_kwargs)
+                elif cmd == CMD.STOP_SAMPLING:
+                    self.pending_ack_on_stop_sampling = (cmd, error, packet_view[min_length:], record)
+                    self._logger.debug("Pending ACK on stop sampling set")
                 self.event_ACK.emit(self, cmd, error, packet_view[min_length:])
 
             case PACKET.ID_packet:
@@ -270,6 +275,7 @@ class Device:
                 
                 with self.buffer_lock:
                     self.packet_counter += 1
+                    self._logger.debug(f"DATA packet #{packet_num} -> {self.packet_counter}")
                     buffer_write_index = self.buffer_size + packet_num * Device.SAMPLES_PER_PACKET - self.buffer_overflow_counter * 2 * self.buffer_size
                     packet_np = np.frombuffer(packet, dtype=Device.RAW_DATA_TYPE, offset = offset, count = Device.SAMPLES_PER_PACKET * self.channels_count)
                     channels_data = packet_np.reshape((self.channels_count, Device.SAMPLES_PER_PACKET))
@@ -285,12 +291,15 @@ class Device:
                         self.raw_buffer_write_max = max(self.raw_buffer_write_max, buffer_write_end)
                         self.raw_buffer_read_size = min(self.raw_buffer_write_max - self.buffer_start_index, self.buffer_size)
                     self.raw_buffer_read_index = self.raw_buffer_write_max - self.raw_buffer_read_size
-                    if packet_num - self.max_packet_num > 1:
-                        self.lost_packets += packet_num - self.max_packet_num - 1
+                    if (lost:=(packet_num - self.max_packet_num)) > 1: #and self.max_packet_num > -1
+                        lost -= 1
+                        self.lost_packets += lost
+                        self._logger.warning(f"Lost packets detected. Count: {lost}, {self.lost_packets} total.")
                     self.max_packet_num = max(self.max_packet_num, packet_num)
                     if packet_num < self.max_packet_num:
                         self.out_of_order_packets.put(buffer_write_index)
                         self.lost_packets -= 1
+                        self._logger.info(f"Out of order packet: {packet_num} (expected up to {self.max_packet_num}, Lost packets: {self.lost_packets})")  
                     
                 self.event_data.emit(self, packet_num, channels_data, buffer_write_index)
             case PACKET.TRIGGER_packet:
@@ -316,7 +325,8 @@ class Device:
                 del self.sent_commands[cmd]
                 return record 
         except KeyError:
-            self._logger.info(f"Packet received: unexpected response for {cmd}")
+            if cmd != CMD.STOP_SAMPLING or self.is_sampling is False:
+                self._logger.info(f"Packet received: unexpected response for {cmd}")
         return None
 
     def on_timeout(self, cmd, msg = None, on_timeout = None, on_timeout_args = [], on_timeout_kwargs = {}):
@@ -328,6 +338,28 @@ class Device:
         self._logger.info(msg or f"Send command: received ACK for {cmd}")
         if on_ack is not None:
             on_ack(error, data, *on_ack_args, **on_ack_kwargs)
+
+    def sampling_finished(self):
+        if self.pending_ack_on_stop_sampling is not None:
+            cmd, error, data, record = self.pending_ack_on_stop_sampling
+            self.pending_ack_on_stop_sampling = None
+            self._ack_on_stop_sampling(cmd, error, data, record.on_ack, *record.on_ack_args, **record.on_ack_kwargs)
+
+    def _ack_on_stop_sampling(self, cmd, error, data, on_ack = None, on_ack_args = [], on_ack_kwargs = {}):
+        sent_packets = struct.unpack_from('<I', data, 0)[0]
+        if self.packet_counter != sent_packets:
+            self._logger.warning(f"Stop sampling: received packets ({self.packet_counter}) not equal to sent packets ({sent_packets})")
+        else:
+            self._logger.info(f"Stop sampling acknowledged, sent packets: {sent_packets}")
+        self.is_sampling = False
+        all_packets = self.packet_counter + self.lost_packets + self.error_packets
+        missing_packets = sent_packets - all_packets
+        if missing_packets > 0:
+            self.lost_packets += missing_packets
+            self.max_packet_num += missing_packets
+            self._logger.warning(f"Stop sampling: missing packets: {missing_packets}")
+        if on_ack is not None:
+            on_ack(error, sent_packets, *on_ack_args, **on_ack_kwargs)
 
     def _init_buffer(self, *, channels_count = None, buffer_size = None):
         with self.buffer_lock:
@@ -518,8 +550,6 @@ class Device:
             self.is_sampling = True
             if on_ack is not None:
                 on_ack(error, requested_packets, *on_ack_args, **on_ack_kwargs)
-        self.packet_counter = 0
-        self.lost_packets = 0
         self.packet_count = packet_count
         data = struct.pack('<I', self.packet_count)
         if self.channels_count is None or self.channels_count == 0:
@@ -552,19 +582,10 @@ class Device:
 
     def stop_sampling(self, on_timeout=None, on_timeout_args=[], on_timeout_kwargs={}, on_ack=None, on_ack_args=[], on_ack_kwargs={}):
         if self.is_sampling:
-            def _on_ack(cmd, error, data):
-                sent_packets = struct.unpack_from('<I', data, 0)[0]
-                if self.packet_counter != sent_packets:
-                    self._logger.warning(f"Stop sampling: received packets ({self.packet_counter}) not equal to sent packets ({sent_packets})")
-                else:
-                    self._logger.info(f"Stop sampling acknowledged, sent packets: {sent_packets}")
-                self.is_sampling = False
-                if on_ack is not None:
-                    on_ack(error, sent_packets, *on_ack_args, **on_ack_kwargs)
             try:
                 self.send_command(CMD.STOP_SAMPLING, 
                                   on_timeout = self.on_timeout, on_timeout_args = (None, on_timeout, on_timeout_args, on_timeout_kwargs),
-                                  on_ack = _on_ack)
+                                  on_ack = lambda cmd, error, data: self.ack_on_stop_sampling(cmd, error, data, on_ack, on_ack_args, on_ack_kwargs))
             except Exception as e:
                 self._logger.error(f"Stop sampling failed: {e}")
                 if on_timeout is not None:
@@ -580,10 +601,19 @@ class Device:
             self._logger.error(f"Trigger send: {e}")
 
     def reset_counters(self, on_timeout=None, on_timeout_args=[], on_timeout_kwargs={}, on_ack=None, on_ack_args=[], on_ack_kwargs={}):
+        def _on_ack(cmd, error, data):
+            self.max_packet_num = -1
+            self.lost_packets = 0
+            self.error_packets = 0
+            self.packet_counter = 0
+            self.last_packet_num = None
+            self.packet_counter_cycle = 0
+            if on_ack is not None:
+                on_ack(error, data, *on_ack_args, **on_ack_kwargs)
         try:
             self.send_command(CMD.RESET_COUNTERS, 
                               on_timeout = self.on_timeout, on_timeout_args=(None, on_timeout, on_timeout_args, on_timeout_kwargs),
-                              on_ack = self.on_ack, on_ack_args=(None, on_ack, on_ack_args, on_ack_kwargs))
+                              on_ack = _on_ack)
         except Exception as e:
             self._logger.error(f"Reset counters: {e}")
             if on_timeout is not None:

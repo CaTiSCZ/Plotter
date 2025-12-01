@@ -8,9 +8,13 @@ from device_manager import DeviceManager
 
 class Gui(QWidget):
     log_signal = pyqtSignal(str)
+    _start_timer_signal = pyqtSignal()
+    _init_curves_signal = pyqtSignal()
 
     def __init__(self, plotter):
         super().__init__()
+
+        self.plotter = plotter
 
         # === Inicializace okna ===
         self.setWindowTitle("UDP Signal Client")
@@ -53,8 +57,8 @@ class Gui(QWidget):
         self.data_error_label = QLabel("ERR samples\n")
         self.data_error_label.setStyleSheet("font-family: monospace; padding: 6px;")
         self.layout.addWidget(self.data_error_label)
-        row2.addWidget(self.data_error_label, 0, 0, 4, 1)
-        
+        row2.addWidget(self.data_error_label, 0, 0, 3, 1)
+       
 # Packet counters
         self.lost_packets_label = QLabel("Lost packets:")
         self.lost_packets_value = QLabel("0")
@@ -71,8 +75,8 @@ class Gui(QWidget):
         row2.addWidget(self.recv_packets_label, 2, 1)
         row2.addWidget(self.recv_packets_value, 2, 2)
 
-        self.clear_err_button = QPushButton("Clear error stats")
-        self.clear_err_button.clicked.connect(lambda: plotter.log_message("TO DO"))
+        self.clear_err_button = QPushButton("Reset counters")
+        self.clear_err_button.clicked.connect(plotter._reset_counters)
         row2.addWidget(self.clear_err_button, 0, 3)
 
 # --- Y Min ---
@@ -358,3 +362,36 @@ class Gui(QWidget):
             widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         self.layout.addLayout(grid)
+
+        # === Timer pro aktualizaci grafu ===
+        self.plot_timer = QTimer()
+        self.plot_timer.timeout.connect(plotter._update_plot_data)
+        # Timer se spustí až po přidání zařízení
+        
+        self._start_timer_signal.connect(plotter._start_plot_timer)
+
+        # === Registrace událostí ===
+        plotter.device_manager.event_device_added.connect(plotter._on_device_added)
+        self._init_curves_signal.connect(plotter._init_curves)
+
+    def show(self):
+        res = super().show()
+        self.plotter.isShown = True
+        self.plotter.update_ports()
+        return res
+
+    def closeEvent(self, event):
+        self.plotter._logger.debug("Ukončuji aplikaci...")
+
+        # Zastavíme timer
+        if hasattr(self, 'plot_timer'):
+            self.plot_timer.stop()
+
+        self.plotter.data_socket.socket.close()
+        self.plotter.cmd_socket.socket.close()
+        self.plotter.data_socket.stop()
+        self.plotter.cmd_socket.stop()
+        self.plotter.device_manager.stop()
+
+        self.plotter.isShown = False
+        event.accept()

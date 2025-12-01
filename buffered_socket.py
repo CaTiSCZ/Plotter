@@ -125,6 +125,9 @@ class BufferedSocket:
             raise socket.timeout("recvfrom: timeout")
 
     def get_received_count(self):
+        return self._received_count
+
+    def get_buffered_items_count(self):
         return self._receive_buffer.qsize()
 
     def __bool__(self):

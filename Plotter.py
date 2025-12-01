@@ -30,9 +30,8 @@ UDP_PORT_RECV = 10579  # tento klient - port pro příjem ACK +
 UDP_PORT_DATA = 10577  # port pro příjem dat 
 
 # -------------------- GUI s více tlačítky ----------------------
-class Plotter(QWidget):
-    _start_timer_signal = pyqtSignal()
-    _init_curves_signal = pyqtSignal()
+class Plotter:
+
 
     def __init__(self):
         super().__init__()
@@ -61,20 +60,11 @@ class Plotter(QWidget):
 # === inicializace grafu ===
         self.gui = Gui(self)
 
-# === Timer pro aktualizaci grafu ===
-        self.plot_timer = QTimer()
-        self.plot_timer.timeout.connect(self._update_plot_data)
-        # Timer se spustí až po přidání zařízení
         self.plot_timer_running = False
-        self._start_timer_signal.connect(self._start_plot_timer)
-
-# === Registrace událostí ===
-        self.device_manager.event_device_added.connect(self._on_device_added)
-        self._init_curves_signal.connect(self._init_curves)
 
     def _start_plot_timer(self):
         if not self.plot_timer_running:
-            self.plot_timer.start(100)  # Aktualizace každých 100ms (10 FPS)
+            self.gui.plot_timer.start(100)  # Aktualizace každých 100ms (10 FPS)
             self.plot_timer_running = True
             self._logger.info("Plot timer started")
 
@@ -189,7 +179,7 @@ class Plotter(QWidget):
                 self.plot_error_count += 1
                 if self.plot_error_count > 10:
                     self._logger.error("Příliš mnoho chyb při aktualizaci grafu, zastavuji timer")
-                    self.plot_timer.stop()
+                    self.gui.plot_timer.stop()
                     self.plot_timer_running = False
             else:
                 self.plot_error_count = 1
@@ -207,16 +197,19 @@ class Plotter(QWidget):
             
         self.gui.lost_packets_value.setText(str(total_lost))
         self.gui.err_packets_value.setText(str(total_errors))
-        self.gui.recv_packets_value.setText(str(total_received))
+        self.gui.recv_packets_value.setText(str(f"{total_received} ({total_lost + total_errors + total_received})"))
+    
+    def _reset_counters(self):
+        self.device_manager.reset_counters()
 
     def _on_device_added(self, manager, device):
         """Callback volaný při přidání nového zařízení"""
         def on_id_received(error, old_id, new_id, old_channel_info, new_channel_info):
             if new_channel_info != old_channel_info:
                 self._logger.info(f"Device added: {device.addr}, curves initialized")
-                self._init_curves_signal.emit()
+                self.gui._init_curves_signal.emit()
                 # Spustíme timer pro aktualizaci grafu, pokud ještě neběží
-                self._start_timer_signal.emit()
+                self.gui._start_timer_signal.emit()
 
         self._logger.debug(f"Requesting device ID {device.addr}")
         device.get_id(on_ack=on_id_received)
@@ -278,26 +271,7 @@ class Plotter(QWidget):
         else:
             self.device_manager.start_sampling(self.num_packets)
 
-    def show(self):
-        res = super().show()
-        self.isShown = True
-        self.update_ports()
-        return res
 
-    def closeEvent(self, event):
-        self._logger.debug("Ukončuji aplikaci...")
-
-        # Zastavíme timer
-        if hasattr(self, 'plot_timer'):
-            self.plot_timer.stop()
-
-        self.data_socket.socket.close()
-        self.cmd_socket.socket.close()
-
-        self.data_socket.stop()
-        self.cmd_socket.stop()
-        self.isShown = False
-        event.accept()
 
 def main(argv):
     with ExitStack() as stack:
