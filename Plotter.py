@@ -254,7 +254,9 @@ class Plotter(QWidget):
 
     def add_device(self):
         self._logger.debug("Adding device...")
-        for en, addr in zip(self.dev_enable,self.dev_ip_edit):
+        if not self.cmd_socket or not self.data_socket:
+            self.update_ports()
+        for en, addr in zip(self.gui.dev_enable,self.gui.dev_ip_edit):
             if en.isChecked():
                 ip, port = addr.text().split(":")
                 self.device_manager.add_device((ip, int(port)))
@@ -264,14 +266,13 @@ class Plotter(QWidget):
         #self.device_manager.get_id()
     
     def update_ports(self):
-        int(self.command_port_edit.text())
-        int(self.data_port_edit.text())
-        ip, port = self.dev_ip_edit[0].text().split(":")
-        self.cmd_socket.socket.bind((int(self.command_port_edit.text())), use_my_ip = True, device_ip = ip, device_port = int(port))
-        self.data_socket.socket.bind((int(self.data_port_edit.text())), use_my_ip = True, device_ip = ip, device_port = int(port))
-
+        int(self.gui.command_port_edit.text())
+        int(self.gui.data_port_edit.text())
+        ip, port = self.gui.dev_ip_edit[0].text().split(":")
+        self.cmd_socket.socket.bind((int(self.gui.command_port_edit.text())), use_my_ip = True, device_ip = ip, device_port = int(port))
+        self.data_socket.socket.bind((int(self.gui.data_port_edit.text())), use_my_ip = True, device_ip = ip, device_port = int(port))
     def start_sampling(self, on_trigger):
-        self.num_packets = self.num_packets_spinbox.value()
+        self.num_packets = self.gui.num_packets_spinbox.value()
         if on_trigger:
             self.device_manager.start_on_trigger(self.num_packets)
         else:
@@ -312,7 +313,7 @@ def main(argv):
         gui_log_handler.setLevel(logging.DEBUG)
         logging_.log_printer.add_handler(gui_log_handler)
         logging_.logger.critical(f"Logging to file: {logging_.log_path}") # This has to be in console, so critical
-        plotter.show()
+        plotter.gui.show()
         return app.exec_()
 
 # Spuštění aplikace

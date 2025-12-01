@@ -37,4 +37,8 @@ class AsyncSocket:
         self._running = False
         if self._listener_thread and self._listener_thread.is_alive():
             self._listener_thread.join(timeout=2)
+
+    def __bool__(self):
+        """Vrací True pokud je socket aktivní (běží), jinak False."""
+        return bool(self.socket)
  

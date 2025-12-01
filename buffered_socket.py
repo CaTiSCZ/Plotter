@@ -46,8 +46,8 @@ class BufferedSocket:
             self._sock.bind(self._addr)
             self._sock.settimeout(5.0)
             self._start()
-            #print(f"[INFO] Bound to {self.addr[0]}:{self.addr[1]}")      
-
+            #print(f"[INFO] Bound to {self.addr[0]}:{self.addr[1]}")  
+   
     def _start(self):
         if not self._sock:
             raise RuntimeError("Start: Need to call bind() first to set IP and port.")
@@ -126,6 +126,10 @@ class BufferedSocket:
 
     def get_received_count(self):
         return self._receive_buffer.qsize()
+
+    def __bool__(self):
+        """Vrací True pokud je socket aktivní (běží), jinak False."""
+        return self._running
 
 
 if __name__ == '__main__':

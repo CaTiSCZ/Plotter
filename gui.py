@@ -114,7 +114,7 @@ class Gui(QWidget):
         self.buffer_size_label = QLabel("Buffer size [s]:")
         self.buffer_size_spinbox = QDoubleSpinBox()
         self.buffer_size_spinbox.setRange(0.1, 60.0)
-        self.buffer_size_spinbox.setValue(self.buffer_length_sec)
+        self.buffer_size_spinbox.setValue(plotter.buffer_length_sec)
    
         row2.addWidget(self.buffer_size_label, 0, 11, alignment=Qt.AlignRight)
         row2.addWidget(self.buffer_size_spinbox, 0, 12, alignment=Qt.AlignLeft)
@@ -164,14 +164,14 @@ class Gui(QWidget):
         self.listen_all_checkbox.setChecked(True) 
         
         self.cmd_label = QLabel("CMD:")
-        self.command_port_edit = QLineEdit(str(self.udp_ack_port))
+        self.command_port_edit = QLineEdit(str(plotter.udp_ack_port))
         self.command_port_edit.returnPressed.connect(plotter.update_ports)
         grid.addWidget(self.cmd_label, 1, 0, alignment=Qt.AlignRight)
         grid.addWidget(self.command_port_edit, 1, 1, alignment=Qt.AlignLeft)
         grid.addWidget(self.listen_all_checkbox, 0, 2, 1, 4)
 
         self.data_label = QLabel("DATA:")
-        self.data_port_edit = QLineEdit(str(self.udp_data_port))
+        self.data_port_edit = QLineEdit(str(plotter.udp_data_port))
         self.data_port_edit.returnPressed.connect(plotter.update_ports)
         grid.addWidget(self.data_label, 1,2, alignment=Qt.AlignRight)
         grid.addWidget(self.data_port_edit, 1, 3, alignment=Qt.AlignLeft)
@@ -218,7 +218,7 @@ class Gui(QWidget):
         self.get_receivers_button.clicked.connect(lambda: plotter.device_manager.get_receivers(0))
         grid.addWidget(self.get_receivers_button, 1, 9, 1, 2, alignment=Qt.AlignCenter)
 # register receiver
-        self.register_text_edit = QLineEdit(f"0.0.0.0:{self.udp_data_port}")
+        self.register_text_edit = QLineEdit(f"0.0.0.0:{plotter.udp_data_port}")
         self.register_text_edit.returnPressed.connect(lambda: plotter.device_manager.register_receiver(self.register_text_edit.text(), 0))
         grid.addWidget(QLabel("Register receiver:"), 3, 5, 1, 3)
         grid.addWidget(self.register_text_edit, 4, 5, 1, 2)
@@ -226,7 +226,7 @@ class Gui(QWidget):
         self.register_button.clicked.connect(lambda: plotter.device_manager.register_receiver(self.register_text_edit.text(), 0))
         grid.addWidget(self.register_button, 4, 7)
 # remove receiver
-        self.remove_text_edit = QLineEdit(f"0.0.0.0:{self.udp_data_port}")
+        self.remove_text_edit = QLineEdit(f"0.0.0.0:{plotter.udp_data_port}")
         self.remove_text_edit.returnPressed.connect(lambda: plotter.device_manager.remove_receiver(self.remove_text_edit.text(), 0))
         grid.addWidget(QLabel("Remove receiver:"), 3, 8, 1, 3)
         grid.addWidget(self.remove_text_edit, 4, 8, 1, 2)
@@ -241,7 +241,7 @@ class Gui(QWidget):
         self.num_packets_label = QLabel("Wanted packets (0 = continue):")
         self.num_packets_spinbox = QSpinBox()
         self.num_packets_spinbox.setRange(0, 10000)
-        self.num_packets_spinbox.setValue(self.num_packets)
+        self.num_packets_spinbox.setValue(plotter.num_packets)
 
         grid.addWidget(self.num_packets_label, 0, 11)
         grid.addWidget(self.num_packets_spinbox, 0, 12)
@@ -268,16 +268,18 @@ class Gui(QWidget):
         self.dev_enable = []
         self.dev_ip_edit = []
         device_count = 5
+        select_all = True
         for i in range (device_count):
             self.dev_enable.append(QCheckBox(f"Device {i+1}:"))
-            self.dev_enable[-1].setChecked(i in [0])
+            self.dev_enable[-1].setChecked(v:=(i in [0]))
             self.dev_enable[-1].stateChanged.connect(plotter._device_selected_changed) 
             grid.addWidget(self.dev_enable[-1], i+1, 13)
-            self.dev_ip_edit.append(QLineEdit(f"{self.udp_device_addr}:{self.udp_device_port}"))
+            self.dev_ip_edit.append(QLineEdit(f"{plotter.udp_device_addr}:{plotter.udp_device_port}"))
             grid.addWidget(self.dev_ip_edit[-1], i+1, 14, 1, 1)
+            select_all &= v
 
         self.select_all_checkbox = QCheckBox("Select All")
-        self.select_all_checkbox.setChecked(True)
+        self.select_all_checkbox.setChecked(select_all)
         grid.addWidget(self.select_all_checkbox, 0, 13) 
         self.select_all_checkbox.stateChanged.connect(lambda state: plotter._select_all_devices(state == Qt.Checked))
         self.invert_selection_button = QPushButton("Invert Selection")
