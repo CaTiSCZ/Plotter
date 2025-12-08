@@ -2,6 +2,17 @@
     "launch": {
         "configurations": [
             {
+                "name": "Plotter",
+                "type": "debugpy",
+                "request": "launch",
+                "program": "Plotter.py",
+                "env": { "USED_VSCODE_COMMAND_PICKARGS": "0" },
+                //"args": ["${command:pickArgs}"], // "${command:pickArgs}"
+                "args": [],
+                "console": "integratedTerminal",
+                "justMyCode": false
+            },
+            {
                 "name": "buffered_socket_test",
                 "type": "debugpy",
                 "request": "launch",

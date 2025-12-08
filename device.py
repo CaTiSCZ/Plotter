@@ -1,34 +1,86 @@
 import logging
 from logger import application_logger
-from async_socket import AsyncSocket
 import threading
 import struct
-from enum import IntEnum
+from enum import IntEnum, unique
+from dataclasses import dataclass
+from collections.abc import Callable
+from typing import Any
+import socket
+from event import Event
+import numpy as np
+from queue import Queue, Empty
 
     # ---------------------- CMD a packety -------------------
-class PACKET(IntEnum):
-    ACK_packet = 0
-    ID_packet = 1
-    DATA_packet = 2
-    TRIGGER_packet = 3
+class IntEnumName(IntEnum):
+    def __str__(self):
+        return self.name
 
-class CMD(IntEnum):
-    PING = 0
-    GET_ID = 1
-    REGISTER_RECEIVER = 2
-    REMOVE_RECEIVER = 3
-    GET_RECEIVERS =	4
-    START_SAMPLING = 5
-    START_ON_TRIGGER = 6
-    STOP_SAMPLING = 7
-    TRIGGER_ACK = 8
-    FORSE_TRIGGER =	9
+@unique
+class PACKET(IntEnumName):
+    ACK_packet              =  0
+    ID_packet               =  1
+    DATA_packet             =  2
+    TRIGGER_packet          =  3
+    LOG_packet              =  4
 
+@unique
+class CMD(IntEnumName):
+    PING                    =  0
+    GET_ID                  =  1
+    REGISTER_RECEIVER       =  2
+    REMOVE_RECEIVER         =  3
+    GET_RECEIVERS           =  4
+    START_SAMPLING          =  5
+    START_ON_TRIGGER        =  6
+    STOP_SAMPLING           =  7
+    TRIGGER_ACK             =  8
+    FORCE_TRIGGER           =  9
+    RESET_COUNTERS          = 10
+    CLOCK_CONFIG            = 11
+    GET_ACQUISITION_STATE   = 12
+    DEVICE_ID_CONFIG        = 13
+    RESET_DEVICE            = 14
+    GET_CLOCK_CONFIG        = 15
+
+class STRUCT:
+    HEADER = struct.Struct("<HH")
+    CMD = struct.Struct("<I")
+    CRC = struct.Struct("<H")
+    ID = struct.Struct('<HBBI3I HBB I HBB 8s 30s H')
+    CHANNEL = struct.Struct('<4s ff')
+
+SAVE_KEY = 0xAC
+RESET_KEY = 0xFE
 
 class Device:
-    # ---------------------- CRC CCITT ----------------------
+
+    RAW_DATA_TYPE = np.int16
+    DATA_TYPE = np.float64
+    SAMPLES_PER_PACKET = 200
+    PACKETS_PER_SECOND = 1000
+    DEFAULT_BUFFER_SIZE = 10 * SAMPLES_PER_PACKET * PACKETS_PER_SECOND
+    BUFFER_EXTEND = 3
+
+
+    @dataclass
+    class CommandRecord:
+        timer: threading.Timer
+        on_timeout: Callable[[CMD, list[Any], dict[str, Any]], None] | None
+        on_timeout_args: list[Any]
+        on_timeout_kwargs: dict[str, Any]
+        on_ack: Callable[[CMD, int, bytes, list[Any], dict[str, Any]], None] | None
+        on_ack_args: list[Any]
+        on_ack_kwargs: dict[str, Any]
+
+    @dataclass    
+    class ChannelInfo:
+        unit: str
+        offset: float
+        gain: float    
+    
     @staticmethod
-    def crc16_ccitt(data: bytes, start, end, poly=0x1021, crc=0xFFFF):
+    def _crc16_ccitt(data: memoryview, start, end, poly=0x1021, crc=0xFFFF):
         for i in range (start, end):
             crc ^= data[i] << 8
             for _ in range(8):
@@ -39,16 +91,13 @@ class Device:
                 crc &= 0xFFFF
         return crc
 
-    def verify_crc(self, packet):
-        if (l:=len(packet)) < 2:
-            self._logger.error(f"Verify crc: Too short packet ({l}).")
-            return False
-        crc_position = l - 2
-        received_crc = self._crc_parser.unpack_from(packet, crc_position)[0]
-        if (crc:=Device.crc16_ccitt(packet, 0, crc_position)) != received_crc:
-            self._logger.debug(f"CRC mismatch: expected 0x{crc:04X}, received 0x{received_crc:04X}")
-            return False
-        return True
+    @staticmethod
+    def _verify_crc(packet: memoryview):
+        if (l:=len(packet)) < STRUCT.CRC.size:
+            return None
+        received_crc = STRUCT.CRC.unpack_from(packet, l - STRUCT.CRC.size)[0]
+        expected_crc = Device._crc16_ccitt(packet, 0, l- STRUCT.CRC.size)
+        return True if expected_crc == received_crc else (received_crc, expected_crc)
 
     def __init__(self, cmd_socket, addr):
         self._logger = logging.getLogger(__class__.__name__ if application_logger is None else f'{application_logger}.{__class__.__name__}')
@@ -56,219 +105,630 @@ class Device:
         self.cmd_socket = cmd_socket
         self.addr = addr
 
-        self._packet_type_parser = struct.Struct("<H")
-        self._ack_packet_parser = struct.Struct("<HI")
-
-        self._crc_parser = struct.Struct("<H")
-
         self.sent_commands = {}
-        self.timeout = 1
+        self.timeout = 5
 
         self.send_command_lock = threading.Lock()
+        self.buffer_lock = threading.Lock()
+
+        self.is_sampling = False
+        self.id = {}
+        self.channels_count = None
+        self.channel_info = []
+        self.buffer_size = Device.DEFAULT_BUFFER_SIZE
+        self.buffer_start_index = self.buffer_size
+        self.raw_buffer_read_index = self.buffer_start_index
+        self.raw_buffer_write_max = self.buffer_start_index
+        self.raw_buffer_read_size = 0
+        self.buffer_read_index = self.buffer_start_index
+        self.buffer_read_size = 0
+        self.buffer_overflow_counter = 0
+        self.last_packet_num = None
+        self.packet_counter = 0
+        self.packet_counter_cycle = 0
+        self.data_packet_size = 0
+        self.max_packet_num = -1
+        self.out_of_order_packets = Queue()
+        self.lost_packets = 0
+        self.error_packets = 0
+        self.pending_ack_on_stop_sampling = None
+        self.last_value = None
+        self.receiving_data = False
+        self.transmiter_sent_packets = 0
+
+        # Inicializace prázdných bufferů
+        self.raw_buffer = np.array([])
+        self.buffer = np.array([])
+        self.gain = np.array([])
+        self.offset = np.array([])
+
+        self.event_ACK = Event()
+        self.event_ID = Event()
+        self.event_data = Event()
+        self.event_trigger = Event()
+        self.event_log = Event()
+        self.event_shrink_buffer = Event()
+
+
+    def _keep_alive (self):
+        pass
 
     def packet_received (self, packet):
-        if (l:=len(packet)) < 2:
-            self._logger.warning(f"Packet received: Too short packet ({l}).")
+        min_length = STRUCT.HEADER.size
+        if (packet_length:=len(packet)) < min_length:
+            self._logger.warning(f"Packet received: Too short packet ({packet_length}).")
             return
-        packet_type = self._packet_type_parser.unpack_from(packet, 0)[0]
+        packet_view = memoryview(packet)
+        packet_type, error = STRUCT.HEADER.unpack_from(packet, 0)
         match packet_type:
             case PACKET.ACK_packet:
-                error, cmd = self._ack_packet_parser.unpack_from(packet, 2)
-                try:
-                    with self.send_command_lock:
-                        timer, on_timeout, on_ack = self.sent_commands[cmd]
-                        del self.sent_commands[cmd]
+                offset = min_length
+                min_length += STRUCT.CMD.size
+                if packet_length < min_length:
+                    self._logger.warning(f"Packet received: Too short ACK packet ({packet_length}).")
+                    return  
+                cmd = STRUCT.CMD.unpack_from(packet, offset)[0]
+                
+                record = self._cancel_timeout(cmd)
+                if record is not None and record.on_ack is not None and cmd != CMD.STOP_SAMPLING:
+                    record.on_ack(cmd, error, packet_view[min_length:], *record.on_ack_args, **record.on_ack_kwargs)
+                elif cmd == CMD.STOP_SAMPLING:
+                    self.pending_ack_on_stop_sampling = (cmd, error, packet_view[min_length:], record)
+                    self._logger.debug("Pending ACK on stop sampling set")
+                self.event_ACK.emit(self, cmd, error, packet_view[min_length:])
 
-                    timer.cancel()
-                    on_ack(error, packet[8:])
-                except KeyError:
-                    self._logger.info("Packet received: unexpected ACK for {cmd}")
-    
-    def _on_timeout(self, cmd):
+            case PACKET.ID_packet:
+                cmd = CMD.GET_ID
+                record = self._cancel_timeout(cmd)
+                match Device._verify_crc(packet_view):
+                    case True:
+                        pass
+                    case None:
+                        self._logger.error(f"Packet received: Too short ID packet ({packet_length}).")
+                        if record is not None and record.on_timeout is not None:
+                            record.on_timeout(*record.on_timeout_args, **record.on_timeout_kwargs)
+                        return
+                    case (received_crc, expected_crc):
+                        self._logger.error(f"Packet received: ID packet with invalid CRC; reveived: {received_crc}, expected: {expected_crc}")
+                        if record is not None and record.on_timeout is not None:
+                            record.on_timeout(*record.on_timeout_args, **record.on_timeout_kwargs)
+                        return
+                offset = min_length
+                min_length += STRUCT.ID.size
+                if packet_length < min_length:
+                    self._logger.error(f"Packet received: Too short ID packet ({packet_length}).")
+                    if record is not None and record.on_timeout is not None:
+                        record.on_timeout(*record.on_timeout_args, **record.on_timeout_kwargs)
+                    return
+                unpacked = STRUCT.ID.unpack_from(packet_view[offset : min_length])
+                old_id = self.id
+                
+                self.id = {
+                    'mcu_hw_id': unpacked[0],
+                    'mcu_hw_ver_major': unpacked[1],
+                    'mcu_hw_ver_minor': unpacked[2],
+                    'mcu_serial': unpacked[3],
+                    'cpu_uid': (unpacked[4], unpacked[5], unpacked[6]),
+                    'adc_hw_id': unpacked[7],
+                    'adc_ver_major': unpacked[8],
+                    'adc_ver_minor': unpacked[9],
+                    'adc_serial': unpacked[10],
+                    'fw_id': unpacked[11],
+                    'fw_ver_major': unpacked[12],
+                    'fw_ver_minor': unpacked[13],
+                    'fw_config': unpacked[14].decode('ascii').rstrip('\x00'),
+                    'build_time': unpacked[15].decode('ascii').rstrip('\x00'),
+                    'channels_count': unpacked[16],
+                }
+                channels_count = self.id['channels_count']
+                offset = min_length
+                min_length += channels_count * STRUCT.CHANNEL.size
+                if len(packet) < min_length:
+                    self._logger.error(f"Packet received: Too short ID packet ({packet_length}).")
+                    if record is not None and record.on_timeout is not None:
+                        record.on_timeout(*record.on_timeout_args, **record.on_timeout_kwargs)
+                    return
+                old_channel_info = self.channel_info
+                self.channel_info = []
+                unpacker = STRUCT.CHANNEL.iter_unpack(packet_view[offset:min_length])
+                offsets = channels_count * [0]
+                gains = channels_count * [0]
+                for i in range (channels_count):
+                    info = Device.ChannelInfo(*next(unpacker))
+                    info.unit = info.unit.decode('ascii').rstrip('\x00')
+                    offsets[i] = info.offset
+                    gains[i] = info.gain
+                    self.channel_info.append(info)
+                self.offset = np.array(offsets)
+                self.gain = np.array(gains)
+                self._logger.info(f"Packet received: ID packet received")
+                #volat funkci zajišťující správný přepočet dat
+                self._init_buffer(channels_count = channels_count)
+                if record is not None and record.on_ack is not None:
+                    record.on_ack(error, old_id, self.id, old_channel_info, self.channel_info, *record.on_ack_args, **record.on_ack_kwargs)
+                self.event_ID.emit(self, error, old_id, self.id, old_channel_info, self.channel_info)
+
+            case PACKET.DATA_packet:
+                offset = min_length
+                min_length += self.data_packet_size
+                if packet_length < min_length:
+                    self._logger.error(f"Packet received: Too short DATA packet ({packet_length}).")
+                    self.error_packets += 1
+                    return
+                match Device._verify_crc(packet_view):
+                    case True:
+                        pass
+                    case None:
+                        self._logger.error(f"Packet received: Too short DATA packet ({packet_length}).")
+                        self.error_packets += 1
+                        return
+                    case (received_crc, expected_crc):
+                        self._logger.error(f"Packet received: DATA packet with invalid CRC; reveived: {received_crc}, expected: {expected_crc}")
+                        self.error_packets += 1
+                        return
+                  
+                packet_num = error
+                if self.last_packet_num is not None:
+                    if self.last_packet_num - packet_num > 60000:
+                        self.packet_counter_cycle += 1
+                    elif self.last_packet_num - packet_num < -60000:
+                        self.packet_counter_cycle -= 1
+                self.last_packet_num = packet_num
+                packet_num = packet_num + self.packet_counter_cycle * 65536
+                
+                with self.buffer_lock:
+                    self.packet_counter += 1
+                    self._logger.debug(f"DATA packet #{packet_num} -> {self.packet_counter}")
+                    buffer_write_index = self.buffer_size + packet_num * Device.SAMPLES_PER_PACKET - self.buffer_overflow_counter * 2 * self.buffer_size
+                    packet_np = np.frombuffer(packet, dtype=Device.RAW_DATA_TYPE, offset = offset, count = Device.SAMPLES_PER_PACKET * self.channels_count)
+                    channels_data = packet_np.reshape((self.channels_count, Device.SAMPLES_PER_PACKET))
+                    buffer_write_end = buffer_write_index + Device.SAMPLES_PER_PACKET
+                    self.raw_buffer[:, buffer_write_index:buffer_write_end] = channels_data
+                    if buffer_write_end == self.buffer_size * 3:
+                        self.buffer_overflow_counter += 1
+                        self.raw_buffer[:, 0:self.buffer_size] = self.raw_buffer[:, 2*self.buffer_size:]
+                        self.buffer_start_index = 0
+                        self.raw_buffer_write_max = self.buffer_size
+                        self.raw_buffer_read_size = self.buffer_size
+                    else:
+                        self.raw_buffer_write_max = max(self.raw_buffer_write_max, buffer_write_end)
+                        self.raw_buffer_read_size = min(self.raw_buffer_write_max - self.buffer_start_index, self.buffer_size)
+                    self.raw_buffer_read_index = self.raw_buffer_write_max - self.raw_buffer_read_size
+                    
+                    if (lost:=(packet_num - self.max_packet_num)) > 1 and self.max_packet_num > -1:
+                        lost -= 1
+                        self.lost_packets += lost
+                        self._logger.warning(f"Lost packets detected. Count: {lost}, {self.lost_packets} total.")
+                    self.max_packet_num = max(self.max_packet_num, packet_num)
+                    if packet_num < self.max_packet_num:
+                        self.out_of_order_packets.put(buffer_write_index)
+                        self.lost_packets -= 1
+                        self._logger.info(f"Out of order packet: {packet_num} (expected up to {self.max_packet_num}, Lost packets: {self.lost_packets})")  
+                    
+                self.event_data.emit(self, packet_num, channels_data, buffer_write_index)
+            case PACKET.TRIGGER_packet:
+                self._logger.info(f"Packet received: TRIGGER packet received")
+                self.event_trigger.emit(self, error, packet_view[min_length:])
+            case PACKET.LOG_packet:
+                packet_num = error
+                msg = packet[min_length:].decode('ascii').rstrip('\x00')
+                self._logger.info(f"LOG [{packet_num:5}]: {msg}")
+                self.event_log.emit(self, packet_num, msg)
+
+    def _timeout(self, cmd):
         with self.send_command_lock:
-            timer, on_timeout, on_ack = self.sent_commands[cmd]
+            record = self.sent_commands[cmd]
             del self.sent_commands[cmd]
-        on_timeout()
+        record.on_timeout(cmd, *record.on_timeout_args, **record.on_timeout_kwargs)
+    
+    def _cancel_timeout(self, cmd):
+        try:
+            with self.send_command_lock:
+                record = self.sent_commands[cmd]
+                record.timer.cancel()
+                del self.sent_commands[cmd]
+                return record 
+        except KeyError:
+            if cmd != CMD.STOP_SAMPLING or self.is_sampling is False:
+                self._logger.info(f"Packet received: unexpected response for {cmd}")
+        return None
 
+    def on_timeout(self, cmd, msg = None, on_timeout = None, on_timeout_args = [], on_timeout_kwargs = {}):
+        self._logger.warning(msg or f"Send command: no answer for {cmd}" )
+        if on_timeout is not None:
+            on_timeout(*on_timeout_args, **on_timeout_kwargs)
 
-    def send_command(self, cmd: int, data: bytes = b'', on_timeout = None, on_ack = None):
+    def on_ack(self, cmd, error, data, msg = None, on_ack = None, on_ack_args = [], on_ack_kwargs = {}):
+        self._logger.info(msg or f"Send command: received ACK for {cmd}")
+        if on_ack is not None:
+            on_ack(error, data, *on_ack_args, **on_ack_kwargs)
+
+    def sampling_finished(self):
+        value = self.last_packet_num
+        if value == self.last_value:
+            if self.receiving_data:
+                self.receiving_data = False
+                self._logger.info("No new packet, sampling finished")
+                if self.pending_ack_on_stop_sampling is not None:
+                    cmd, error, data, record = self.pending_ack_on_stop_sampling
+                    self.pending_ack_on_stop_sampling = None
+                    if record is None:
+                        record = type('Record', (object,), {})()
+                        record.on_ack, record.on_ack_args, record.on_ack_kwargs = None, [], {}
+                    self._ack_on_stop_sampling(cmd, error, data, record.on_ack, *record.on_ack_args, **record.on_ack_kwargs)
+        else:
+            self.receiving_data = True
+            self.last_value = value
+
+    def _ack_on_stop_sampling(self, cmd, error, data, on_ack = None, on_ack_args = [], on_ack_kwargs = {}):
+        sent_packets = struct.unpack_from('<I', data, 0)[0] + self.transmiter_sent_packets
+        self.transmiter_sent_packets = sent_packets
+        if self.packet_counter != sent_packets:
+            self._logger.warning(f"Stop sampling: received packets ({self.packet_counter}) not equal to sent packets ({sent_packets})")
+        else:
+            self._logger.info(f"Stop sampling acknowledged, sent packets: {sent_packets}")
+        self.is_sampling = False
+        all_packets = self.packet_counter + self.lost_packets + self.error_packets
+        missing_packets = sent_packets - all_packets
+        if missing_packets > 0:
+            self.lost_packets += missing_packets
+            self.max_packet_num += missing_packets
+            self._logger.warning(f"Stop sampling: missing packets: {missing_packets}")
+        if on_ack is not None:
+            on_ack(error, sent_packets, *on_ack_args, **on_ack_kwargs)
+
+    def _init_buffer(self, *, channels_count = None, buffer_size = None):
+        with self.buffer_lock:
+            if buffer_size is None and channels_count is None:
+                self._logger.critical("Init buffer: Both channels_count and buffer_size cannot be None")
+                raise ValueError("Both channels_count and buffer_size cannot be None")
+            elif channels_count is not None:
+                if buffer_size is not None:
+                    self._logger.critical("Init buffer: Both channels_count and buffer_size cannot change")
+                    raise ValueError("Both channels_count and buffer_size cannot change")
+                elif self.channels_count is None:
+                    self.raw_buffer = np.zeros((channels_count, Device.BUFFER_EXTEND * self.buffer_size), dtype=Device.RAW_DATA_TYPE)
+                elif channels_count > self.channels_count:
+                    self.raw_buffer = np.concatenate((self.raw_buffer, np.zeros((channels_count - self.channels_count, Device.BUFFER_EXTEND * self.buffer_size), dtype=Device.RAW_DATA_TYPE)), axis=0)
+                elif channels_count < self.channels_count:
+                    raw = self.raw_buffer
+                    self.event_shrink_buffer.emit(self, raw)
+                    self.raw_buffer = self.raw_buffer[:channels_count]
+                self.channels_count = channels_count
+                self.data_packet_size = STRUCT.CRC.size + self.channels_count * (Device.RAW_DATA_TYPE().nbytes * Device.SAMPLES_PER_PACKET + 1) + self.channels_count % 2
+            elif buffer_size is not None:
+                if self.channels_count is not None:
+                    if buffer_size > self.buffer_size:
+                        self.raw_buffer = np.concatenate((self.raw_buffer, np.zeros((self.channels_count, Device.BUFFER_EXTEND * (buffer_size - self.buffer_size)), dtype=Device.RAW_DATA_TYPE)), axis=1)
+                    elif buffer_size < self.buffer_size:
+                        raw = self.raw_buffer
+                        self.event_shrink_buffer.emit(self, raw)
+                        self.raw_buffer = self.raw_buffer[:, :Device.BUFFER_EXTEND * buffer_size]
+                self.buffer_size = buffer_size
+            self.buffer = np.zeros((self.channels_count, Device.BUFFER_EXTEND * self.buffer_size), dtype=Device.DATA_TYPE)
+
+    def get_data(self):
+        def calc(begin, end):
+            self.buffer[:, begin:end] = self.raw_buffer[:, begin:end] * self.gain[:, np.newaxis] + self.offset[:, np.newaxis]
+        
+        # Kontrola, jestli je zařízení správně inicializované
+        if self.channels_count is None or self.channels_count == 0:
+            self._logger.debug("get_data: Zařízení není inicializované (channels_count)")
+            return (np.array([]), 0, 0, 0)
+            
+        if not hasattr(self, 'buffer') or not hasattr(self, 'raw_buffer'):
+            self._logger.debug("get_data: Buffer není inicializovaný")
+            return (np.array([]), 0, 0, 0)
+            
+        with self.buffer_lock:
+            new_data_size = self.raw_buffer_write_max - (self.buffer_read_index + self.buffer_read_size)
+            if new_data_size > 0:
+                calc(self.raw_buffer_write_max - new_data_size, self.raw_buffer_write_max)
+            elif new_data_size < 0:
+                new_data_size += 3 * self.buffer_size
+                self.buffer[:, self.buffer_start_index:self.buffer_start_index + self.buffer_read_size] = self.buffer[:, self.buffer_read_index:self.buffer_read_index + self.buffer_read_size]
+                calc(self.raw_buffer_write_max - new_data_size, self.raw_buffer_write_max)
+            while True:
+                try:
+                    buffer_write_index = self.out_of_order_packets.get_nowait()
+                    calc(buffer_write_index, buffer_write_index + Device.SAMPLES_PER_PACKET)
+                    self.out_of_order_packets.task_done()
+                except Empty:
+                    break
+            self.buffer_read_index = self.raw_buffer_read_index
+            self.buffer_read_size = self.raw_buffer_read_size
+            return (self.buffer[:, self.buffer_read_index:self.buffer_read_index + self.buffer_read_size], 
+                    self.max_packet_num * Device.SAMPLES_PER_PACKET, 
+                    self.buffer_read_size,
+                    self.channels_count)
+
+    def send_command(self, cmd: int, data: bytes = b'', on_timeout = None, on_timeout_args = [], on_timeout_kwargs = {}, on_ack = None, on_ack_args = [], on_ack_kwargs = {}):
         with self.send_command_lock:
-            if on_timeout is not None and on_ack is not None:
+            if on_timeout is not None or on_ack is not None:
                 if cmd in self.sent_commands:
                     self._logger.warning(f"Send command: Command {cmd} in progres.")
                     return
-                self.sent_commands[cmd] = (threading.Timer(self.timeout, self._on_timeout), on_timeout, on_ack)
-
+                self.sent_commands[cmd] = Device.CommandRecord(t:= threading.Timer(self.timeout, self._timeout, args=(cmd,)),
+                                                               on_timeout, on_timeout_args, on_timeout_kwargs,
+                                                               on_ack, on_ack_args, on_ack_kwargs)
+                t.start()
             packet = struct.pack('<I', cmd) + data
             self.cmd_socket.sendto(packet, self.addr)
 
-    def ping(self):
+    def ping(self, on_timeout = None, on_timeout_args = [], on_timeout_kwargs = {}, on_ack = None, on_ack_args = [], on_ack_kwargs = {}):       
         try:
-            responses = self.send_command(CMD.PING,expect_response=True)
-            if responses:
-                self._logger.info(f"Ping: ok")
-            else:
-                self._logger.warning("Ping: no response")
+            self.send_command(CMD.PING, 
+                              on_timeout = self.on_timeout, on_timeout_args=(None, on_timeout, on_timeout_args, on_timeout_kwargs),
+                              on_ack = self.on_ack, on_ack_args=("Ping: ok", on_ack, on_ack_args, on_ack_kwargs))
         except Exception as e:
             self._logger.error(f"Ping: {e}")
+            if on_timeout is not None:
+                on_timeout(*on_timeout_args, **on_timeout_kwargs)
 
-    def get_id(self):
-        try:
-            resp = self.send_command(CMD.GET_ID, expect_response=True)
-            if not resp:
-                self._logger.warning("Get ID: no response")
-                return
-            data = verify_crc(resp)
-            if not data:
-                self._logger.error("Get ID: CRC failed")
-                return
-            parsed = parse_id_packet(data)
-            self.channels_count = parsed['channels_count']
-
-            self.update_buffers(channels_count=self.channels_count, preserve_data=False)
-
-            # Předat nový počet kanálů do vlákna
-            if self.sampling_thread:
-                self.sampling_thread.set_buffers(self.signal_buffer, self.error_buffer)
-                self.sampling_thread.set_channels_count(self.channels_count)
-
-            self.init_curves()
-
-            self._logger.info(
-                f"Firmware: v{parsed['fw_ver_major']}.{parsed['fw_ver_minor']}\n"
-                f"Build time: {parsed['build_time']}\n"
-                f"Number of channels: {self.channels_count}"
-            )
+    def get_id(self, on_timeout = None, on_timeout_args = [], on_timeout_kwargs = {}, on_ack = None, on_ack_args = [], on_ack_kwargs = {}):
+        try: 
+            self.send_command(CMD.GET_ID,
+                              on_timeout = self.on_timeout, on_timeout_args=(None, on_timeout, on_timeout_args, on_timeout_kwargs),
+                              on_ack = on_ack, on_ack_args=on_ack_args, on_ack_kwargs=on_ack_kwargs)
         except Exception as e:
             self._logger.error(f"Get ID: {e}")
+            if on_timeout is not None:
+                on_timeout(*on_timeout_args, **on_timeout_kwargs)
 
-    def register_receiver(self):
-        try:
-            addr, port = self.register_text_edit.text().split(':', 1)
-            data = socket.inet_aton(addr) + struct.pack('<H', int(port))
-            resp = self.send_command(CMD.REGISTER_RECEIVER, data, expect_response=True)
-
-            if not resp:
-                self._logger.warning("Register receiver: no response")
-                return
-            
-            if len(resp) < 15:
-                self._logger.error(f"Register receiver: ACK to short ({len(resp)} bytes)")
-                return   
-                
-            ip = socket.inet_ntoa(resp[8:12])
-            port = struct.unpack('<H', resp[12:14])[0]
-            order = resp[14]
-
+    def register_receiver(self, addr, source, on_timeout = None, on_timeout_args = [], on_timeout_kwargs = {}, on_ack = None, on_ack_args = [], on_ack_kwargs = {}):
+        def _on_ack(cmd, error, data):
+            if len(data) < 7:
+                self._logger.error(f"Register receiver: ACK to short ({len(data)} bytes)")
+                if on_timeout is not None:
+                    on_timeout(*on_timeout_args, **on_timeout_kwargs)
+                return  
+            ip = socket.inet_ntoa(data[:4])
+            port, order = struct.unpack('<HB', data[4:])
             self._logger.info(
                 f"Register receiver:\n"
                 f"IP: {ip}\n"
                 f"Port: {port}\n"
                 f"Order: {order}"
             )
-        except Exception as e:
-            self._logger.error(f"Registr receiver: {e}")
-    def connect(self):
-        self.get_id()
-        self.register_receiver()
-
-    def remove_receiver(self):
+            if on_ack is not None:
+                on_ack(error, ip, port, order, *on_ack_args, **on_ack_kwargs)
         try:
-            addr, port = self.remove_text_edit.text().split(':', 1)
-            data = socket.inet_aton(addr) + struct.pack('<H', int(port))
-            resp = self.send_command(CMD.REMOVE_RECEIVER, data, expect_response=True)
+            addr, port = addr.rsplit(':', 1)
+            data = socket.inet_aton(addr) + struct.pack('<HB', int(port), source)
+            self.send_command(CMD.REGISTER_RECEIVER, data,
+                              on_timeout = self.on_timeout, on_timeout_args=(None, on_timeout, on_timeout_args, on_timeout_kwargs),
+                              on_ack = _on_ack)
+        except Exception as e:
+            self._logger.error(f"Register receiver: {e}")
+            if on_timeout is not None:
+                on_timeout(*on_timeout_args, **on_timeout_kwargs)
 
-            if not resp:
-                self._logger.warning("Remove receiver: no response")
-                return
-            
-            if len(resp) < 14:
-                self._logger.error(f"Remove receiver: ACK to short ({len(resp)} bytes)")
-                return   
-                
-            ip = socket.inet_ntoa(resp[8:12])
-            port = struct.unpack('<H', resp[12:14])[0]
-
+    def remove_receiver(self, addr, source, on_timeout = None, on_timeout_args = [], on_timeout_kwargs = {}, on_ack = None, on_ack_args = [], on_ack_kwargs = {}):
+        def _on_ack(cmd, error, data):
+            if len(data) < 6:
+                self._logger.error(f"Remove receiver: ACK to short ({len(data)} bytes)")
+                if on_timeout is not None:
+                    on_timeout(*on_timeout_args, **on_timeout_kwargs)
+                return  
+            ip = socket.inet_ntoa(data[:4])
+            port = struct.unpack('<H', data[4:])
             self._logger.info(
                 f"Remove receiver:\n"
                 f"IP: {ip}\n"
-                f"Port: {port}"
+                f"Port: {port}\n"
             )
+            if on_ack is not None:
+                on_ack(error, ip, port, *on_ack_args, **on_ack_kwargs)
+        try:
+            addr, port = addr.rsplit(':', 1)
+            data = socket.inet_aton(addr) + struct.pack('<HB', int(port), source)
+            self.send_command(CMD.REMOVE_RECEIVER, data,
+                              on_timeout = self.on_timeout, on_timeout_args=(None, on_timeout, on_timeout_args, on_timeout_kwargs),
+                              on_ack = _on_ack)
         except Exception as e:
             self._logger.error(f"Remove receiver: {e}")
-    
-    def get_receivers(self):
-        try:
-            resp = self.send_command(CMD.GET_RECEIVERS, expect_response=True, expected_packets=1)
-            if not resp:
-                self._logger.warning("Get receivers: no response")
-                return
-            data = resp
+            if on_timeout is not None:
+                on_timeout(*on_timeout_args, **on_timeout_kwargs)
+
+    def get_receivers(self, source, on_timeout = None, on_timeout_args = [], on_timeout_kwargs = {}, on_ack = None, on_ack_args = [], on_ack_kwargs = {}):
+        def _on_ack(cmd, error, data):
+            if len(data) % 6 != 0:
+                self._logger.warning(f"Get receivers: ACK incomplete ({len(data)} bytes)") 
             receivers = []
-            # Začneme za hlavičkou ACK, což jsou 8 bajtů podle předpokladu
-            offset = 8
+            offset = 0
             while offset + 6 <= len(data):
                 ip = socket.inet_ntoa(data[offset:offset + 4])
                 port = struct.unpack('<H', data[offset + 4:offset + 6])[0]
                 receivers.append(f"{ip}:{port}")
                 offset += 6
             if receivers:
-                self._logger.info("Registred receivers:\n" + "\n".join(receivers))
+                self._logger.info("Registered receivers:\n" + "\n".join(receivers))
             else:
-                self._logger.warning("No Registred receivers")
+                self._logger.info("Get receivers: no registered receivers")
+            if on_ack is not None:
+                on_ack(error, receivers, *on_ack_args, **on_ack_kwargs)
+        try:
+            self.send_command(CMD.GET_RECEIVERS, struct.pack('<B', source),
+                              on_timeout = self.on_timeout, on_timeout_args=(None, on_timeout, on_timeout_args, on_timeout_kwargs),
+                              on_ack = _on_ack )
         except Exception as e:
             self._logger.error(f"Get receivers: {e}")
-    
-    def start_sampling(self):
-        self.sampling_thread.received_packets = 0
-        self.num_packets = self.num_packets_spinbox.value()
-        data = struct.pack('<I', self.num_packets)
-        if self.channels_count == 0:
-            self._logger.error("Need Get ID at first")
+            if on_timeout is not None:
+                on_timeout(*on_timeout_args, **on_timeout_kwargs)
+
+    def _start_sampling(self, name, cmd, packet_count, on_timeout=None, on_timeout_args=[], on_timeout_kwargs={}, on_ack=None, on_ack_args=[], on_ack_kwargs={}):
+        def _on_ack(cmd, error, data):
+            requested_packets = struct.unpack_from('<I', data, 0)[0]
+            if self.packet_count != requested_packets:
+                self._logger.warning(f"{name}: sent count ({self.packet_count}) not equal to received count ({requested_packets})")
+            else:
+                self._logger.info(f"{name}: sent packets count: {self.packet_count}")
+            self.is_sampling = True
+            if on_ack is not None:
+                on_ack(error, requested_packets, *on_ack_args, **on_ack_kwargs)
+        self.packet_count = packet_count
+        data = struct.pack('<I', self.packet_count)
+        if self.channels_count is None or self.channels_count == 0:
+            def repeat():
+                if self.channels_count == 0:
+                    self._logger.error(f"{name}: device with 0 channels")
+                    if on_timeout is not None:
+                        on_timeout(*on_timeout_args, **on_timeout_kwargs)
+                else: 
+                    self._start_sampling(name, cmd, packet_count, on_timeout, on_timeout_args, on_timeout_kwargs, on_ack, on_ack_args, on_ack_kwargs)
+            msg = f"{name}: get id failed"
+            self.get_id(on_timeout = self.on_timeout, on_timeout_args = (msg, on_timeout, on_timeout_args, on_timeout_kwargs), 
+                        on_ack = repeat)
             return
 
-        resp = self.send_command(CMD.START_SAMPLING, data, expect_response=True)
+        try:
+            self.send_command(cmd, data, 
+                              on_timeout = self.on_timeout, on_timeout_args = (None, on_timeout, on_timeout_args, on_timeout_kwargs), 
+                              on_ack = _on_ack)
+        except Exception as e:
+            self._logger.error(f"{name}: {e}")
+            if on_timeout is not None:
+                on_timeout(*on_timeout_args, **on_timeout_kwargs)
 
-        self._logger.info(f"Start sampling, {self.num_packets} packets")
+    def start_sampling(self, packet_count, on_timeout=None, on_timeout_args=[], on_timeout_kwargs={}, on_ack=None, on_ack_args=[], on_ack_kwargs={}):
+        self._start_sampling("Start sampling", CMD.START_SAMPLING, packet_count, on_timeout, on_timeout_args, on_timeout_kwargs, on_ack, on_ack_args, on_ack_kwargs)
 
-    def start_on_trigger(self):
-            self.sampling_thread.received_packets = 0
-            self.num_packets = self.num_packets_spinbox.value()
-            data = struct.pack('<I', self.num_packets)
-            if self.channels_count == 0:
-                self._logger.error("Need Get ID at first")
-                return
+    def start_on_trigger(self, packet_count, on_timeout=None, on_timeout_args=[], on_timeout_kwargs={}, on_ack=None, on_ack_args=[], on_ack_kwargs={}):
+        self._start_sampling("Start on trigger", CMD.START_ON_TRIGGER, packet_count, on_timeout, on_timeout_args, on_timeout_kwargs, on_ack, on_ack_args, on_ack_kwargs)
 
-            resp = self.send_command(CMD.START_ON_TRIGGER, data, expect_response=True)
-
-            self._logger.info(f"Waiting on trigger, {self.num_packets} packets")
-
-    def stop_sampling(self):
-        if self.sampling_thread and self.sampling_thread.isRunning():
-            self._logger.info(f"Stop sampling, received packets: {self.sampling_thread.received_packets}")
-            resp = self.send_command(CMD.STOP_SAMPLING, expect_response=True)
-            
-            if resp and len(resp) >= 16:  # 2+2+4+8 = 16 bajtů
-                packet_type, error_state, cmd_type, packets_sent = struct.unpack('<HHIQ', resp[:16])
-                
-                if packet_type == PACKET.ACK_packet and cmd_type == CMD.STOP_SAMPLING:
-                    self._logger.debug(f"Stop sampling confirmed, packets sent by divice: {packets_sent}")
-                    if packets_sent != self.sampling_thread.received_packets:
-                        self._logger.warning(f"Packet from device ({packets_sent}) not equal to recv packets ({self.sampling_thread.received_packets}) ")
-                else:
-                    self._logger.warning(f"Stop sampling: unexpected ACK structure or CMD")
-            else:
-                self._logger.warning(f"Stop sampling: no or invalid ACK response")
-            
-            self.sampling_thread.flush_packet_buffer()
-            self.update_plot_buffered()
+    def stop_sampling(self, on_timeout=None, on_timeout_args=[], on_timeout_kwargs={}, on_ack=None, on_ack_args=[], on_ack_kwargs={}):
+        if self.is_sampling:
+            try:
+                self.send_command(CMD.STOP_SAMPLING, 
+                                  on_timeout = self.on_timeout, on_timeout_args = (None, on_timeout, on_timeout_args, on_timeout_kwargs),
+                                  on_ack = lambda cmd, error, data: self.ack_on_stop_sampling(cmd, error, data, on_ack, on_ack_args, on_ack_kwargs))
+            except Exception as e:
+                self._logger.error(f"Stop sampling failed: {e}")
+                if on_timeout is not None:
+                    on_timeout(*on_timeout_args, **on_timeout_kwargs)
         else:
-            self._logger.info("Sampling is already stopped")
- 
+            self._logger.info("Sampling is not running")
+
     def send_trigger(self):
         try:
-            resp = self.send_command(CMD.FORSE_TRIGGER)
-            self._logger.info("Sent trigger (CMD 9)")
-        
+            self.send_command(CMD.FORCE_TRIGGER)
+            self._logger.info("Sent trigger")
         except Exception as e:
             self._logger.error(f"Trigger send: {e}")
+
+    def reset_counters(self, on_timeout=None, on_timeout_args=[], on_timeout_kwargs={}, on_ack=None, on_ack_args=[], on_ack_kwargs={}):
+        def _on_ack(cmd, error, data):
+            self.max_packet_num = -1
+            self.lost_packets = 0
+            self.error_packets = 0
+            self.packet_counter = 0
+            self.last_packet_num = None
+            self.packet_counter_cycle = 0
+            if on_ack is not None:
+                on_ack(error, data, *on_ack_args, **on_ack_kwargs)
+        try:
+            self.send_command(CMD.RESET_COUNTERS, 
+                              on_timeout = self.on_timeout, on_timeout_args=(None, on_timeout, on_timeout_args, on_timeout_kwargs),
+                              on_ack = _on_ack)
+        except Exception as e:
+            self._logger.error(f"Reset counters: {e}")
+            if on_timeout is not None:
+                on_timeout(*on_timeout_args, **on_timeout_kwargs)
+
+    def clock_config(self, external_clock: bool, clock_output: bool, save: bool, on_timeout=None, on_timeout_args=[], on_timeout_kwargs={}, on_ack=None, on_ack_args=[], on_ack_kwargs={}):
+        def _on_ack(cmd, error, data):
+            if len(data) < 2:
+                self._logger.error(f"Clock config: ACK to short ({len(data)} bytes)")
+                if on_timeout is not None:
+                    on_timeout(*on_timeout_args, **on_timeout_kwargs)
+                return
+            old_cfg, new_cfg = struct.unpack_from('<BB', data)
+            self._logger.info(
+                f"Clock config:\n"
+                f"Old config: {old_cfg:02X}\n"
+                f"New config: {new_cfg:02X}"
+            )
+            if on_ack is not None:
+                on_ack(error, old_cfg, new_cfg, *on_ack_args, **on_ack_kwargs)
+        try:
+            data = struct.pack('<BB', 
+                               (1 if external_clock else 0) | 
+                               (2 if clock_output   else 0), 
+                               SAVE_KEY if save else 0)
+            self.send_command(CMD.CLOCK_CONFIG, data,
+                              on_timeout = self.on_timeout, on_timeout_args=(None, on_timeout, on_timeout_args, on_timeout_kwargs),
+                              on_ack = _on_ack)
+        except Exception as e:
+            self._logger.error(f"Clock config: {e}")
+            if on_timeout is not None:
+                on_timeout(*on_timeout_args, **on_timeout_kwargs)
+
+    def get_acquisition_state(self, on_timeout=None, on_timeout_args=[], on_timeout_kwargs={}, on_ack=None, on_ack_args=[], on_ack_kwargs={}):
+        def _on_ack(cmd, error, data):
+            if len(data) < 9:
+                self._logger.error(f"Get acquisition state: ACK to short ({len(data)} bytes)")
+                if on_timeout is not None:
+                    on_timeout(*on_timeout_args, **on_timeout_kwargs)
+                return  
+            acquired_samples, target_samples, state = struct.unpack_from('<IIB', data)
+            self._logger.info(
+                f"Get acquisition state:\n"
+                f"Acquired samples: {acquired_samples}\n"
+                f"Target samples: {target_samples}\n"
+                f"State: {state:02X}"
+            )
+            if on_ack is not None:
+                on_ack(error, acquired_samples, target_samples, state, *on_ack_args, **on_ack_kwargs)
+        try:
+            self.send_command(CMD.GET_ACQUISITION_STATE,
+                              on_timeout = self.on_timeout, on_timeout_args=(None, on_timeout, on_timeout_args, on_timeout_kwargs),
+                              on_ack = _on_ack)
+        except Exception as e:
+            self._logger.error(f"Get acquisition state: {e}")
+            if on_timeout is not None:
+                on_timeout(*on_timeout_args, **on_timeout_kwargs)
+
+    def device_id_config(self, device_id: int, save: bool, on_timeout=None, on_timeout_args=[], on_timeout_kwargs={}, on_ack=None, on_ack_args=[], on_ack_kwargs={}):
+        try:
+            data = struct.pack('<IB', device_id, SAVE_KEY if save else 0)
+            self.send_command(CMD.DEVICE_ID_CONFIG, data,
+                              on_timeout = self.on_timeout, on_timeout_args=(None, on_timeout, on_timeout_args, on_timeout_kwargs),
+                              on_ack = self.on_ack, on_ack_args=(None, on_ack, on_ack_args, on_ack_kwargs))
+        except Exception as e:
+            self._logger.error(f"Device ID config: {e}")
+            if on_timeout is not None:
+                on_timeout(*on_timeout_args, **on_timeout_kwargs)
+
+    def reset_device(self, on_timeout=None, on_timeout_args=[], on_timeout_kwargs={}, on_ack=None, on_ack_args=[], on_ack_kwargs={}):
+        try:
+            self.send_command(CMD.RESET_DEVICE, struct.pack('<B', RESET_KEY),
+                              on_timeout = self.on_timeout, on_timeout_args=(None, on_timeout, on_timeout_args, on_timeout_kwargs),
+                              on_ack = self.on_ack, on_ack_args=(None, on_ack, on_ack_args, on_ack_kwargs))
+        except Exception as e:
+            self._logger.error(f"Reset device: {e}")
+            if on_timeout is not None:
+                on_timeout(*on_timeout_args, **on_timeout_kwargs)
+
+    def get_clock_config(self, on_timeout=None, on_timeout_args=[], on_timeout_kwargs={}, on_ack=None, on_ack_args=[], on_ack_kwargs={}):
+        def _on_ack(cmd, error, data):
+            if len(data) < 2:
+                self._logger.error(f"Get clock config: ACK to short ({len(data)} bytes)")
+                if on_timeout is not None:
+                    on_timeout(*on_timeout_args, **on_timeout_kwargs)
+                return
+            active_cfg, stored_cfg = struct.unpack_from('<BB', data)
+            self._logger.info(
+                f"Get clock config:\n"
+                f"Active config: {active_cfg:02X}\n"
+                f"Stored config: {stored_cfg:02X}"
+            )
+            if on_ack is not None:
+                on_ack(error, active_cfg, stored_cfg, *on_ack_args, **on_ack_kwargs)
+        try:
+            self.send_command(CMD.GET_CLOCK_CONFIG,
+                              on_timeout = self.on_timeout, on_timeout_args=(None, on_timeout, on_timeout_args, on_timeout_kwargs),
+                              on_ack = _on_ack)
+        except Exception as e:
+            self._logger.error(f"Get clock config: {e}")
+            if on_timeout is not None:
+                on_timeout(*on_timeout_args, **on_timeout_kwargs)

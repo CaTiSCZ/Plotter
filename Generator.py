@@ -34,6 +34,7 @@ START_ON_TRIGGER = 6
 STOP_SAMPLING = 7
 TRIGGER_ACK = 8
 FORSE_TRIGGER =	9
+RESET_COUNTER = 10
 #127.0.0.1:9999
 
 class MultiSignalTestGenerator:
@@ -56,6 +57,7 @@ class MultiSignalTestGenerator:
         self.wait_for_trigger = False
         self.wait_for_response = False
         self.print_queue = Queue()
+        self.stop_ack_addr = None
 
     def start(self):
         self.running = True 
@@ -98,15 +100,19 @@ class MultiSignalTestGenerator:
                 self.sock.sendto(response, addr)
 
             elif command_type == GET_ID:
+                self.print("Přijat požadavek na ID.")
                 self._send_identification_packet(addr)
                 
             elif command_type == REGISTER_RECEIVER:
+                self.print("Přijat požadavek na registraci příjemce.")
                 self._register_receiver(cmd_data, addr)
 
             elif command_type == REMOVE_RECEIVER:
+                self.print("Přijat požadavek na odstranění příjemce.")
                 self._remove_receiver(cmd_data, addr)
 
             elif command_type == GET_RECEIVERS:
+                self.print("Přijat požadavek na seznam příjemců.")
                 self._send_receivers_list(addr)
 
             elif command_type == START_SAMPLING or command_type == START_ON_TRIGGER: 
@@ -118,6 +124,7 @@ class MultiSignalTestGenerator:
                 self.print(f"Přijat příkaz: typ={command_type}, počet paketů={num_packets}")
 
                 self.num_packets_to_send = num_packets
+                self.stop_ack_addr = addr
                 
                 if command_type == START_SAMPLING:
                     self._start_sampling()
@@ -129,21 +136,21 @@ class MultiSignalTestGenerator:
                 self.sock.sendto(response, addr)
             
             elif command_type == STOP_SAMPLING:
-                # Stop sampling
-                self.sampling = False
-                self.print(f"[INFO] Sampling zastaven, odesláno paketů: {self.packets_sent}")
-
-                # Odpověď: ACK + CMD + počet odeslaných paketů
-                response = struct.pack('<HHIQ', ACK_packet, 0, command_type, self.packets_sent)
-                self.sock.sendto(response, addr)
+                self._stop_sampling(addr, command_type)
 
             elif command_type == TRIGGER_ACK:
                 self.print("[INFO] Přijat Trigger ACK(CMD 8)")
                 self.wait_for_response = False
 
             elif command_type == FORSE_TRIGGER:
+                self.print("[INFO] Přijat FORSE TRIGGER(CMD 9)")
                 self.wait_for_trigger == False
                 self._trigger()
+            elif command_type == RESET_COUNTER:
+                self.packet_id = 0
+                response = struct.pack('<HHI', ACK_packet, 0, command_type)  # Packet type, error, CMD
+                self.sock.sendto(response, addr)
+                self.print("Counter reset.")
 
             else:
                 self.print(f"Neznámý příkaz typu {command_type}")
@@ -282,6 +289,21 @@ class MultiSignalTestGenerator:
             self.sender_thread = threading.Thread(target=self._send_data_to_all_receivers, daemon=True)
             self.sender_thread.start()
 
+    def _stop_sampling(self, addr=None, command_type=7):
+        self.sampling = False
+        if self.num_packets_to_send == 0:
+            self.print(f"[INFO] Sampling zastaven, odesláno paketů: {self.packets_sent}")
+        elif self.num_packets_to_send > 0:
+            self.print(f"[INFO] Všechny požadované pakety odeslány ({self.packets_sent} / {self.num_packets_to_send}).")
+
+        # Odpověď: ACK + CMD + počet odeslaných paketů
+        response = struct.pack('<HHIQ', ACK_packet, 0, command_type, self.packets_sent)
+        if addr is not None:    
+            self.sock.sendto(response, addr)
+            self.print(f"Odeslána odpověď: {addr}")
+        else:
+            self.print("Není komu poslat ack")
+
     def _trigger(self):
         self.print("Přijat trigger")
         if self.sampling == True:
@@ -377,8 +399,7 @@ class MultiSignalTestGenerator:
             self.packets_sent += 1
 
             if self.num_packets_to_send != 0 and self.packets_sent >= self.num_packets_to_send:
-                self.print(f"[INFO] Všechny požadované pakety odeslány ({self.packets_sent} / {self.num_packets_to_send}).")
-                self.sampling = False  # automaticky zastavit sampling
+                self._stop_sampling(addr=self.stop_ack_addr)  # automaticky zastavit sampling
 
             t = time.monotonic()
             t_send += self.interval
