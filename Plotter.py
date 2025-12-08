@@ -203,6 +203,8 @@ class Plotter:
         self.gui.lost_packets_value.setText(str(total_lost))
         self.gui.err_packets_value.setText(str(total_errors))
         self.gui.recv_packets_value.setText(str(f"{total_received} ({total_lost + total_errors + total_received})"))
+
+        self.gui.queued_packets_value.setText(str(self.data_socket.socket.get_buffered_items_count()))
     
     def _reset_counters(self):
         self.device_manager.reset_counters()
@@ -269,6 +271,7 @@ class Plotter:
         ip, port = self.gui.dev_ip_edit[0].text().split(":")
         self.cmd_socket.socket.bind((int(self.gui.command_port_edit.text())), use_my_ip = True, device_ip = ip, device_port = int(port))
         self.data_socket.socket.bind((int(self.gui.data_port_edit.text())), use_my_ip = True, device_ip = ip, device_port = int(port))
+    
     def start_sampling(self, on_trigger):
         self.num_packets = self.gui.num_packets_spinbox.value()
         if on_trigger:

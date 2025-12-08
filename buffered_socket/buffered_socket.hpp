@@ -141,8 +141,13 @@ public:
         DWORD tv = (DWORD)(timeout_ * 1000);
         setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
     }
-
+    
     int get_received_count() {
+        std::lock_guard<std::mutex> l(recv_mutex_);
+        return received_count_;
+    }
+
+    int get_buffered_items_count() {
         std::lock_guard<std::mutex> l(recv_mutex_);
         return (int)receive_buffer_.size();
     }

@@ -40,6 +40,7 @@ PYBIND11_MODULE(buffered_socket_cpp, m) {
         })
         .def("settimeout", &BufferedSocket::settimeout)
         .def("get_received_count", &BufferedSocket::get_received_count)
+        .def("get_buffered_items_count", &BufferedSocket::get_buffered_items_count)
         .def("__bool__", [](const BufferedSocket& self) {
             return self.sock_ != INVALID_SOCKET && self.running_;
         });
