@@ -20,12 +20,22 @@ class AsyncSocket:
     def _listen_loop(self):
         while self._running:
             try:
+                # Kontrola, jestli socket existuje a je svázán
+                if not self.socket:
+                    time.sleep(0.1)  # Krátké čekání, než bude socket připraven
+                    continue
+                    
                 data, addr = self.socket.recvfrom(self.max_size)
                 #print(f"[DEBUG] Příchozí data od {addr}: {data}")
                 if self._on_packet is not None:
                     self._on_packet(self, data, addr)
             except socket.timeout:
                 #print("timeout")
+                continue
+            except Exception as e:
+                # Ignoruj chyby pokud socket není připraven
+                if self._running:
+                    time.sleep(0.1)
                 continue
     def register(self, callback):
         self._on_packet = callback

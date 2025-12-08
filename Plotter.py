@@ -1,18 +1,7 @@
 import logging
 import logger
-from contextlib import ExitStack
 
-import numpy as np
-import pyqtgraph as pg
-from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget, QPushButton, QGridLayout, QApplication, QSpinBox, QDoubleSpinBox, \
-    QCheckBox, QTextEdit, QScrollArea, QLineEdit, QDesktopWidget, QSizePolicy 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QFont
-import time
-
-from config_parser import ConfigParser  
-
-USE_PYTHON_SOCKET = True
+USE_PYTHON_SOCKET = False
 if USE_PYTHON_SOCKET:
     from buffered_socket_py import BufferedSocket
 else:
@@ -20,6 +9,14 @@ else:
     print("Importuji C++ BufferedSocket...")
     buffered_socket = cppimport.imp("buffered_socket.buffered_socket_cpp")
     BufferedSocket = buffered_socket.BufferedSocket
+    print("C++ BufferedSocket importován")
+
+from contextlib import ExitStack
+
+import pyqtgraph as pg
+from PyQt5.QtWidgets import QApplication
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont
 
 from async_socket import AsyncSocket
 from device_manager import DeviceManager
@@ -46,6 +43,7 @@ class Plotter:
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self._logger.debug("Plotter GUI start")
 
+# === Sockets ===
         self.cmd_socket = AsyncSocket(BufferedSocket(name="cmd_buffered"), name="cmd_async")
         self.data_socket = AsyncSocket(BufferedSocket(name="data_buffered"), name="data_async")
 

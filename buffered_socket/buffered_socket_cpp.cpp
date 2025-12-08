@@ -13,7 +13,7 @@ PYBIND11_MODULE(buffered_socket_cpp, m) {
     py::object py_socket_timeout = py_socket.attr("timeout");
     py::register_exception<buffered_socket::SocketTimeout>(m, "SocketTimeout", py_socket_timeout.ptr());
     py::class_<BufferedSocket>(m, "BufferedSocket")
-        .def(py::init<int>(), py::arg("max_size") = 4096)
+        .def(py::init<int, const std::string&>(), py::arg("max_size") = 4096, py::arg("name") = "BufferedSocket")
         .def("bind", &BufferedSocket::bind, py::arg("port"), py::arg("use_my_ip")=false, py::arg("device_ip")="192.168.1.100", py::arg("device_port")=9999)
         .def("close", &BufferedSocket::close)
         .def("sendto", [](BufferedSocket& self, py::bytes data, py::tuple addr) {
@@ -39,7 +39,10 @@ PYBIND11_MODULE(buffered_socket_cpp, m) {
                                   py::make_tuple(result.second.first, result.second.second));
         })
         .def("settimeout", &BufferedSocket::settimeout)
-        .def("get_received_count", &BufferedSocket::get_received_count);
+        .def("get_received_count", &BufferedSocket::get_received_count)
+        .def("__bool__", [](const BufferedSocket& self) {
+            return self.sock_ != INVALID_SOCKET && self.running_;
+        });
 }
 
 /*

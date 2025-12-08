@@ -30,9 +30,9 @@ public:
 template<typename Container>
 class BufferedSocket {
 public:
-    BufferedSocket(int max_size = 4096)
+    BufferedSocket(int max_size = 4096, const std::string& name = "BufferedSocket")
         : max_size_(max_size), running_(false), sock_(INVALID_SOCKET),
-          timeout_(1.0), received_count_(0)
+          timeout_(1.0), received_count_(0), name_(name)
     {
         WinsockManager::ensure_initialized();
     }
@@ -153,6 +153,12 @@ public:
 private:
     void listen_loop() {
         while (running_) {
+            // Kontrola, jestli je socket platný
+            if (sock_ == INVALID_SOCKET) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            
             sockaddr_in src_addr{};
             int addrlen = sizeof(src_addr);
             Container buffer;
@@ -182,6 +188,12 @@ private:
                 item = std::move(send_buffer_.front());
                 send_buffer_.pop();
             }
+            
+            // Kontrola, jestli je socket platný před odesláním
+            if (sock_ == INVALID_SOCKET) {
+                continue;
+            }
+            
             ::sendto(sock_, (const char*)item.first.data(), (int)item.first.size(),
                    0, (sockaddr*)&item.second, sizeof(item.second));
         }
@@ -209,6 +221,7 @@ private:
     std::condition_variable send_cv_;
 
     int received_count_;
+    std::string name_;
 };
 
 } // namespace bufferred_socket
