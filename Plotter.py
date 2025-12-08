@@ -12,8 +12,15 @@ import time
 
 from config_parser import ConfigParser  
 
+USE_PYTHON_SOCKET = True
+if USE_PYTHON_SOCKET:
+    from buffered_socket_py import BufferedSocket
+else:
+    import cppimport
+    print("Importuji C++ BufferedSocket...")
+    buffered_socket = cppimport.imp("buffered_socket.buffered_socket_cpp")
+    BufferedSocket = buffered_socket.BufferedSocket
 
-from buffered_socket import BufferedSocket
 from async_socket import AsyncSocket
 from device_manager import DeviceManager
 from gui import Gui
