@@ -36,17 +36,11 @@ class DeviceManager:
         except KeyError:
             self._logger.warning(f"Packet handler:Received packet from unknown device: {addr}")
 
-    def _data_timeout_handler(self):
-        last_value = self._data_socket.socket.get_buffered_items_count()
+    def _data_timeout_handler(self):    
         while self.data_timeout_processor_running:
-            value = self._data_socket.socket.get_buffered_items_count()
-            self._logger.debug(f"Buffered items count: {value}")
-            if value == 0 and last_value != 0:
-                self._logger.info("Data buffer emptied, sampling finished")
-                for device in self._devices.values():
-                    device.sampling_finished()
-            last_value = value
-            time.sleep(0.1)
+            for device in self._devices.values():
+                device.sampling_finished()
+            time.sleep(0.5)
 
     def add_device(self, addr):
         device = Device(self._cmd_socket, addr)

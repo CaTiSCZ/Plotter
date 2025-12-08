@@ -132,6 +132,9 @@ class Device:
         self.lost_packets = 0
         self.error_packets = 0
         self.pending_ack_on_stop_sampling = None
+        self.last_value = None
+        self.receiving_data = False
+        self.transmiter_sent_packets = 0
 
         # Inicializace prázdných bufferů
         self.raw_buffer = np.array([])
@@ -291,7 +294,8 @@ class Device:
                         self.raw_buffer_write_max = max(self.raw_buffer_write_max, buffer_write_end)
                         self.raw_buffer_read_size = min(self.raw_buffer_write_max - self.buffer_start_index, self.buffer_size)
                     self.raw_buffer_read_index = self.raw_buffer_write_max - self.raw_buffer_read_size
-                    if (lost:=(packet_num - self.max_packet_num)) > 1: #and self.max_packet_num > -1
+                    
+                    if (lost:=(packet_num - self.max_packet_num)) > 1 and self.max_packet_num > -1:
                         lost -= 1
                         self.lost_packets += lost
                         self._logger.warning(f"Lost packets detected. Count: {lost}, {self.lost_packets} total.")
@@ -340,13 +344,25 @@ class Device:
             on_ack(error, data, *on_ack_args, **on_ack_kwargs)
 
     def sampling_finished(self):
-        if self.pending_ack_on_stop_sampling is not None:
-            cmd, error, data, record = self.pending_ack_on_stop_sampling
-            self.pending_ack_on_stop_sampling = None
-            self._ack_on_stop_sampling(cmd, error, data, record.on_ack, *record.on_ack_args, **record.on_ack_kwargs)
+        value = self.last_packet_num
+        if value == self.last_value:
+            if self.receiving_data:
+                self.receiving_data = False
+                self._logger.info("No new packet, sampling finished")
+                if self.pending_ack_on_stop_sampling is not None:
+                    cmd, error, data, record = self.pending_ack_on_stop_sampling
+                    self.pending_ack_on_stop_sampling = None
+                    if record is None:
+                        record = type('Record', (object,), {})()
+                        record.on_ack, record.on_ack_args, record.on_ack_kwargs = None, [], {}
+                    self._ack_on_stop_sampling(cmd, error, data, record.on_ack, *record.on_ack_args, **record.on_ack_kwargs)
+        else:
+            self.receiving_data = True
+            self.last_value = value
 
     def _ack_on_stop_sampling(self, cmd, error, data, on_ack = None, on_ack_args = [], on_ack_kwargs = {}):
-        sent_packets = struct.unpack_from('<I', data, 0)[0]
+        sent_packets = struct.unpack_from('<I', data, 0)[0] + self.transmiter_sent_packets
+        self.transmiter_sent_packets = sent_packets
         if self.packet_counter != sent_packets:
             self._logger.warning(f"Stop sampling: received packets ({self.packet_counter}) not equal to sent packets ({sent_packets})")
         else:
