@@ -43,7 +43,7 @@ def _assign_id(new_id: int):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python assign_id.py <ID>")
+        print("Usage: python assign_id.py <ID> [<IP_ADDRESS>]")
         sys.exit(1)
     id = int(sys.argv[1])
     if len(sys.argv) == 3:

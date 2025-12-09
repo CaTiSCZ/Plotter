@@ -46,6 +46,7 @@ RECV_TIMEOUT_S     = 0.3
 SAMPLES_PER_PACKET = 200
 PACKET_RATE_HZ     = 1000
 SAMPLING_PERIOD    = 1/(SAMPLES_PER_PACKET*PACKET_RATE_HZ)
+PACKET_PERIOD      = 1/(PACKET_RATE_HZ)
 BUFFER_LENGTH_S    = 30
 BUFFER_SIZE        = int(BUFFER_LENGTH_S*SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 DEFAULT_AVG_LEN_MS = 1000
@@ -142,6 +143,7 @@ class Device:
     PKT_TYPE_ACK = 0
     PKT_TYPE_DATA = 2
     PKT_TYPE_LOG  = 4
+    PKT_TYPE_RESULT  = 5
 
     def __init__(self, ip:str, cmd_port:int, data_port:int, loop):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
@@ -267,6 +269,18 @@ class Device:
                 log_msg = pkt[4:].decode('utf-8').strip()
                 self._logger.info(f"Dev {self.ip} log[{order}]: {log_msg}")
                 return
+            case self.PKT_TYPE_RESULT:
+                data = _verify_crc(pkt)
+                if not data:
+                    return
+                t = [order + 1]
+                samples = []
+                result_code = struct.unpack('<H', data[4:6])
+                samples.append(result_code)
+                errs = list(data[6:10])
+                self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
+                self._logger.info(f"Dev {self.ip} packetNumber[{order}]: result {result_code}")
+                return order
 
 # Manager of multiple devices
 class DeviceManager:
@@ -475,7 +489,7 @@ class Plotter(QWidget):
                           ('Save Measurement'               , self.save_measurement                 ),
                           ('Force trigger'                  , self._force_trigger                   ),
                           #('Stop Sampling'                  , self._stop_sampling                   ),
-                          #('Reset Counter'                  , self._reset_counter                   ),
+                          ('Reset Counter'                  , self._reset_counter                   ),
                           #('Clean Graf'                     , self.clear_plot                       ),
                           #('Penetrate Firewall'             , self._penetrate_firewall              ),
                           #('Save Data'                      , self.save_data                        ),
@@ -497,17 +511,16 @@ class Plotter(QWidget):
 
         # Detection plot
         self.plot_widget.nextRow()  # move to next row in the graphics layout
-        self.ax_bits = self.plot_widget.addPlot(title='Detection result')
-        self.ax_bits.showGrid(x=True, y=True, alpha=0.3)
-        self.ax_bits.setLabel('bottom', 'Time', units='s')
-        self.ax_bits.setLabel('left', 'Bit value')
-        self.ax_bits.addLegend()
+        self.ax_result = self.plot_widget.addPlot(title='Detection result')
+        self.ax_result.showGrid(x=True, y=True, alpha=0.3)
+        self.ax_result.setLabel('bottom', 'Time', units='s')
+        self.ax_result.setLabel('left', 'Errors')
+        self.ax_result.addLegend()
         # Link x-axis so both plots share the same time base and zoom/pan together
-        self.ax_bits.setXLink(self.ax)
+        self.ax_result.setXLink(self.ax)
         # curves for individual bits (bit index -> PlotDataItem)
-        self.bit_curves: Dict[int, pg.PlotDataItem] = {}
-        # Optional: set a comfortable y-range for bit+offsets
-        self.ax_bits.setYRange(0, 1)
+        self.ax_result_curves: Dict[int, pg.PlotDataItem] = {}
+        self.ax_result.setYRange(0, 1)
 
         self.error_lbl = QLabel()
         self.error_lbl.setStyleSheet('font-family: monospace')
@@ -536,7 +549,7 @@ class Plotter(QWidget):
         self.timer.timeout.connect(self._update_plot)
         self.timer.start()
 
-        self.data_ready.connect(self._check_order)
+        #self.data_ready.connect(self._check_order) # TODO: enable packet order checking
 
     def closeEvent(self, event):
         super().closeEvent(event)
@@ -752,12 +765,14 @@ class Plotter(QWidget):
             for l in k:
                 l.blockSignals(False)
 
-    def _save_clock_config(self):
-        reply = QMessageBox.question(self, "Save?",
-                                     "Do you really want to save clock configuration to EEPROM?",
-                                     QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
+    def _save_clock_config(self, save=True):
+        if save:
+            reply = QMessageBox.question(self, "Save?",
+                                        "Do you really want to save clock configuration to EEPROM?",
+                                        QMessageBox.Yes | QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            
         for row in range(DeviceManager.MAX_DEVICES):
             if not self.device_checks[row].isChecked():
                 continue
@@ -766,7 +781,10 @@ class Plotter(QWidget):
             if dev is not None:
                 enabled = self.device_clock_enables[row].isChecked()
                 external = self.device_clock_sources[row].isChecked()
-                dev.set_clock_ctrl(external=external, enabled=enabled, save=True)
+                dev.set_clock_ctrl(external=external, enabled=enabled, save=save)
+    
+    def _set_clock_config(self):
+        self._save_clock_config(False)
 
     def clear_plot(self):
         for dev in self.manager.devices.values():
@@ -777,10 +795,9 @@ class Plotter(QWidget):
         self.ax.clear()
         self.curves.clear()
 
-        if hasattr(self, 'ax_bits'):
-            self.ax_bits.clear()
-        if hasattr(self, 'bit_curves'):
-            self.bit_curves.clear()
+        #if hasattr(self, 'ax_result'):
+        self.ax_result.clear()
+        self.ax_result_curves.clear()
 
         self._update_plot()
         self._logger.info('Graf cleaned')
@@ -822,45 +839,59 @@ class Plotter(QWidget):
 
     def _update_plot(self):
         lines = []
-        for (ip, dev) in self.manager.devices.items():
+        #for (ip, dev) in self.manager.devices.items():
+        for dev_index, (ip, dev) in enumerate(self.manager.devices.items()):
             buf = dev.buffer
             if not buf.time:
                 continue
             with buf.lock:
-                # Data processing + statistics
-                x = np.array(buf.signal[0]) * SAMPLING_PERIOD
-                avgs = [0] * dev.channels
-                for ch in range(dev.channels):
-                    key = (ip, ch)
-                    if key not in self.curves:
-                        self.curves[key] = self.ax.plot(pen=Plotter.Colors[len(self.curves)], name=f'{ip}[{ch}]')
-                    y = np.array(buf.signal[ch + 1])[-len(x):]
-                    avgs[ch] = np.mean(y[-min(len(y), SAMPLES_PER_PACKET * DEFAULT_AVG_LEN_MS):])
-                    self.curves[key].setData(x[-len(y):], y)
-                errs = ','.join(str(sum(list(buf.error[c])[-SAMPLES_PER_PACKET:])) for c in range(dev.channels))
+                # Data processing
+                if (dev_index != 4): # TODO: index compare by constant
+                    x = np.array(buf.signal[0]) * SAMPLING_PERIOD
+                    avgs = [0] * dev.channels
+                    for ch in range(dev.channels):
+                        key = (ip, ch)
+                        if key not in self.curves:
+                            self.curves[key] = self.ax.plot(pen=Plotter.Colors[len(self.curves)], name=f'{ip}[{ch}]')
+                        y = np.array(buf.signal[ch + 1])[-len(x):]
+                        avgs[ch] = np.mean(y[-min(len(y), SAMPLES_PER_PACKET * DEFAULT_AVG_LEN_MS):])
+                        self.curves[key].setData(x[-len(y):], y)
+                
+                    # Error calculation
+                    errs = ','.join(str(sum(list(buf.error[c])[-SAMPLES_PER_PACKET:])) for c in range(dev.channels))
+
+                    # Statistics part
+                    received = int(len(x)//SAMPLES_PER_PACKET)
 
                 # Result processing
-                if (dev == self.manager.devices.items[CCU_DEVICE_INDEX] and dev.channels > 0 and hasattr(self, 'ax_bits')):
+                else:
+                    x = np.array(buf.signal[1]) * PACKET_PERIOD
+                    avgs = [0]  # Dummy for uniform output
                     # Use first data channel (signal[1]) as byte source
                     y_src = np.array(buf.signal[1])[-len(x):]
-                    # Convert to unsigned bytes; mask to 8 bits
-                    byte_values = y_src.astype(np.int32) & 0xFF
+                    # Convert to unsigned bytes; mask to 16 bits
+                    byte_values = y_src.astype(np.int32) & 0xFFFF
 
-                    num_bits = 8
+                    num_bits = dev.channels
                     center = (num_bits - 1) / 2.0
-                    offset_step = 0.1  # vertical spacing between bit lines
+                    offset_step = 0.05  # vertical spacing between bit lines
 
                     for bit_idx in range(num_bits):
-                        if bit_idx not in self.bit_curves:
-                            color = Plotter.Colors[len(self.bit_curves) % len(Plotter.Colors)]
-                            self.bit_curves[bit_idx] = self.ax_bits.plot(pen=color, name=f'bit{bit_idx}')
+                        if bit_idx not in self.ax_result_curves:
+                            color = Plotter.Colors[len(self.ax_result_curves) % len(Plotter.Colors)]
+                            self.ax_result_curves[bit_idx] = self.ax_result.plot(pen=color, name=f'bit{bit_idx}')
+                            #self.ax_result_curves[bit_idx] = self.ax_result.step(pen=color, where='post', name=f'bit{bit_idx}')
 
                         bit_vals = ((byte_values >> bit_idx) & 1).astype(float)
                         # Slight offset so bits with same logical value are still visible
                         offset = (bit_idx - center) * offset_step
                         y_bits = bit_vals + offset
 
-                        self.bit_curves[bit_idx].setData(x[-len(y_bits):], y_bits)
+                        self.ax_result_curves[bit_idx].setData(x[-len(y_bits):], y_bits)
+                        #self.ax_result.step(x[-len(y_bits):], y_bits, where='post', linewidth=2)
+                    
+                    # Statistics part
+                    received = int(len(x))
 
             # Statistics
             avgs = ', '.join(map(lambda v: f'{v:.3f}', avgs))
@@ -869,7 +900,7 @@ class Plotter(QWidget):
                 sent = 0
             else:
                 sent += 1
-            received = int(len(x)//SAMPLES_PER_PACKET)
+            #received = int(len(x)//SAMPLES_PER_PACKET)
             sent = max(sent, received) # sent is updated in data_ready signal, which can be delayed from receiving buffer on heavy load
             lines.append(f'{ip}: packets = {received}/{sent}/{self.expected_samples}; errs = {errs}; avg = {avgs}')
         self.error_lbl.setText(f'Statistic (ip: received / sent / expected packets (ms); channels parity errors; channels average per {DEFAULT_AVG_LEN_MS} ms):\n' + 
@@ -905,6 +936,7 @@ class Plotter(QWidget):
     def _apply_config(self):
         #self._penetrate_firewall()
         #for i, f in enumerate((self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._register_all, self._reset_counter)):
+        # TODO: add self._leader_changed
         for i, f in enumerate((self._ping_all, self._get_ids, self._register_all, self._register_ccu, self._reset_counter)):
             QTimer(self).singleShot(i * 100, f)
 
