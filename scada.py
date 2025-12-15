@@ -263,6 +263,9 @@ class Device:
                     samples.append(sig)
                     off += 2*SAMPLES_PER_PACKET
                 errs = list(data[off:off+self.channels])
+                off += self.channels
+                # result_code = struct.unpack('<H', data[4:6])
+                fault_state = data[off:off+2]
                 self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
                 return order
             case self.PKT_TYPE_LOG:
