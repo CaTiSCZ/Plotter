@@ -375,7 +375,7 @@ class Device:
             self.max_packet_num += missing_packets
             self._logger.warning(f"Stop sampling: missing packets: {missing_packets}")
         if on_ack is not None:
-            on_ack(error, sent_packets, *on_ack_args, **on_ack_kwargs)
+            on_ack(cmd, error, sent_packets, *on_ack_args, **on_ack_kwargs)
 
     def _init_buffer(self, *, channels_count = None, buffer_size = None):
         with self.buffer_lock:
@@ -601,7 +601,7 @@ class Device:
             try:
                 self.send_command(CMD.STOP_SAMPLING, 
                                   on_timeout = self.on_timeout, on_timeout_args = (None, on_timeout, on_timeout_args, on_timeout_kwargs),
-                                  on_ack = lambda cmd, error, data: self.ack_on_stop_sampling(cmd, error, data, on_ack, on_ack_args, on_ack_kwargs))
+                                  on_ack = on_ack, on_ack_args=on_ack_args, on_ack_kwargs=on_ack_kwargs)
             except Exception as e:
                 self._logger.error(f"Stop sampling failed: {e}")
                 if on_timeout is not None:
@@ -624,6 +624,8 @@ class Device:
             self.packet_counter = 0
             self.last_packet_num = None
             self.packet_counter_cycle = 0
+            self.transmiter_sent_packets = 0
+            self._logger.info("Reset counters")
             if on_ack is not None:
                 on_ack(error, data, *on_ack_args, **on_ack_kwargs)
         try:
