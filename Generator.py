@@ -58,6 +58,7 @@ class MultiSignalTestGenerator:
         self.wait_for_response = False
         self.print_queue = Queue()
         self.stop_ack_addr = None
+        self.lock = threading.Lock()
 
     def start(self):
         self.running = True 
@@ -94,66 +95,67 @@ class MultiSignalTestGenerator:
 
             command_type = struct.unpack('<I', cmd_data[:4])[0]
 
-            if command_type == PING:
-                self.print("Přijat ping.")
-                response = struct.pack('<HHI', ACK_packet, 0, command_type)  # Packet type, error, CMD
-                self.sock.sendto(response, addr)
+            with self.lock:
+                if command_type == PING:
+                    self.print("Přijat ping.")
+                    response = struct.pack('<HHI', ACK_packet, 0, command_type)  # Packet type, error, CMD
+                    self.sock.sendto(response, addr)
 
-            elif command_type == GET_ID:
-                self.print("Přijat požadavek na ID.")
-                self._send_identification_packet(addr)
-                
-            elif command_type == REGISTER_RECEIVER:
-                self.print("Přijat požadavek na registraci příjemce.")
-                self._register_receiver(cmd_data, addr)
-
-            elif command_type == REMOVE_RECEIVER:
-                self.print("Přijat požadavek na odstranění příjemce.")
-                self._remove_receiver(cmd_data, addr)
-
-            elif command_type == GET_RECEIVERS:
-                self.print("Přijat požadavek na seznam příjemců.")
-                self._send_receivers_list(addr)
-
-            elif command_type == START_SAMPLING or command_type == START_ON_TRIGGER: 
-                command_type = struct.unpack('<I', cmd_data[:4])[0]
-                if len(cmd_data) < 8:
-                    self.print(f"⚠️ CMD {command_type} má nedostatečnou délku.")
+                elif command_type == GET_ID:
+                    self.print("Přijat požadavek na ID.")
+                    self._send_identification_packet(addr)
                     
-                _, num_packets = struct.unpack('<II', cmd_data)
-                self.print(f"Přijat příkaz: typ={command_type}, počet paketů={num_packets}")
+                elif command_type == REGISTER_RECEIVER:
+                    self.print("Přijat požadavek na registraci příjemce.")
+                    self._register_receiver(cmd_data, addr)
 
-                self.num_packets_to_send = num_packets
-                self.stop_ack_addr = addr
+                elif command_type == REMOVE_RECEIVER:
+                    self.print("Přijat požadavek na odstranění příjemce.")
+                    self._remove_receiver(cmd_data, addr)
+
+                elif command_type == GET_RECEIVERS:
+                    self.print("Přijat požadavek na seznam příjemců.")
+                    self._send_receivers_list(addr)
+
+                elif command_type == START_SAMPLING or command_type == START_ON_TRIGGER: 
+                    command_type = struct.unpack('<I', cmd_data[:4])[0]
+                    if len(cmd_data) < 8:
+                        self.print(f"⚠️ CMD {command_type} má nedostatečnou délku.")
+                        
+                    _, num_packets = struct.unpack('<II', cmd_data)
+                    self.print(f"Přijat příkaz: typ={command_type}, počet paketů={num_packets}")
+
+                    self.num_packets_to_send = num_packets
+                    self.stop_ack_addr = addr
+                    
+                    if command_type == START_SAMPLING:
+                        self._start_sampling()
+                    else:
+                        self.print("[INFO] Sampling spuštěn na trigger.")   
+                        self.wait_for_trigger = True
                 
-                if command_type == START_SAMPLING:
-                    self._start_sampling()
+                    response = struct.pack('<HHIQ', ACK_packet, 0, command_type, self.num_packets_to_send)
+                    self.sock.sendto(response, addr)
+                
+                elif command_type == STOP_SAMPLING:
+                    self._stop_sampling(addr, command_type)
+
+                elif command_type == TRIGGER_ACK:
+                    self.print("[INFO] Přijat Trigger ACK(CMD 8)")
+                    self.wait_for_response = False
+
+                elif command_type == FORSE_TRIGGER:
+                    self.print("[INFO] Přijat FORSE TRIGGER(CMD 9)")
+                    self.wait_for_trigger == False
+                    self._trigger()
+                elif command_type == RESET_COUNTER:
+                    self.packet_id = 0
+                    response = struct.pack('<HHI', ACK_packet, 0, command_type)  # Packet type, error, CMD
+                    self.sock.sendto(response, addr)
+                    self.print("Counter reset.")
+
                 else:
-                    self.print("[INFO] Sampling spuštěn na trigger.")   
-                    self.wait_for_trigger = True
-             
-                response = struct.pack('<HHIQ', ACK_packet, 0, command_type, self.num_packets_to_send)
-                self.sock.sendto(response, addr)
-            
-            elif command_type == STOP_SAMPLING:
-                self._stop_sampling(addr, command_type)
-
-            elif command_type == TRIGGER_ACK:
-                self.print("[INFO] Přijat Trigger ACK(CMD 8)")
-                self.wait_for_response = False
-
-            elif command_type == FORSE_TRIGGER:
-                self.print("[INFO] Přijat FORSE TRIGGER(CMD 9)")
-                self.wait_for_trigger == False
-                self._trigger()
-            elif command_type == RESET_COUNTER:
-                self.packet_id = 0
-                response = struct.pack('<HHI', ACK_packet, 0, command_type)  # Packet type, error, CMD
-                self.sock.sendto(response, addr)
-                self.print("Counter reset.")
-
-            else:
-                self.print(f"Neznámý příkaz typu {command_type}")
+                    self.print(f"Neznámý příkaz typu {command_type}")
 
     def _send_identification_packet(self, addr):
         packet_type = ID_packet
@@ -368,38 +370,41 @@ class MultiSignalTestGenerator:
                 last_sent = 0
                 continue
 
-            signals = []
-            for i in range(self.num_signals):
-                shift = (i * period_length) // self.num_signals
-                start_index = (self.packet_id*packet_size + shift) % period_length
-                if start_index + packet_size <= period_length:
-                    chunk = base_signal[start_index:start_index + packet_size]
-                else:
-                    part1 = base_signal[start_index:]
-                    part2 = base_signal[:packet_size - len(part1)]
-                    chunk = np.concatenate((part1, part2))
+            with self.lock:
+                if not self.sampling:
+                    continue
+                signals = []
+                for i in range(self.num_signals):
+                    shift = (i * period_length) // self.num_signals
+                    start_index = (self.packet_id*packet_size + shift) % period_length
+                    if start_index + packet_size <= period_length:
+                        chunk = base_signal[start_index:start_index + packet_size]
+                    else:
+                        part1 = base_signal[start_index:]
+                        part2 = base_signal[:packet_size - len(part1)]
+                        chunk = np.concatenate((part1, part2))
 
-                signals.append(chunk.astype(np.int16))
+                    signals.append(chunk.astype(np.int16))
 
-            signal_bytes = b''.join(s.tobytes() for s in signals)
-            error_counts = struct.pack('<' + 'B' * self.num_signals, *([0] * self.num_signals))
-            header = struct.pack('<HH', DATA_packet, self.packet_id % 65536)
-            packet = header + signal_bytes + error_counts
+                signal_bytes = b''.join(s.tobytes() for s in signals)
+                error_counts = struct.pack('<' + 'B' * self.num_signals, *([0] * self.num_signals))
+                header = struct.pack('<HH', DATA_packet, self.packet_id % 65536)
+                packet = header + signal_bytes + error_counts
 
-            if self.num_signals % 2 != 0:
-                packet += b'\x00'  # padding
+                if self.num_signals % 2 != 0:
+                    packet += b'\x00'  # padding
 
-            crc = crc16_ccitt(packet)
-            packet += struct.pack('<H', crc)
+                crc = crc16_ccitt(packet)
+                packet += struct.pack('<H', crc)
 
-            for receiver in self.receivers:
-                self.sock.sendto(packet, receiver)
+                for receiver in self.receivers:
+                    self.sock.sendto(packet, receiver)
 
-            self.packet_id += 1
-            self.packets_sent += 1
+                self.packet_id += 1
+                self.packets_sent += 1
 
-            if self.num_packets_to_send != 0 and self.packets_sent >= self.num_packets_to_send:
-                self._stop_sampling(addr=self.stop_ack_addr)  # automaticky zastavit sampling
+                if self.num_packets_to_send != 0 and self.packets_sent >= self.num_packets_to_send:
+                    self._stop_sampling(addr=self.stop_ack_addr)  # automaticky zastavit sampling
 
             t = time.monotonic()
             t_send += self.interval
