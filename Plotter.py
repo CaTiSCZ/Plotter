@@ -58,6 +58,7 @@ class Plotter:
 
         self.decimation_factor = 1
         self.decimation_mode = "mean"
+        self.pen_width = 1
         self.current_time = time.time()
 # === Device Manager ===
         self.device_manager = DeviceManager(self.cmd_socket, self.data_socket)
@@ -100,17 +101,17 @@ class Plotter:
             color = colors[i % len(colors)]
             if unit == 'mV':
                 # Křivka pro napětí na levé ose
-                curve = self.gui.plot.plot(pen=pg.mkPen(color, width=2), name=label)
+                curve = self.gui.plot.plot(pen=pg.mkPen(color, width=self.pen_width), name=label)
                 self.curves_mv.append(curve)
             elif unit == 'A':
                 # Křivka pro proud na pravé ose - PlotDataItem
-                curve = pg.PlotDataItem(pen=pg.mkPen(color, width=2), name=label)
+                curve = pg.PlotDataItem(pen=pg.mkPen(color, width=self.pen_width), name=label)
                 self.gui.right_axis.addItem(curve)
                 self.curves_a.append(curve)
             else:
                 # Pro jiné jednotky použijeme levou osu jako výchozí s čárkovaným stylem
                 self._logger.warning(f"Neznámá jednotka '{unit}' pro kanál '{label}', použita levá osa s čárkovaným stylem")
-                dash_pen = pg.mkPen(color, width=3, style=2)
+                dash_pen = pg.mkPen(color, width=self.pen_width, style=2)
                 curve = self.gui.plot.plot(pen=dash_pen, name=f"{label} (neznámá jednotka)")
                 self.curves_mv.append(curve)
         self.decimation_changed()  # Aplikujeme decimaci na nové křivky
