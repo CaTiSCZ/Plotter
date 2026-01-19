@@ -124,10 +124,17 @@ class Gui(QWidget):
         row2.addWidget(self.buffer_size_spinbox, 0, 12, alignment=Qt.AlignLeft)
         self.buffer_size_spinbox.valueChanged.connect(lambda: plotter.log_message("TO DO"))
 
+        self.decimation_label = QLabel("Decimation:")
+        self.decimation_value = QSpinBox()
+        self.decimation_value.setRange(1, 10000)
+        self.decimation_value.setValue(plotter.decimation_factor)
+        row2.addWidget(self.decimation_label, 0, 13, alignment=Qt.AlignRight)
+        row2.addWidget(self.decimation_value, 0, 14, alignment=Qt.AlignLeft)
+        self.decimation_value.valueChanged.connect(plotter.decimation_changed)
 # clear graf
         self.clear_button = QPushButton("Clean graf")
         self.clear_button.clicked.connect(lambda: plotter.log_message("TO DO"))
-        row2.addWidget(self.clear_button, 0, 13)
+        row2.addWidget(self.clear_button, 0, 15, alignment=Qt.AlignCenter)
 # ------ 3. řádek -----
 # Path display (full width)
         self.path_label = QLabel("Path:")

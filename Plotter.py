@@ -54,6 +54,8 @@ class Plotter:
         self.num_packets = 0
         self.buffer_length_sec = DeviceManager.BUFFER_LENGTH_SECONDS
         self.buffer_size = int(self.buffer_length_sec * DeviceManager.SAMPLES_PER_PACKET * DeviceManager.PACKET_RATE_HZ)
+
+        self.decimation_factor = 1
 # === Device Manager ===
         self.device_manager = DeviceManager(self.cmd_socket, self.data_socket)
 
@@ -111,7 +113,7 @@ class Plotter:
         
         self._logger.info(f"Inicializovány křivky: {len(self.curves_mv)} na levé ose (mV), {len(self.curves_a)} na pravé ose (A)")
 
-    def _update_plot_data(self):
+    def _update_plot_data(self, force_update=False):
         """Aktualizuje data v grafu podle jednotek kanálů"""
         try:
             # Aktualizujeme statistiky paketů
@@ -141,7 +143,7 @@ class Plotter:
             # Aktualizujeme data pro křivky podle jednotek
             mv_index = 0
             a_index = 0
-            
+            is_new_data = force_update
             for i, (time_data, channel_data, last_packet_num) in enumerate(channels_data):
                 # Kontrola rozměrů dat
                 if len(time_data) == 0 or len(channel_data) == 0:
@@ -151,16 +153,17 @@ class Plotter:
                     self._logger.warning(f"Nesoulad rozměrů pro kanál {i}: time={len(time_data)}, data={len(channel_data)}")
                     continue
 
-                if self.last_packet_nums[i] != last_packet_num:
-                    self.last_packet_nums[i] = last_packet_num
-                    is_new_data = True
-                else:
-                    is_new_data = False
+                if not force_update:    
+                    if self.last_packet_nums[i] != last_packet_num:
+                        self.last_packet_nums[i] = last_packet_num
+                        is_new_data = True
+                    else:
+                        is_new_data = False
                 # Omezení velikosti dat pro výkon
-                max_points = 10000  # Maximální počet bodů pro zobrazení
-                if 0 and len(time_data) > max_points:
+                
+                if self.decimation_factor > 1 and len(time_data) > self.decimation_factor:
                     # Vzorkování dat
-                    step = len(time_data) // max_points
+                    step = len(time_data) // self.decimation_factor
                     time_data = time_data[::step]
                     channel_data = channel_data[::step]
                 
@@ -195,6 +198,11 @@ class Plotter:
                     self.plot_timer_running = False
             else:
                 self.plot_error_count = 1
+
+    def decimation_changed(self):
+        self.decimation_factor = self.gui.decimation_value.value()
+        self._logger.info(f"Decimation factor changed to {self.decimation_factor}")
+        self._update_plot_data(force_update=True)
 
     def _update_packet_stats(self):
         """Aktualizuje statistiky paketů z připojených zařízení"""

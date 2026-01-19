@@ -278,7 +278,7 @@ class Device:
                 
                 with self.buffer_lock:
                     self.packet_counter += 1
-                    self._logger.debug(f"DATA packet #{packet_num} -> {self.packet_counter}")
+                    #self._logger.debug(f"DATA packet #{packet_num} -> {self.packet_counter}")
                     buffer_write_index = self.buffer_size + packet_num * Device.SAMPLES_PER_PACKET - self.buffer_overflow_counter * 2 * self.buffer_size
                     packet_np = np.frombuffer(packet, dtype=Device.RAW_DATA_TYPE, offset = offset, count = Device.SAMPLES_PER_PACKET * self.channels_count)
                     channels_data = packet_np.reshape((self.channels_count, Device.SAMPLES_PER_PACKET))
