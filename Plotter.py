@@ -57,6 +57,7 @@ class Plotter:
         self.buffer_size = int(self.buffer_length_sec * DeviceManager.SAMPLES_PER_PACKET * DeviceManager.PACKET_RATE_HZ)
 
         self.decimation_factor = 1
+        self.decimation_mode = "mean"
         self.current_time = time.time()
 # === Device Manager ===
         self.device_manager = DeviceManager(self.cmd_socket, self.data_socket)
@@ -102,8 +103,8 @@ class Plotter:
                 curve = self.gui.plot.plot(pen=pg.mkPen(color, width=2), name=label)
                 self.curves_mv.append(curve)
             elif unit == 'A':
-                # Křivka pro proud na pravé ose
-                curve = pg.PlotCurveItem(pen=pg.mkPen(color, width=2), name=label)
+                # Křivka pro proud na pravé ose - PlotDataItem
+                curve = pg.PlotDataItem(pen=pg.mkPen(color, width=2), name=label)
                 self.gui.right_axis.addItem(curve)
                 self.curves_a.append(curve)
             else:
@@ -112,7 +113,7 @@ class Plotter:
                 dash_pen = pg.mkPen(color, width=3, style=2)
                 curve = self.gui.plot.plot(pen=dash_pen, name=f"{label} (neznámá jednotka)")
                 self.curves_mv.append(curve)
-        
+        self.decimation_changed()  # Aplikujeme decimaci na nové křivky
         self._logger.info(f"Inicializovány křivky: {len(self.curves_mv)} na levé ose (mV), {len(self.curves_a)} na pravé ose (A)")
 
     def _update_plot_data(self, force_update=False):
@@ -165,13 +166,6 @@ class Plotter:
                         is_new_data = True
                     else:
                         is_new_data = False
-                # Omezení velikosti dat pro výkon
-                
-                if self.decimation_factor > 1 and len(time_data) > self.decimation_factor:
-                    # Vzorkování dat
-                    step = self.decimation_factor
-                    time_data = time_data[::step]
-                    channel_data = channel_data[::step]
                 
                 if i < len(self.channel_units):
                     unit = self.channel_units[i]
@@ -208,6 +202,9 @@ class Plotter:
 
     def decimation_changed(self):
         self.decimation_factor = self.gui.decimation_value.value()
+        self.decimation_mode = self.gui.decimation_mode_dropdown.currentText()
+        for curve in self.curves_mv + self.curves_a:
+            curve.setDownsampling(self.decimation_factor, method = self.decimation_mode)
         self._logger.info(f"Decimation factor changed to {self.decimation_factor}")
         self._update_plot_data(force_update=True)
     

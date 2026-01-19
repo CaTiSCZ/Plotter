@@ -1,6 +1,6 @@
 import pyqtgraph as pg
 from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget, QPushButton, QGridLayout, QApplication, QSpinBox, QDoubleSpinBox, \
-    QCheckBox, QTextEdit, QScrollArea, QLineEdit, QDesktopWidget, QSizePolicy 
+    QCheckBox, QTextEdit, QScrollArea, QLineEdit, QDesktopWidget, QSizePolicy, QComboBox
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont
 
@@ -131,10 +131,18 @@ class Gui(QWidget):
         row2.addWidget(self.decimation_label, 0, 13, alignment=Qt.AlignRight)
         row2.addWidget(self.decimation_value, 0, 14, alignment=Qt.AlignLeft)
         self.decimation_value.valueChanged.connect(plotter.decimation_changed)
+
+        self.decimation_mode_label = QLabel("Method:")
+        self.decimation_mode_dropdown = QComboBox()
+        self.decimation_mode_dropdown.addItems(["mean", "peak", "subsample"])
+        self.decimation_mode_dropdown.setCurrentText(plotter.decimation_mode)
+        row2.addWidget(self.decimation_mode_label, 0, 15, alignment=Qt.AlignRight)
+        row2.addWidget(self.decimation_mode_dropdown, 0, 16, alignment=Qt.AlignLeft)
+        self.decimation_mode_dropdown.currentTextChanged.connect(plotter.decimation_changed)
 # clear graf
         self.clear_button = QPushButton("Clean graf")
         self.clear_button.clicked.connect(lambda: plotter.log_message("TO DO"))
-        row2.addWidget(self.clear_button, 0, 15, alignment=Qt.AlignCenter)
+        row2.addWidget(self.clear_button, 0, 17, alignment=Qt.AlignCenter)
 # ------ 3. řádek -----
 # Path display (full width)
         self.path_label = QLabel("Path:")
