@@ -89,11 +89,10 @@ class Plotter:
         self.channel_units = [unit[0] for unit in units]  # Ukládáme pouze jednotky
         
         colors = ['r', 'g', 'b', 'c', 'm', 'y', 'k', 'w']  # Základní barvy pro křivky
-        
+        self.last_packet_nums = [-1] * len(units)  # Ukládáme poslední čísla paketů pro každý kanál
         # Vytvoříme křivky pro každý kanál podle jeho jednotky
         for i, (unit, label) in enumerate(units):
             color = colors[i % len(colors)]
-            
             if unit == 'mV':
                 # Křivka pro napětí na levé ose
                 curve = self.gui.plot.plot(pen=pg.mkPen(color, width=2), name=label)
@@ -143,7 +142,7 @@ class Plotter:
             mv_index = 0
             a_index = 0
             
-            for i, (time_data, channel_data) in enumerate(channels_data):
+            for i, (time_data, channel_data, last_packet_num) in enumerate(channels_data):
                 # Kontrola rozměrů dat
                 if len(time_data) == 0 or len(channel_data) == 0:
                     continue
@@ -151,7 +150,12 @@ class Plotter:
                 if len(time_data) != len(channel_data):
                     self._logger.warning(f"Nesoulad rozměrů pro kanál {i}: time={len(time_data)}, data={len(channel_data)}")
                     continue
-                
+
+                if self.last_packet_nums[i] != last_packet_num:
+                    self.last_packet_nums[i] = last_packet_num
+                    is_new_data = True
+                else:
+                    is_new_data = False
                 # Omezení velikosti dat pro výkon
                 max_points = 10000  # Maximální počet bodů pro zobrazení
                 if 0 and len(time_data) > max_points:
@@ -165,16 +169,19 @@ class Plotter:
                     
                     if unit == 'mV' and mv_index < len(self.curves_mv):
                         # Aktualizace křivky na levé ose (mV)
-                        self.curves_mv[mv_index].setData(time_data, channel_data)
+                        if is_new_data:
+                            self.curves_mv[mv_index].setData(time_data, channel_data)
                         mv_index += 1
                     elif unit == 'A' and a_index < len(self.curves_a):
                         # Aktualizace křivky na pravé ose (A)
-                        self.curves_a[a_index].setData(time_data, channel_data)
+                        if is_new_data:
+                            self.curves_a[a_index].setData(time_data, channel_data)
                         a_index += 1
                     else:
                         # Pro neznámé jednotky použijeme levou osu
                         if mv_index < len(self.curves_mv):
-                            self.curves_mv[mv_index].setData(time_data, channel_data)
+                            if is_new_data:
+                                self.curves_mv[mv_index].setData(time_data, channel_data)
                             mv_index += 1
                             
         except Exception as e:

@@ -84,7 +84,7 @@ class DeviceManager:
             end_index = int(device[1] - min_t)
             t = time[start_index:end_index]
             for channel in range(device[3]):
-                channels_plot.append((t, device[0][channel, :]))
+                channels_plot.append((t, device[0][channel, :], device[4]))
         return channels_plot
 
     def ping(self):

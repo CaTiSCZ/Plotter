@@ -440,7 +440,8 @@ class Device:
             return (self.buffer[:, self.buffer_read_index:self.buffer_read_index + self.buffer_read_size], 
                     self.max_packet_num * Device.SAMPLES_PER_PACKET, 
                     self.buffer_read_size,
-                    self.channels_count)
+                    self.channels_count, 
+                    self.last_packet_num)
 
     def send_command(self, cmd: int, data: bytes = b'', on_timeout = None, on_timeout_args = [], on_timeout_kwargs = {}, on_ack = None, on_ack_args = [], on_ack_kwargs = {}):
         with self.send_command_lock:
