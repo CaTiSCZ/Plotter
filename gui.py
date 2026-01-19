@@ -317,17 +317,21 @@ class Gui(QWidget):
         log_scroll_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         grid.addWidget(log_scroll_area, 0, 17, 6, 1) 
         self.log_signal.connect(self.log_output.append)
+
+        self.time_lable = QLabel("Time: 00:00:00 bbLast update: 00:00:00")
+        grid.addWidget(self.time_lable, 6, 17, alignment=Qt.AlignCenter) 
+
         
         grid.setColumnStretch(17, 1)
         for col in range(17):
             grid.setColumnStretch(col, 0)
+        
 
         #===Pevná velikost tlačítek:
         #tlačítka 
         for btn, width  in [
             (self.confirm_client_button, 40),
             (self.send_trigger_button, 110),
-            
             (self.ping_button, 105),
             (self.get_id_button, 105),
             (self.get_receivers_button, 105),

@@ -17,6 +17,7 @@ import pyqtgraph as pg
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
+import time
 
 from async_socket import AsyncSocket
 from device_manager import DeviceManager
@@ -56,6 +57,7 @@ class Plotter:
         self.buffer_size = int(self.buffer_length_sec * DeviceManager.SAMPLES_PER_PACKET * DeviceManager.PACKET_RATE_HZ)
 
         self.decimation_factor = 1
+        self.current_time = time.time()
 # === Device Manager ===
         self.device_manager = DeviceManager(self.cmd_socket, self.data_socket)
 
@@ -116,6 +118,10 @@ class Plotter:
     def _update_plot_data(self, force_update=False):
         """Aktualizuje data v grafu podle jednotek kanálů"""
         try:
+            current_time = time.time()
+            last_update_time = current_time - self.current_time
+            self.update_time_label(current_time, last_update_time)
+            self.current_time = current_time
             # Aktualizujeme statistiky paketů
             self._update_packet_stats()
             
@@ -163,7 +169,7 @@ class Plotter:
                 
                 if self.decimation_factor > 1 and len(time_data) > self.decimation_factor:
                     # Vzorkování dat
-                    step = len(time_data) // self.decimation_factor
+                    step = self.decimation_factor
                     time_data = time_data[::step]
                     channel_data = channel_data[::step]
                 
@@ -186,6 +192,7 @@ class Plotter:
                             if is_new_data:
                                 self.curves_mv[mv_index].setData(time_data, channel_data)
                             mv_index += 1
+            
                             
         except Exception as e:
             self._logger.error(f"Chyba při aktualizaci grafu: {e}")
@@ -203,6 +210,12 @@ class Plotter:
         self.decimation_factor = self.gui.decimation_value.value()
         self._logger.info(f"Decimation factor changed to {self.decimation_factor}")
         self._update_plot_data(force_update=True)
+    
+    def update_time_label(self, current_time, last_update_time):
+        current_time = time.localtime(current_time)
+        current_time = time.strftime("%H:%M:%S", current_time)
+        last_update_time = f"{last_update_time:.3f} s"
+        self.gui.time_lable.setText(f"Time: {current_time}    Last update: {last_update_time}")
 
     def _update_packet_stats(self):
         """Aktualizuje statistiky paketů z připojených zařízení"""
