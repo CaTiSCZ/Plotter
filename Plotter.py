@@ -205,7 +205,7 @@ class Plotter:
         self.decimation_factor = self.gui.decimation_value.value()
         self.decimation_mode = self.gui.decimation_mode_dropdown.currentText()
         for curve in self.curves_mv + self.curves_a:
-            curve.setDownsampling(self.decimation_factor, method = self.decimation_mode)
+            curve.setDownsampling(self.decimation_factor, auto = self.decimation_factor == 0, method = self.decimation_mode)
         self._logger.info(f"Decimation factor changed to {self.decimation_factor}")
         self._update_plot_data(force_update=True)
     

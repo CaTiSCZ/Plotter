@@ -126,7 +126,7 @@ class Gui(QWidget):
 
         self.decimation_label = QLabel("Decimation:")
         self.decimation_value = QSpinBox()
-        self.decimation_value.setRange(1, 10000)
+        self.decimation_value.setRange(0, 10000)
         self.decimation_value.setValue(plotter.decimation_factor)
         row2.addWidget(self.decimation_label, 0, 13, alignment=Qt.AlignRight)
         row2.addWidget(self.decimation_value, 0, 14, alignment=Qt.AlignLeft)
