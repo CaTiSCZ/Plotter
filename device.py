@@ -273,6 +273,8 @@ class Device:
                         self.packet_counter_cycle += 1
                     elif self.last_packet_num - packet_num < -60000:
                         self.packet_counter_cycle -= 1
+                else:
+                    self.buffer_overflow_counter = int(packet_num * Device.SAMPLES_PER_PACKET // (2 * self.buffer_size))
                 self.last_packet_num = packet_num
                 packet_num = packet_num + self.packet_counter_cycle * 65536
                 
