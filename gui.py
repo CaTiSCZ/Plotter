@@ -1,12 +1,131 @@
 import pyqtgraph as pg
-from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget, QPushButton, QGridLayout, QApplication, QSpinBox, QDoubleSpinBox, \
-    QCheckBox, QTextEdit, QScrollArea, QLineEdit, QDesktopWidget, QSizePolicy, QComboBox
+from PyQt5.QtWidgets import (QLabel, QVBoxLayout, QWidget, QPushButton, QGridLayout, QApplication, QSpinBox, QDoubleSpinBox,
+    QCheckBox, QTextEdit, QScrollArea, QLineEdit, QDesktopWidget, QSizePolicy, QComboBox, 
+    QMainWindow, QDockWidget, QMenuBar, QMenu, QAction)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont
 
 from device_manager import DeviceManager
 
-class Gui(QWidget):
+
+class GraphPanel(QWidget):
+    """Samostatný panel pro zobrazení grafu s možností výběru zdroje dat."""
+    
+    def __init__(self, plotter, data_source=None, parent=None):
+        super().__init__(parent)
+        self.plotter = plotter
+        self.data_source = data_source
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout()
+        layout.setContentsMargins(5, 5, 5, 5)
+        self.setLayout(layout)
+        
+        # Nastavení size policy a minimálních rozměrů pro volné přesouvání
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumSize(100, 100)  # Velmi malé minimum pro volnost pohybu
+        
+        # Výběr zdroje dat
+        source_layout = QGridLayout()
+        source_layout.addWidget(QLabel("Zdroj dat:"), 0, 0)
+        self.source_combo = QComboBox()
+        self.source_combo.addItems(["Všechna zařízení", "Zařízení 1", "Zařízení 2", "Zařízení 3"])
+        source_layout.addWidget(self.source_combo, 0, 1)
+        layout.addLayout(source_layout)
+        
+        # Graf
+        self.plot_widget = pg.GraphicsLayoutWidget()
+        self.plot_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.plot_widget.setMinimumSize(50, 50)  # Velmi malé minimum
+        self.plot = self.plot_widget.addPlot(title=f"Graf - {self.source_combo.currentText()}")
+        self.plot.setLabel('bottom', 'Time', units='s')
+        self.plot.setLabel('left', 'Voltage', units='mV')
+        self.plot.enableAutoRange(x=True, y=True)
+        self.plot.showGrid(x=True, y=True, alpha=0.5)
+        self.plot.setMouseEnabled(x=True, y=True)
+        layout.addWidget(self.plot_widget)
+        
+        # Druhá osa Y
+        self.right_axis = pg.ViewBox()
+        self.plot.showAxis('right')
+        self.plot.scene().addItem(self.right_axis)
+        self.plot.getAxis('right').linkToView(self.right_axis)
+        self.right_axis.setXLink(self.plot)
+        self.plot.setLabel('right', 'Current', units='A')
+        
+        def update_views():
+            self.right_axis.setGeometry(self.plot.getViewBox().sceneBoundingRect())
+            self.right_axis.linkedViewChanged(self.plot.getViewBox(), self.right_axis.XAxis)
+        
+        self.plot.getViewBox().sigResized.connect(update_views)
+        
+        # Update title při změně zdroje
+        self.source_combo.currentTextChanged.connect(
+            lambda text: self.plot.setTitle(f"Graf - {text}")
+        )
+
+
+class LogPanel(QWidget):
+    """Samostatný panel pro zobrazení logů s možností filtrace."""
+    
+    def __init__(self, plotter, log_level="INFO", log_source=None, parent=None):
+        super().__init__(parent)
+        self.plotter = plotter
+        self.log_level = log_level
+        self.log_source = log_source
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout()
+        layout.setContentsMargins(5, 5, 5, 5)
+        self.setLayout(layout)
+        
+        # Nastavení size policy a minimálních rozměrů pro volné přesouvání
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumSize(100, 100)  # Velmi malé minimum pro volnost pohybu
+        
+        # Nastavení filtrace
+        filter_layout = QGridLayout()
+        filter_layout.addWidget(QLabel("Úroveň logů:"), 0, 0)
+        self.level_combo = QComboBox()
+        self.level_combo.addItems(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+        self.level_combo.setCurrentText(self.log_level)
+        filter_layout.addWidget(self.level_combo, 0, 1)
+        
+        filter_layout.addWidget(QLabel("Zdroj:"), 0, 2)
+        self.source_combo = QComboBox()
+        self.source_combo.addItems(["Vše", "Plotter", "Device Manager", "Network"])
+        filter_layout.addWidget(self.source_combo, 0, 3)
+        
+        layout.addLayout(filter_layout)
+        
+        # Log výstup
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setLineWrapMode(QTextEdit.NoWrap)
+        self.log_output.setStyleSheet("background-color: #f8f8f8;")
+        self.log_output.setFont(QFont("consolas", 9))
+        self.log_output.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self.log_output)
+        
+        # Tlačítka
+        button_layout = QGridLayout()
+        self.clear_button = QPushButton("Vymazat logy")
+        self.clear_button.clicked.connect(self.log_output.clear)
+        button_layout.addWidget(self.clear_button, 0, 0)
+        
+        self.save_button = QPushButton("Uložit logy")
+        button_layout.addWidget(self.save_button, 0, 1)
+        
+        layout.addLayout(button_layout)
+    
+    def append_log(self, message):
+        """Přidá zprávu do logu."""
+        self.log_output.append(message)
+
+
+class Gui(QMainWindow):
     log_signal = pyqtSignal(str)
     _start_timer_signal = pyqtSignal()
     _init_curves_signal = pyqtSignal()
@@ -15,6 +134,17 @@ class Gui(QWidget):
         super().__init__()
 
         self.plotter = plotter
+        
+        # Počítadla otevřených panelů
+        self.graph_panel_counter = 0
+        self.log_panel_counter = 0
+        
+        # Seznam otevřených dock widgetů
+        self.graph_docks = []
+        self.log_docks = []
+        
+        # Reference na poslední dock pro všechny panely (grafy i logy dohromady)
+        self.last_panel_dock = None
 
         # === Inicializace okna ===
         self.setWindowTitle("UDP Signal Client")
@@ -23,8 +153,57 @@ class Gui(QWidget):
         height = int(screen_geometry.height() * 0.9)
         self.resize(width, height)
         
+        # Povolení záložkového zobrazení dock widgetů
+        self.setDockOptions(QMainWindow.AllowTabbedDocks | QMainWindow.AnimatedDocks)
+        
+        # Nastavení stylu pro záložky - úzké a dynamické
+        self.setStyleSheet("""
+            QTabBar::tab {
+                min-width: 80px;
+                max-width: 200px;
+                padding: 5px 10px;
+            }
+            QTabBar {
+                qproperty-expanding: false;
+            }
+        """)
+        
+        # Vytvoření prázdného centrálního widgetu (minimální velikost)
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        central_layout = QVBoxLayout()
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_widget.setLayout(central_layout)
+        central_widget.setMaximumHeight(0)  # Skryje centrální widget
+        
+        # Vytvoření menu baru
+        self.create_menu_bar()
+
+                # Vytvoření hlavního panelu jako DockWidget
+        main_panel = QWidget()
+        main_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.layout = QVBoxLayout()
-        self.setLayout(self.layout)
+        main_panel.setLayout(self.layout)
+        
+        # Obalení hlavního panelu do scroll area
+        scroll_area = QScrollArea()
+        scroll_area.setWidget(main_panel)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        
+        self.main_dock = QDockWidget("Hlavní panel", self)
+        self.main_dock.setWidget(scroll_area)
+        self.main_dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+        self.main_dock.setFeatures(QDockWidget.DockWidgetMovable | 
+                                     QDockWidget.DockWidgetFloatable | 
+                                     QDockWidget.DockWidgetClosable)
+        self.main_dock.setMinimumSize(100, 100)  # Velmi malé minimum pro dock
+        
+        # Přidání hlavního doku
+        self.addDockWidget(Qt.TopDockWidgetArea, self.main_dock)
+        
+        # Reference na poslední dock - začínáme s hlavním panelem
+        self.last_panel_dock = self.main_dock
         
 # === 1. řádek: GRAF ===
         self.plot_widget = pg.GraphicsLayoutWidget()
@@ -87,7 +266,7 @@ class Gui(QWidget):
 
         row2.addWidget(self.y_min_label, 0, 4, alignment=Qt.AlignRight)
         row2.addWidget(self.y_min_spinbox, 0, 5, alignment=Qt.AlignLeft)
-        self.y_min_spinbox.valueChanged.connect(lambda: plotter.log_message("TO DO"))
+        self.y_min_spinbox.valueChanged.connect(lambda: plotter._logger("TO DO"))
 # --- Y Max ---
         self.y_max_label = QLabel("Y max:")
         self.y_max_spinbox = QDoubleSpinBox()
@@ -96,7 +275,7 @@ class Gui(QWidget):
 
         row2.addWidget(self.y_max_label, 0, 6, alignment=Qt.AlignRight)
         row2.addWidget(self.y_max_spinbox, 0, 7, alignment=Qt.AlignLeft)
-        self.y_max_spinbox.valueChanged.connect(lambda: plotter.log_message("TO DO"))
+        self.y_max_spinbox.valueChanged.connect(lambda: plotter._logger("TO DO"))
 # X range
         self.x_range_label = QLabel("X range:")
         self.x_range_spinbox = QDoubleSpinBox()
@@ -105,13 +284,13 @@ class Gui(QWidget):
         self.x_range_spinbox.setSuffix(" ms")
         row2.addWidget(self.x_range_label, 0, 8, alignment=Qt.AlignRight)
         row2.addWidget(self.x_range_spinbox, 0, 9, alignment=Qt.AlignLeft)
-        self.x_range_spinbox.valueChanged.connect(lambda: plotter.log_message("TO DO"))        
+        self.x_range_spinbox.valueChanged.connect(lambda: plotter._logger("TO DO"))        
 
 # x auto range        
         self.auto_x_range = True
         self.auto_x_range_checkbox = QCheckBox("Whole buffer")
         self.auto_x_range_checkbox.setChecked(True)
-        self.auto_x_range_checkbox.stateChanged.connect(lambda: plotter.log_message("TO DO"))
+        self.auto_x_range_checkbox.stateChanged.connect(lambda: plotter._logger("TO DO"))
         row2.addWidget(self.auto_x_range_checkbox, 0, 10, alignment=Qt.AlignCenter)
 
 # Buffer size
@@ -122,7 +301,7 @@ class Gui(QWidget):
    
         row2.addWidget(self.buffer_size_label, 0, 11, alignment=Qt.AlignRight)
         row2.addWidget(self.buffer_size_spinbox, 0, 12, alignment=Qt.AlignLeft)
-        self.buffer_size_spinbox.valueChanged.connect(lambda: plotter.log_message("TO DO"))
+        self.buffer_size_spinbox.valueChanged.connect(lambda: plotter._logger("TO DO"))
 
         self.decimation_label = QLabel("Decimation:")
         self.decimation_value = QSpinBox()
@@ -141,7 +320,7 @@ class Gui(QWidget):
         self.decimation_mode_dropdown.currentTextChanged.connect(plotter.decimation_changed)
 # clear graf
         self.clear_button = QPushButton("Clean graf")
-        self.clear_button.clicked.connect(lambda: plotter.log_message("TO DO"))
+        self.clear_button.clicked.connect(lambda: plotter._logger("TO DO"))
         row2.addWidget(self.clear_button, 0, 17, alignment=Qt.AlignCenter)
 # ------ 3. řádek -----
 # Path display (full width)
@@ -159,15 +338,15 @@ class Gui(QWidget):
         row2.addWidget(self.path_display, 1, 4, 1, 10)
         
         self.set_path_button = QPushButton("Set path")
-        self.set_path_button.clicked.connect(lambda: plotter.log_message("TO DO"))
+        self.set_path_button.clicked.connect(lambda: plotter._logger("TO DO"))
         row2.addWidget(self.set_path_button, 2, 4)
         
         self.save_data_button = QPushButton("Save buffer")
-        self.save_data_button.clicked.connect(lambda: plotter.log_message("TO DO"))
+        self.save_data_button.clicked.connect(lambda: plotter._logger("TO DO"))
         row2.addWidget(self.save_data_button, 2, 5)
 
         self.AdHoc_safe_button = QPushButton("Ad Hoc save")
-        self.AdHoc_safe_button.clicked.connect(lambda: plotter.log_message("TO DO"))
+        self.AdHoc_safe_button.clicked.connect(lambda: plotter._logger("TO DO"))
         row2.addWidget(self.AdHoc_safe_button, 2, 6)
 
         self.layout.addLayout(row2)
@@ -209,7 +388,7 @@ class Gui(QWidget):
         self.save_on_trigger = False
         self.save_on_trigger_checkbox = QCheckBox("Save on triger")
         self.save_on_trigger_checkbox.setChecked(True)
-        self.save_on_trigger_checkbox.stateChanged.connect(lambda: plotter.log_message("TO DO"))
+        self.save_on_trigger_checkbox.stateChanged.connect(lambda: plotter._logger("TO DO"))
         grid.addWidget(self.save_on_trigger_checkbox, 3, 2, 1, 3,  alignment=Qt.AlignLeft)      
 
 
@@ -259,7 +438,7 @@ class Gui(QWidget):
 # num packets
         self.num_packets_label = QLabel("Wanted packets (0 = continue):")
         self.num_packets_spinbox = QSpinBox()
-        self.num_packets_spinbox.setRange(0, 10000)
+        self.num_packets_spinbox.setRange(0, 100000)
         self.num_packets_spinbox.setValue(plotter.num_packets)
 
         grid.addWidget(self.num_packets_label, 0, 11)
@@ -311,7 +490,7 @@ class Gui(QWidget):
 
         self.connect_generator_button = QPushButton("Connect")
         grid.addWidget(self.connect_generator_button, device_count + 1, 14,1,1, alignment=Qt.AlignCenter)
-        self.connect_generator_button.clicked.connect(lambda: plotter.log_message("TO DO"))
+        self.connect_generator_button.clicked.connect(lambda: plotter._logger("TO DO"))
 
 # === Sloupec 3: LOG ===
         self.log_output = QTextEdit("Log messenge:")
@@ -392,6 +571,140 @@ class Gui(QWidget):
         # === Registrace událostí ===
         plotter.device_manager.event_device_added.connect(plotter._on_device_added)
         self._init_curves_signal.connect(plotter._init_curves)
+    
+    def create_menu_bar(self):
+        """Vytvoří menu bar s možnostmi pro otevírání panelů."""
+        menubar = self.menuBar()
+        
+        # Menu Panely
+        panels_menu = menubar.addMenu("&Panely")
+        
+        # Akce pro graf
+        graph_action = QAction("&Nový graf", self)
+        graph_action.setShortcut("Ctrl+G")
+        graph_action.setStatusTip("Otevře nový panel s grafem")
+        graph_action.triggered.connect(self.open_new_graph_panel)
+        panels_menu.addAction(graph_action)
+        
+        # Akce pro log
+        log_action = QAction("&Nové logy", self)
+        log_action.setShortcut("Ctrl+L")
+        log_action.setStatusTip("Otevře nový panel s logy")
+        log_action.triggered.connect(self.open_new_log_panel)
+        panels_menu.addAction(log_action)
+        
+        panels_menu.addSeparator()
+        
+        # Zavřít všechny panely
+        close_all_action = QAction("&Zavřít všechny panely", self)
+        close_all_action.triggered.connect(self.close_all_panels)
+        panels_menu.addAction(close_all_action)
+    
+    def open_new_graph_panel(self):
+        """Otevře nový dockable panel s grafem."""
+        self.graph_panel_counter += 1
+        
+        # Vytvoření panelu
+        graph_panel = GraphPanel(self.plotter)
+        
+        # Vytvoření dock widgetu
+        dock = QDockWidget(f"Graf #{self.graph_panel_counter}", self)
+        dock.setWidget(graph_panel)
+        dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+        dock.setFeatures(QDockWidget.DockWidgetMovable | 
+                         QDockWidget.DockWidgetFloatable | 
+                         QDockWidget.DockWidgetClosable)
+        dock.setMinimumSize(100, 100)  # Velmi malé minimum pro volné přesouvání
+        
+        # Přidání do hlavního okna
+        if self.last_panel_dock is not None:
+            # Pokud už existuje nějaký panel, přidáme jako záložku k němu
+            self.tabifyDockWidget(self.last_panel_dock, dock)
+        else:
+            # První panel přidáme do dolní oblasti
+            self.addDockWidget(Qt.BottomDockWidgetArea, dock)
+        
+        # Aktivujeme nově přidaný dock (zobrazí se jako aktivní záložka)
+        dock.raise_()
+        
+        # Uložení reference
+        self.graph_docks.append(dock)
+        self.last_panel_dock = dock
+        
+        # Při zavření doku jej odebrat ze seznamu
+        def remove_dock():
+            if dock in self.graph_docks:
+                self.graph_docks.remove(dock)
+            if self.last_panel_dock == dock:
+                # Nastavíme poslední dock na jiný existující panel
+                all_docks = self.graph_docks + [d for d, _ in self.log_docks]
+                self.last_panel_dock = all_docks[-1] if all_docks else None
+        
+        dock.destroyed.connect(remove_dock)
+        
+        self.plotter._logger(f"Otevřen nový panel grafu #{self.graph_panel_counter}")
+    
+    def open_new_log_panel(self):
+        """Otevře nový dockable panel s logy."""
+        self.log_panel_counter += 1
+        
+        # Vytvoření panelu
+        log_panel = LogPanel(self.plotter)
+        
+        # Propojení log signálu s novým panelem
+        self.log_signal.connect(log_panel.append_log)
+        
+        # Vytvoření dock widgetu
+        dock = QDockWidget(f"Logy #{self.log_panel_counter}", self)
+        dock.setWidget(log_panel)
+        dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+        dock.setFeatures(QDockWidget.DockWidgetMovable | 
+                         QDockWidget.DockWidgetFloatable | 
+                         QDockWidget.DockWidgetClosable)
+        dock.setMinimumSize(100, 100)  # Velmi malé minimum pro volné přesouvání
+        
+        # Přidání do hlavního okna
+        if self.last_panel_dock is not None:
+            # Pokud už existuje nějaký panel, přidáme jako záložku k němu
+            self.tabifyDockWidget(self.last_panel_dock, dock)
+        else:
+            # První panel přidáme do dolní oblasti
+            self.addDockWidget(Qt.BottomDockWidgetArea, dock)
+        
+        # Aktivujeme nově přidaný dock (zobrazí se jako aktivní záložka)
+        dock.raise_()
+        
+        # Uložení reference
+        self.log_docks.append((dock, log_panel))
+        self.last_panel_dock = dock
+        
+        # Při zavření doku jej odebrat ze seznamu
+        def remove_dock():
+            for i, (d, p) in enumerate(self.log_docks):
+                if d == dock:
+                    self.log_signal.disconnect(p.append_log)
+                    self.log_docks.pop(i)
+                    if self.last_panel_dock == dock:
+                        # Nastavíme poslední dock na jiný existující panel
+                        all_docks = self.graph_docks + [d for d, _ in self.log_docks]
+                        self.last_panel_dock = all_docks[-1] if all_docks else None
+                    break
+        
+        dock.destroyed.connect(remove_dock)
+        
+        self.plotter._logger(f"Otevřen nový panel logů #{self.log_panel_counter}")
+    
+    def close_all_panels(self):
+        """Zavře všechny otevřené panely."""
+        # Zavření všech grafů
+        for dock in self.graph_docks[:]:
+            dock.close()
+        
+        # Zavření všech logů
+        for dock, _ in self.log_docks[:]:
+            dock.close()
+        
+        self.plotter._logger("Všechny panely byly zavřeny")
 
     def show(self):
         res = super().show()
