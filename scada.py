@@ -124,7 +124,7 @@ class AsyncSocket:
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.loop = loop
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8*1024*1024)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16*1024*1024)
         sock.setblocking(False)
         sock.bind(('0.0.0.0', local_port))
         self.sock,self.queue = sock, asyncio.Queue()
@@ -142,7 +142,7 @@ class AsyncSocket:
 
 # PTP mode container
 class PTPMode:
-    enabled: bool = True
+    enabled: bool = False
     waiting_for_trigger: bool = False
     samples_awaited: int = 0
     device_manager: DeviceManager = None
@@ -1011,7 +1011,7 @@ class Plotter(QWidget):
         #self._penetrate_firewall()
         #for i, f in enumerate((self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._register_all, self._reset_counter)):
         # TODO: add self._leader_changed
-        for i, f in enumerate((self._ping_all, self._get_ids, self._get_clock_config, self._register_all, self._register_ccu, self._reset_counter)):
+        for i, f in enumerate((self._ping_all, self._get_ids, self._get_clock_config, self._register_all, self._reset_counter)): #, self._register_ccu
             QTimer(self).singleShot(i * 100, f)
 
 def main(argv):
