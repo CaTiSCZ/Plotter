@@ -140,10 +140,30 @@ class AsyncSocket:
     def sendto(self, data:bytes, target:Tuple[str,int]):
         self.sock.sendto(data, target)
 
+# PTP mode container
+class PTPMode:
+    enabled: bool = True
+    waiting_for_trigger: bool = False
+    samples_awaited: int = 0
+    device_manager: DeviceManager = None
+
+    def fire_trigger(self):
+        if not self.enabled:
+            return
+        if not self.waiting_for_trigger:
+            return
+        self.waiting_for_trigger = False
+        self.device_manager.ptp_trigger()
+        self._logger.info('PTP trigger received, starting sampling.')
+
+ptp_mode = PTPMode()
+
 # Single device client
 class Device:
     PKT_TYPE_ACK = 0
+    PKT_TYPE_ID = 1
     PKT_TYPE_DATA = 2
+    PKT_TYPE_TRIGGER = 3
     PKT_TYPE_LOG  = 4
     PKT_TYPE_RESULT  = 5
 
@@ -159,6 +179,8 @@ class Device:
         self.header_struct = struct.Struct('<HH')
         self.data_struct = struct.Struct('<'+'h'*SAMPLES_PER_PACKET)
         self.silent_ping = False
+        self.packet_counter = 0
+        self.ptp_triggered = False
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None):
         pkt = struct.pack('<I', code) + payload
@@ -218,6 +240,12 @@ class Device:
     
     def reset_device(self):
         return self._send_cmd(14, struct.pack('<B', 0xFE))
+    
+    def ptp_trigger(self):
+        if not ptp_mode.enabled:
+            return
+        self.packet_counter = 0
+        self.ptp_triggered = True
 
     def set_clock_ctrl(self, clock_ctrl:int, save: bool = False):
         """According CLOCK_SETTINGS index."""
@@ -255,6 +283,13 @@ class Device:
                 data = _verify_crc(pkt)
                 if not data:
                     return
+                if ptp_mode.enabled:
+                    if not self.ptp_triggered:
+                        return
+                    if self.packet_counter >= ptp_mode.samples_awaited:
+                        self.ptp_triggered = False
+                        return
+                    self.packet_counter += 1
                 #print(f"[DBG] Dev {self.id} dataPacket {order} length {len(pkt)}")
                 off = 4
                 t = [order*SAMPLES_PER_PACKET + k for k in range(SAMPLES_PER_PACKET)]
@@ -269,6 +304,13 @@ class Device:
                 fault_state = data[off:off+2]
                 self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
                 return order
+            case self.PKT_TYPE_TRIGGER:
+                # data = _verify_crc(pkt)
+                # if not data:
+                #     return
+                packet_num = struct.unpack('<H', data[2:4])
+                sample_num = struct.unpack('<B', data[5])
+                ptp_mode.fire_trigger()
             case self.PKT_TYPE_LOG:
                 log_msg = pkt[4:].decode('utf-8').strip()
                 self._logger.info(f"Dev {self.ip} log[{order}]: {log_msg}")
@@ -336,6 +378,9 @@ class DeviceManager:
     def get_clock_config_all(self):
         return {ip: dev.get_clock_config() for ip, dev in self.devices.items()}
 
+    def ptp_trigger(self):
+        for dev in self.devices.values(): dev.ptp_trigger()
+
     def dispatch_loop(self, signal):
         async def run():
             while True:
@@ -398,6 +443,7 @@ class Plotter(QWidget):
         self.default_cmd_port = DEFAULT_CMD_PORT
         self.last_order: Dict[str,int] = {}
         self.expected_samples = 0
+        ptp_mode.device_manager = manager
 
         self.setWindowTitle(APPLICATION_TITLE)
         self.resize(1400, 800)
@@ -681,37 +727,50 @@ class Plotter(QWidget):
     def _start_sampling(self):
         n = self.sample_spin.value()
         self.expected_samples = n
-        leader_id=self.leader_buttons.checkedId()
-        leader_ip = self.device_edits[leader_id].text().strip().split(':')[0]
-        for i, (ip, dev) in enumerate(self.manager.devices.items()):
-            if ip != leader_ip:
-                dev.start_sampling(n)
-                self._logger.info(f'Start on follower {ip} (n={n})')
-        if 0 <= leader_id < len(self.manager.devices):
-            time.sleep(0.01)
-            self.manager.devices[leader_ip].start_sampling(n)
-            self._logger.info(f'Start on leader {leader_ip} (n={n})')
+
+        if ptp_mode.enabled:
+            ptp_mode.samples_awaited = n
+            ptp_mode.waiting_for_trigger = True
+            ptp_mode.fire_trigger()
+            self._logger.info(f'Started PTP sampling (n={n})')
         else:
-            for ip, dev in self.manager.devices.items():
-                dev.start_sampling(n)
-                self._logger.info(f'Start on {ip} (n={n})')
+            leader_id=self.leader_buttons.checkedId()
+            leader_ip = self.device_edits[leader_id].text().strip().split(':')[0]
+            for i, (ip, dev) in enumerate(self.manager.devices.items()):
+                if ip != leader_ip:
+                    dev.start_sampling(n)
+                    self._logger.info(f'Start on follower {ip} (n={n})')
+            if 0 <= leader_id < len(self.manager.devices):
+                time.sleep(0.01)
+                self.manager.devices[leader_ip].start_sampling(n)
+                self._logger.info(f'Start on leader {leader_ip} (n={n})')
+            else:
+                for ip, dev in self.manager.devices.items():
+                    dev.start_sampling(n)
+                    self._logger.info(f'Start on {ip} (n={n})')
 
     def _start_sampling_on_trigger(self):
         n = self.sample_spin.value()
         self.expected_samples = n
-        leader_id = self.leader_buttons.checkedId()
-        leader_ip = self.device_edits[leader_id].text().strip().split(':')[0]
-        for i, (ip, dev) in enumerate(self.manager.devices.items()):
-            if ip != leader_ip:
-                dev.start_sampling(n)
-                self._logger.info(f'Start on follower {ip} (n={n})')
-        if 0 <= leader_id < len(self.manager.devices):
-            self.manager.devices[leader_ip].start_sampling_trigger(n)
-            self._logger.info(f'Trigger on leader {leader_ip} (n={n})')
+
+        if ptp_mode.enabled:
+            ptp_mode.samples_awaited = n
+            ptp_mode.waiting_for_trigger = True
+            self._logger.info(f'Wait trigger PTP sampling (n={n})')
         else:
-            for ip, dev in self.manager.devices.items():
-                dev.start_sampling(n)
-                self._logger.info(f'Start on {ip} (n={n})')
+            leader_id = self.leader_buttons.checkedId()
+            leader_ip = self.device_edits[leader_id].text().strip().split(':')[0]
+            for i, (ip, dev) in enumerate(self.manager.devices.items()):
+                if ip != leader_ip:
+                    dev.start_sampling(n)
+                    self._logger.info(f'Start on follower {ip} (n={n})')
+            if 0 <= leader_id < len(self.manager.devices):
+                self.manager.devices[leader_ip].start_sampling_trigger(n)
+                self._logger.info(f'Trigger on leader {leader_ip} (n={n})')
+            else:
+                for ip, dev in self.manager.devices.items():
+                    dev.start_sampling(n)
+                    self._logger.info(f'Start on {ip} (n={n})')
 
     def _start_new_sampling(self):
         self._reset_counter()
