@@ -183,6 +183,7 @@ class Device:
             return None
         info = parse_id_packet(rsp)
         self.channels = info['channels_count']
+        self.buffer = DeviceBuffer(self.channels)
         return info
 
     def set_id(self, new_id:int):
@@ -283,7 +284,7 @@ class Device:
                 samples.append(result_code)
                 errs = list(data[6:10])
                 self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
-                self._logger.info(f"Dev {self.ip} packetNumber[{order}]: result {result_code}")
+                #self._logger.info(f"Dev {self.ip} packetNumber[{order}]: result {result_code}")
                 return order
 
 # Manager of multiple devices
