@@ -281,7 +281,11 @@ class Device:
                 t = [order + 1]
                 samples = []
                 result_code = struct.unpack('<H', data[4:6])
-                samples.append(result_code)
+
+                for bit_idx in range(self.channels):
+                    bit_vals = ((result_code >> bit_idx) & 1).astype(int)
+                    samples.append(bit_vals)
+
                 errs = list(data[6:10])
                 self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
                 #self._logger.info(f"Dev {self.ip} packetNumber[{order}]: result {result_code}")
@@ -859,25 +863,24 @@ class Plotter(QWidget):
                 else:
                     x = np.array(buf.signal[1]) * PACKET_PERIOD
                     avgs = [0]  # Dummy for uniform output
-                    # Use first data channel (signal[1]) as byte source
-                    y_src = np.array(buf.signal[1])[-len(x):]
-                    # Convert to unsigned bytes; mask to 16 bits
-                    byte_values = y_src.astype(np.int32) & 0xFFFF
 
-                    num_bits = dev.channels
-                    center = (num_bits - 1) / 2.0
+                    center = (dev.channels - 1) / 2.0
                     offset_step = 0.05  # vertical spacing between bit lines
-
-                    for bit_idx in range(num_bits):
+                    # Use first data channel (signal[1]) as byte source
+                    #y_src = np.array(buf.signal[1])[-len(x):]
+                    # Convert to unsigned bytes; mask to 16 bits
+                    #byte_values = y_src.astype(np.int32) & 0xFFFF
+                    for bit_idx in range(dev.channels):
                         if bit_idx not in self.ax_result_curves:
                             color = Plotter.Colors[len(self.ax_result_curves) % len(Plotter.Colors)]
                             self.ax_result_curves[bit_idx] = self.ax_result.plot(pen=color, name=f'bit{bit_idx}')
                             #self.ax_result_curves[bit_idx] = self.ax_result.step(pen=color, where='post', name=f'bit{bit_idx}')
 
-                        bit_vals = ((byte_values >> bit_idx) & 1).astype(float)
+                        #bit_vals = ((byte_values >> bit_idx) & 1).astype(float)
+                        y = np.array(buf.signal[bit_idx + 1])[-len(x):]
                         # Slight offset so bits with same logical value are still visible
                         offset = (bit_idx - center) * offset_step
-                        y_bits = bit_vals + offset
+                        y_bits = y + offset
 
                         self.ax_result_curves[bit_idx].setData(x[-len(y_bits):], y_bits)
                         #self.ax_result.step(x[-len(y_bits):], y_bits, where='post', linewidth=2)
