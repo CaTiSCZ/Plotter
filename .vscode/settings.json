@@ -8,7 +8,7 @@
                 "program": "scada.py",
                 "env": { "USED_VSCODE_COMMAND_PICKARGS": "0" },
                 //"args": ["${command:pickArgs}"], // "${command:pickArgs}"
-                "args": ["DEBUG"],
+                //"args": ["DEBUG"],
                 "console": "integratedTerminal",
                 "justMyCode": false
             }

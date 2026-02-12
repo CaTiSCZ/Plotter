@@ -50,7 +50,7 @@ PACKET_PERIOD      = 1/(PACKET_RATE_HZ)
 BUFFER_LENGTH_S    = 30
 BUFFER_SIZE        = int(BUFFER_LENGTH_S*SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 DEFAULT_AVG_LEN_MS = 1000
-CCU_DEVICE_INDEX   = -1
+CCU_DEVICE_INDEX   = 0
 
 # Features
 FCN_QT_LOGGING = True  # Enable Qt logging handler
@@ -845,7 +845,7 @@ class Plotter(QWidget):
                 continue
             with buf.lock:
                 # Data processing
-                if (dev_index != 4): # TODO: index compare by constant
+                if (dev_index != CCU_DEVICE_INDEX):
                     x = np.array(buf.signal[0]) * SAMPLING_PERIOD
                     avgs = [0] * dev.channels
                     for ch in range(dev.channels):
@@ -961,7 +961,7 @@ def main(argv):
             loop.run_forever()
         threading.Thread(target=start_loop,daemon=True).start()
         def autoinit():
-            gui._update_defaults('192.168.137.100:')
+            gui._update_defaults('192.168.137.110:')
             debug = len(argv) > 1 and argv[1] == "DEBUG"
             for i, checkbox in enumerate(gui.device_checks):
                 if debug:
