@@ -280,7 +280,7 @@ class Device:
                     return
                 t = [order + 1]
                 samples = []
-                result_code = struct.unpack('<H', data[4:6])
+                result_code = struct.unpack('<H', data[4:6])[0]
 
                 for bit_idx in range(self.channels):
                     bit_vals = ((result_code >> bit_idx) & 1).astype(int)
