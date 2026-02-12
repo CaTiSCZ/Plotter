@@ -868,6 +868,8 @@ class Plotter(QWidget):
                 # Result processing
                 else:
                     x = np.array(buf.signal[0]) * PACKET_PERIOD
+                    # Statistics part
+                    received = int(len(x))
                     # interpolete x to stretch graph to the same width as signal plot, so each packet corresponds to SAMPLES_PER_PACKET samples on the graph 
                     n = x.size
                     x_idx = np.arange(n, dtype=float)
@@ -907,9 +909,6 @@ class Plotter(QWidget):
                     
                     # Error calculation
                     errs = ','.join(str(sum(list(buf.error[c])[-1:])) for c in range(dev.channels))
-
-                    # Statistics part
-                    received = int(len(x))
 
             # Statistics
             avgs = ', '.join(map(lambda v: f'{v:.3f}', avgs))
