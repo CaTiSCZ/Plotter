@@ -867,7 +867,20 @@ class Plotter(QWidget):
 
                 # Result processing
                 else:
-                    x = np.array(buf.signal[1]) * PACKET_PERIOD
+                    x = np.array(buf.signal[0]) * PACKET_PERIOD
+                    # interpolete x to stretch graph to the same width as signal plot, so each packet corresponds to SAMPLES_PER_PACKET samples on the graph 
+                    n = x.size
+                    x_idx = np.arange(n, dtype=float)
+                    x_idx_new = (
+                        np.arange(n * SAMPLES_PER_PACKET, dtype=float) / SAMPLES_PER_PACKET
+                        - (SAMPLES_PER_PACKET - 1) / SAMPLES_PER_PACKET
+                    )
+                    x_interpolated = np.interp(x_idx_new, x_idx, x)
+                    m_left = (x[1] - x[0]) / (x_idx[1] - x_idx[0])
+                    left = x_idx_new < x_idx[0]
+                    x_interpolated[left] = x[0] + m_left * (x_idx_new[left] - x_idx[0])
+                    x = x_interpolated
+
                     avgs = [0]  # Dummy for uniform output
 
                     center = (dev.channels - 1) / 2.0
@@ -884,6 +897,7 @@ class Plotter(QWidget):
 
                         #bit_vals = ((byte_values >> bit_idx) & 1).astype(float)
                         y = np.array(buf.signal[bit_idx + 1])[-len(x):]
+                        y = np.repeat(y, SAMPLES_PER_PACKET) # Y interpolation - steps
                         # Slight offset so bits with same logical value are still visible
                         offset = (bit_idx - center) * offset_step
                         y_bits = y + offset
