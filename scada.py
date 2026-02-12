@@ -987,7 +987,7 @@ def main(argv):
                     checkbox.setChecked(i in (0,))
                 else:
                     checkbox.setChecked(True)
-            #gui.leader_buttons.button(0 if debug else 1).setChecked(True)
+            gui.leader_buttons.button(1).setChecked(True)
             gui._apply_devices()
             gui._apply_config()
             gui.sample_spin.setValue(int(DEFAULT_AVG_LEN_MS))
