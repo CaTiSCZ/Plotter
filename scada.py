@@ -115,7 +115,7 @@ class DeviceBuffer:
             self.time.extend(t)
             for ch, sig in enumerate(samples):
                 self.signal[ch+1].extend(sig)
-                self.error[ch].extend([errs[ch]]*SAMPLES_PER_PACKET)
+                self.error[ch].extend([errs[ch]]*len(sig))
             self.signal[0].extend(t)
 
 # Async UDP socket
@@ -284,9 +284,12 @@ class Device:
 
                 for bit_idx in range(self.channels):
                     bit_vals = (result_code >> bit_idx) & 1
-                    samples.append(bit_vals)
+                    samples.append([bit_vals])
 
-                errs = list(data[6:10])
+                errs = []
+                for e in list(data[6:10]):
+                    errs.extend([e, e])
+
                 self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
                 #self._logger.info(f"Dev {self.ip} packetNumber[{order}]: result {result_code}")
                 return order
@@ -888,6 +891,9 @@ class Plotter(QWidget):
                         self.ax_result_curves[bit_idx].setData(x[-len(y_bits):], y_bits)
                         #self.ax_result.step(x[-len(y_bits):], y_bits, where='post', linewidth=2)
                     
+                    # Error calculation
+                    errs = ','.join(str(sum(list(buf.error[c])[-1:])) for c in range(dev.channels))
+
                     # Statistics part
                     received = int(len(x))
 
