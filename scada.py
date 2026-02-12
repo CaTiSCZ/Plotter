@@ -800,7 +800,10 @@ class Plotter(QWidget):
     
     def save_measurement(self):
         measurement_nr = int(self.measurement_number_edit.text())
-        file_name = os.path.join(f'RICE_mereni', str(measurement_nr).zfill(4))
+        dir_path = 'RICE_mereni'
+        if not os.path.exists(dir_path):
+            os.mkdir(dir_path)
+        file_name = os.path.join(dir_path, str(measurement_nr).zfill(4))
         self.save_data(file_prefix=file_name)
         measurement_nr += 1
         self.measurement_number_edit.setText(str(measurement_nr))
