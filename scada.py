@@ -293,7 +293,7 @@ class Device:
 
 # Manager of multiple devices
 class DeviceManager:
-    MAX_DEVICES = 6
+    MAX_DEVICES = 5
     def __init__(self, data_port:int = DEFAULT_DATA_PORT):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.data_port = data_port
@@ -967,7 +967,7 @@ def main(argv):
                 if debug:
                     checkbox.setChecked(i in (0,))
                 else:
-                    checkbox.setChecked(i != 0)
+                    checkbox.setChecked(True)
             #gui.leader_buttons.button(0 if debug else 1).setChecked(True)
             gui._apply_devices()
             gui._apply_config()
