@@ -980,14 +980,21 @@ def main(argv):
             loop.run_forever()
         threading.Thread(target=start_loop,daemon=True).start()
         def autoinit():
-            gui._update_defaults('192.168.137.110:')
+            try:
+                import default_settings as ds
+                DEFAULT_FIRST_IP = ds.DEFAULT_FIRST_IP
+                DEFAULT_LEADER = ds.DEFAULT_LEADER
+            except ImportError:
+                DEFAULT_FIRST_IP = "192.168.137.100"
+                DEFAULT_LEADER = 1
+            gui._update_defaults(DEFAULT_FIRST_IP + ':')
             debug = len(argv) > 1 and argv[1] == "DEBUG"
             for i, checkbox in enumerate(gui.device_checks):
                 if debug:
                     checkbox.setChecked(i in (0,))
                 else:
                     checkbox.setChecked(True)
-            gui.leader_buttons.button(1).setChecked(True)
+            gui.leader_buttons.button(DEFAULT_LEADER).setChecked(True)
             gui._apply_devices()
             gui._apply_config()
             gui.sample_spin.setValue(int(DEFAULT_AVG_LEN_MS))
