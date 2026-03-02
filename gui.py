@@ -266,7 +266,7 @@ class Gui(QMainWindow):
 
         row2.addWidget(self.y_min_label, 0, 4, alignment=Qt.AlignRight)
         row2.addWidget(self.y_min_spinbox, 0, 5, alignment=Qt.AlignLeft)
-        self.y_min_spinbox.valueChanged.connect(lambda: plotter._logger("TO DO"))
+        self.y_min_spinbox.valueChanged.connect(lambda: plotter._logger.info("TO DO"))
 # --- Y Max ---
         self.y_max_label = QLabel("Y max:")
         self.y_max_spinbox = QDoubleSpinBox()
@@ -275,7 +275,7 @@ class Gui(QMainWindow):
 
         row2.addWidget(self.y_max_label, 0, 6, alignment=Qt.AlignRight)
         row2.addWidget(self.y_max_spinbox, 0, 7, alignment=Qt.AlignLeft)
-        self.y_max_spinbox.valueChanged.connect(lambda: plotter._logger("TO DO"))
+        self.y_max_spinbox.valueChanged.connect(lambda: plotter._logger.info("TO DO"))
 # X range
         self.x_range_label = QLabel("X range:")
         self.x_range_spinbox = QDoubleSpinBox()
@@ -284,13 +284,13 @@ class Gui(QMainWindow):
         self.x_range_spinbox.setSuffix(" ms")
         row2.addWidget(self.x_range_label, 0, 8, alignment=Qt.AlignRight)
         row2.addWidget(self.x_range_spinbox, 0, 9, alignment=Qt.AlignLeft)
-        self.x_range_spinbox.valueChanged.connect(lambda: plotter._logger("TO DO"))        
+        self.x_range_spinbox.valueChanged.connect(lambda: plotter._logger.info("TO DO"))        
 
 # x auto range        
         self.auto_x_range = True
         self.auto_x_range_checkbox = QCheckBox("Whole buffer")
         self.auto_x_range_checkbox.setChecked(True)
-        self.auto_x_range_checkbox.stateChanged.connect(lambda: plotter._logger("TO DO"))
+        self.auto_x_range_checkbox.stateChanged.connect(lambda: plotter._logger.info("TO DO"))
         row2.addWidget(self.auto_x_range_checkbox, 0, 10, alignment=Qt.AlignCenter)
 
 # Buffer size
@@ -301,7 +301,7 @@ class Gui(QMainWindow):
    
         row2.addWidget(self.buffer_size_label, 0, 11, alignment=Qt.AlignRight)
         row2.addWidget(self.buffer_size_spinbox, 0, 12, alignment=Qt.AlignLeft)
-        self.buffer_size_spinbox.valueChanged.connect(lambda: plotter._logger("TO DO"))
+        self.buffer_size_spinbox.valueChanged.connect(lambda: plotter._logger.info("TO DO"))
 
         self.decimation_label = QLabel("Decimation:")
         self.decimation_value = QSpinBox()
@@ -320,7 +320,7 @@ class Gui(QMainWindow):
         self.decimation_mode_dropdown.currentTextChanged.connect(plotter.decimation_changed)
 # clear graf
         self.clear_button = QPushButton("Clean graf")
-        self.clear_button.clicked.connect(lambda: plotter._logger("TO DO"))
+        self.clear_button.clicked.connect(lambda: plotter._logger.info("TO DO"))
         row2.addWidget(self.clear_button, 0, 17, alignment=Qt.AlignCenter)
 # ------ 3. řádek -----
 # Path display (full width)
@@ -338,15 +338,15 @@ class Gui(QMainWindow):
         row2.addWidget(self.path_display, 1, 4, 1, 10)
         
         self.set_path_button = QPushButton("Set path")
-        self.set_path_button.clicked.connect(lambda: plotter._logger("TO DO"))
+        self.set_path_button.clicked.connect(lambda: plotter._logger.info("TO DO"))
         row2.addWidget(self.set_path_button, 2, 4)
         
         self.save_data_button = QPushButton("Save buffer")
-        self.save_data_button.clicked.connect(lambda: plotter._logger("TO DO"))
+        self.save_data_button.clicked.connect(lambda: plotter._logger.info("TO DO"))
         row2.addWidget(self.save_data_button, 2, 5)
 
         self.AdHoc_safe_button = QPushButton("Ad Hoc save")
-        self.AdHoc_safe_button.clicked.connect(lambda: plotter._logger("TO DO"))
+        self.AdHoc_safe_button.clicked.connect(lambda: plotter._logger.info("TO DO"))
         row2.addWidget(self.AdHoc_safe_button, 2, 6)
 
         self.layout.addLayout(row2)
@@ -388,7 +388,7 @@ class Gui(QMainWindow):
         self.save_on_trigger = False
         self.save_on_trigger_checkbox = QCheckBox("Save on triger")
         self.save_on_trigger_checkbox.setChecked(True)
-        self.save_on_trigger_checkbox.stateChanged.connect(lambda: plotter._logger("TO DO"))
+        self.save_on_trigger_checkbox.stateChanged.connect(lambda: plotter._logger.info("TO DO"))
         grid.addWidget(self.save_on_trigger_checkbox, 3, 2, 1, 3,  alignment=Qt.AlignLeft)      
 
 
@@ -490,7 +490,7 @@ class Gui(QMainWindow):
 
         self.connect_generator_button = QPushButton("Connect")
         grid.addWidget(self.connect_generator_button, device_count + 1, 14,1,1, alignment=Qt.AlignCenter)
-        self.connect_generator_button.clicked.connect(lambda: plotter._logger("TO DO"))
+        self.connect_generator_button.clicked.connect(lambda: plotter._logger.info("TO DO"))
 
 # === Sloupec 3: LOG ===
         self.log_output = QTextEdit("Log messenge:")
@@ -580,14 +580,14 @@ class Gui(QMainWindow):
         panels_menu = menubar.addMenu("&Panely")
         
         # Akce pro graf
-        graph_action = QAction("&Nový graf", self)
+        graph_action = QAction("Nový &graf", self)
         graph_action.setShortcut("Ctrl+G")
         graph_action.setStatusTip("Otevře nový panel s grafem")
         graph_action.triggered.connect(self.open_new_graph_panel)
         panels_menu.addAction(graph_action)
         
         # Akce pro log
-        log_action = QAction("&Nové logy", self)
+        log_action = QAction("Nové &logy", self)
         log_action.setShortcut("Ctrl+L")
         log_action.setStatusTip("Otevře nový panel s logy")
         log_action.triggered.connect(self.open_new_log_panel)
@@ -642,7 +642,7 @@ class Gui(QMainWindow):
         
         dock.destroyed.connect(remove_dock)
         
-        self.plotter._logger(f"Otevřen nový panel grafu #{self.graph_panel_counter}")
+        self.plotter._logger.debug(f"Otevřen nový panel grafu #{self.graph_panel_counter}")
     
     def open_new_log_panel(self):
         """Otevře nový dockable panel s logy."""
@@ -692,7 +692,7 @@ class Gui(QMainWindow):
         
         dock.destroyed.connect(remove_dock)
         
-        self.plotter._logger(f"Otevřen nový panel logů #{self.log_panel_counter}")
+        self.plotter._logger.debug(f"Otevřen nový panel logů #{self.log_panel_counter}")
     
     def close_all_panels(self):
         """Zavře všechny otevřené panely."""
@@ -704,7 +704,7 @@ class Gui(QMainWindow):
         for dock, _ in self.log_docks[:]:
             dock.close()
         
-        self.plotter._logger("Všechny panely byly zavřeny")
+        self.plotter._logger.debug("Všechny panely byly zavřeny")
 
     def show(self):
         res = super().show()
