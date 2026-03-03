@@ -283,6 +283,7 @@ class Device:
             case self.PKT_TYPE_DATA:
                 data = _verify_crc(pkt)
                 if not data:
+                    self._logger.info(f"Dev {self.ip} received corrupted DATA packet.")
                     return
                 if ptp_mode.enabled:
                     if not self.ptp_triggered:
