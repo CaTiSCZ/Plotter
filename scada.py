@@ -143,6 +143,7 @@ class AsyncSocket:
 # Single device client
 class Device:
     PKT_TYPE_ACK = 0
+    PKT_TYPE_ID  = 1
     PKT_TYPE_DATA = 2
     PKT_TYPE_LOG  = 4
     PKT_TYPE_RESULT  = 5
@@ -177,14 +178,23 @@ class Device:
         self.silent_ping = silent
         return bool(self._send_cmd(0, struct.pack('?', silent), expect=socket_ is None, socket_=socket_))
 
-    def get_id(self)->dict|None:
-        rsp = _verify_crc(self._send_cmd(1) or b'')
-        if not rsp:
+    def _parse_id(self, pkt:bytes):
+        try:
+            pkt = _verify_crc(pkt)
+            if not pkt:
+                self._logger.warning(f"Dev {self.ip} ID CRC mismatch.")
+                return None
+            info = parse_id_packet(pkt)
+            self.channels = info['channels_count']
+            self.buffer = DeviceBuffer(self.channels)
+            self.info = info
+            return info
+        except Exception as e:
+            self._logger.warning(f"Dev {self.ip} failed to parse ID packet: {e}")
             return None
-        info = parse_id_packet(rsp)
-        self.channels = info['channels_count']
-        self.buffer = DeviceBuffer(self.channels)
-        return info
+
+    def get_id(self)->dict|None:
+        return self._parse_id(self._send_cmd(1) or b'')
 
     def set_id(self, new_id:int):
         payload = struct.pack('<B', new_id)
@@ -293,6 +303,10 @@ class Device:
                 self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
                 #self._logger.info(f"Dev {self.ip} packetNumber[{order}]: result {result_code}")
                 return order
+            case self.PKT_TYPE_ID:
+                self._logger.info(f"Dev {self.ip} ID packet received on data socket.")
+                self._parse_id(pkt)
+                return
 
 # Manager of multiple devices
 class DeviceManager:
