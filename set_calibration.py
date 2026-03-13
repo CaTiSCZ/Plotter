@@ -54,4 +54,6 @@ if __name__ == "__main__":
         info[i] = (unit, offset, gain)
     if len(sys.argv) > 3 + channels*3:
         save = not (sys.argv[3 + channels*3].lower() in ['false', '0', 'no'])
+    else:
+        save = True
     set_calibration(ip_address, channels, info, save)
