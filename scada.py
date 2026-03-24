@@ -142,10 +142,13 @@ class AsyncSocket:
 
 # PTP mode container
 class PTPMode:
-    enabled: bool = False
-    waiting_for_trigger: bool = False
-    samples_awaited: int = 0
+    enabled: bool = True
     device_manager: DeviceManager = None
+    
+    def __init__(self):
+        self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
+        self.waiting_for_trigger = False
+        self.samples_awaited = 0
 
     def fire_trigger(self):
         if not self.enabled:
