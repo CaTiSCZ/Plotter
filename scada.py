@@ -71,7 +71,7 @@ def _verify_crc(pkt: bytes) -> bytes|None:
     if not pkt or len(pkt)<2:
         return None
     data, recv_crc = pkt[:-2], CRC_STRUCT.unpack(pkt[-2:])[0]
-    return data if crc16_ccitt(data)==recv_crc else None
+    return data if crc16_ccitt(data)==recv_crc else False
 
 # ID packet parsing from GrafTest
 ID_HEADER_STRUCT = struct.Struct('<HHHBBI3I HBB I HBB 8s 30s H')
@@ -178,11 +178,17 @@ class Device:
         self.silent_ping = silent
         return bool(self._send_cmd(0, struct.pack('?', silent), expect=socket_ is None, socket_=socket_))
 
-    def _parse_id(self, pkt:bytes):
+    def _parse_id(self, pkt:bytes | None):
         try:
+            if pkt is None:
+                self._logger.warning(f"Dev {self.ip} did not respond to get ID cmd.")
+                return None
             pkt = _verify_crc(pkt)
-            if not pkt:
-                self._logger.warning(f"Dev {self.ip} ID CRC mismatch.")
+            if pkt is None:
+                self._logger.warning(f"Dev {self.ip} returned too short ID packet.")
+                return None
+            elif pkt is False:
+                self._logger.warning(f"Dev {self.ip} returned ID packet with incorrect CRC.")
                 return None
             info = parse_id_packet(pkt)
             self.channels = info['channels_count']
@@ -264,7 +270,11 @@ class Device:
                 return
             case self.PKT_TYPE_DATA:
                 data = _verify_crc(pkt)
-                if not data:
+                if data is None:
+                    self._logger.warning(f"Dev {self.ip} returned too short DATA packet.")
+                    return
+                elif data is False:
+                    self._logger.warning(f"Dev {self.ip} returned DATA packet with incorrect CRC.")
                     return
                 #print(f"[DBG] Dev {self.id} dataPacket {order} length {len(pkt)}")
                 off = 4
@@ -286,7 +296,11 @@ class Device:
                 return
             case self.PKT_TYPE_RESULT:
                 data = _verify_crc(pkt)
-                if not data:
+                if data is None:
+                    self._logger.warning(f"Dev {self.ip} returned too short RESULT packet.")
+                    return
+                elif data is False:
+                    self._logger.warning(f"Dev {self.ip} returned RESULT packet with incorrect CRC.")
                     return
                 t = [order + 1]
                 samples = []
