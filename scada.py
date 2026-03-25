@@ -284,10 +284,6 @@ class Device:
                     self._logger.info(f"Dev {self.ip} received ACK on DATA socket.")
                 return
             case self.PKT_TYPE_DATA:
-                data = _verify_crc(pkt)
-                if not data:
-                    self._logger.info(f"Dev {self.ip} received corrupted DATA packet.")
-                    return
                 if ptp_mode.enabled:
                     if not self.ptp_triggered:
                         return
@@ -295,6 +291,11 @@ class Device:
                         self.ptp_triggered = False
                         return
                     self.packet_counter += 1
+
+                data = _verify_crc(pkt)
+                if not data:
+                    self._logger.info(f"Dev {self.ip} received corrupted DATA packet.")
+                    return
                 #print(f"[DBG] Dev {self.id} dataPacket {order} length {len(pkt)}")
                 off = 4
                 t = [order*SAMPLES_PER_PACKET + k for k in range(SAMPLES_PER_PACKET)]
@@ -321,6 +322,10 @@ class Device:
                 self._logger.info(f"Dev {self.ip} log[{order}]: {log_msg}")
                 return
             case self.PKT_TYPE_RESULT:
+                if ptp_mode.enabled:
+                    if not self.ptp_triggered:
+                        return
+
                 data = _verify_crc(pkt)
                 if not data:
                     return
