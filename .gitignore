@@ -17,3 +17,6 @@ logs
 
 RICE_mereni
 default_settings.py
+
+# generated tests
+tests/send_test_data/*.csv

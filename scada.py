@@ -49,7 +49,7 @@ SAMPLING_PERIOD    = 1/(SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 PACKET_PERIOD      = 1/(PACKET_RATE_HZ)
 BUFFER_LENGTH_S    = 30
 BUFFER_SIZE        = int(BUFFER_LENGTH_S*SAMPLES_PER_PACKET*PACKET_RATE_HZ)
-DEFAULT_AVG_LEN_MS = 1000
+DEFAULT_AVG_LEN_MS = 1000 # could be overwritten by default_settings.py
 CCU_DEVICE_INDEX   = 0
 
 # Features
@@ -71,7 +71,7 @@ def _verify_crc(pkt: bytes) -> bytes|None:
     if not pkt or len(pkt)<2:
         return None
     data, recv_crc = pkt[:-2], CRC_STRUCT.unpack(pkt[-2:])[0]
-    return data if crc16_ccitt(data)==recv_crc else None
+    return data if crc16_ccitt(data)==recv_crc else False
 
 # ID packet parsing from GrafTest
 ID_HEADER_STRUCT = struct.Struct('<HHHBBI3I HBB I HBB 8s 30s H')
@@ -202,14 +202,29 @@ class Device:
         self.silent_ping = silent
         return bool(self._send_cmd(0, struct.pack('?', silent), expect=socket_ is None, socket_=socket_))
 
-    def get_id(self)->dict|None:
-        rsp = _verify_crc(self._send_cmd(1) or b'')
-        if not rsp:
+    def _parse_id(self, pkt:bytes | None):
+        try:
+            if pkt is None:
+                self._logger.warning(f"Dev {self.ip} did not respond to get ID cmd.")
+                return None
+            pkt = _verify_crc(pkt)
+            if pkt is None:
+                self._logger.warning(f"Dev {self.ip} returned too short ID packet.")
+                return None
+            elif pkt is False:
+                self._logger.warning(f"Dev {self.ip} returned ID packet with incorrect CRC.")
+                return None
+            info = parse_id_packet(pkt)
+            self.channels = info['channels_count']
+            self.buffer = DeviceBuffer(self.channels)
+            self.info = info
+            return info
+        except Exception as e:
+            self._logger.warning(f"Dev {self.ip} failed to parse ID packet: {e}")
             return None
-        info = parse_id_packet(rsp)
-        self.channels = info['channels_count']
-        self.buffer = DeviceBuffer(self.channels)
-        return info
+
+    def get_id(self)->dict|None:
+        return self._parse_id(self._send_cmd(1) or b'')
 
     def set_id(self, new_id:int):
         payload = struct.pack('<B', new_id)
@@ -293,8 +308,12 @@ class Device:
                     self.packet_counter += 1
 
                 data = _verify_crc(pkt)
-                if not data:
+                if data is None:
+                    self._logger.warning(f"Dev {self.ip} returned too short DATA packet.")
                     self._logger.info(f"Dev {self.ip} received corrupted DATA packet.")
+                    return
+                elif data is False:
+                    self._logger.warning(f"Dev {self.ip} returned DATA packet with incorrect CRC.")
                     return
                 #print(f"[DBG] Dev {self.id} dataPacket {order} length {len(pkt)}")
                 off = 4
@@ -327,7 +346,11 @@ class Device:
                         return
 
                 data = _verify_crc(pkt)
-                if not data:
+                if data is None:
+                    self._logger.warning(f"Dev {self.ip} returned too short RESULT packet.")
+                    return
+                elif data is False:
+                    self._logger.warning(f"Dev {self.ip} returned RESULT packet with incorrect CRC.")
                     return
                 t = [order + 1]
                 samples = []
@@ -344,6 +367,10 @@ class Device:
                 self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
                 #self._logger.info(f"Dev {self.ip} packetNumber[{order}]: result {result_code}")
                 return order
+            case self.PKT_TYPE_ID:
+                self._logger.info(f"Dev {self.ip} ID packet received on data socket.")
+                self._parse_id(pkt)
+                return
 
 # Manager of multiple devices
 class DeviceManager:
@@ -1052,16 +1079,20 @@ def main(argv):
                 import default_settings as ds
                 DEFAULT_FIRST_IP = ds.DEFAULT_FIRST_IP
                 DEFAULT_LEADER = ds.DEFAULT_LEADER
+                DEVICES_COUNT = ds.DEVICES_COUNT
+                DEFAULT_AVG_LEN_MS = ds.DEFAULT_AVG_LEN_MS
             except ImportError:
                 DEFAULT_FIRST_IP = "192.168.137.100"
                 DEFAULT_LEADER = 1
+                DEVICES_COUNT = len(gui.device_checks)
+                # DEFAULT_AVG_LEN_MS is defined at file begin
             gui._update_defaults(DEFAULT_FIRST_IP + ':')
             debug = len(argv) > 1 and argv[1] == "DEBUG"
             for i, checkbox in enumerate(gui.device_checks):
                 if debug:
                     checkbox.setChecked(i in (0,))
                 else:
-                    checkbox.setChecked(True)
+                    checkbox.setChecked(i < DEVICES_COUNT)
             gui.leader_buttons.button(DEFAULT_LEADER).setChecked(True)
             gui._apply_devices()
             gui._apply_config()
