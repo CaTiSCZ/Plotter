@@ -1012,16 +1012,18 @@ def main(argv):
                 import default_settings as ds
                 DEFAULT_FIRST_IP = ds.DEFAULT_FIRST_IP
                 DEFAULT_LEADER = ds.DEFAULT_LEADER
+                DEVICES_COUNT = ds.DEVICES_COUNT
             except ImportError:
                 DEFAULT_FIRST_IP = "192.168.137.100"
                 DEFAULT_LEADER = 1
+                DEVICES_COUNT = len(gui.device_checks)
             gui._update_defaults(DEFAULT_FIRST_IP + ':')
             debug = len(argv) > 1 and argv[1] == "DEBUG"
             for i, checkbox in enumerate(gui.device_checks):
                 if debug:
                     checkbox.setChecked(i in (0,))
                 else:
-                    checkbox.setChecked(True)
+                    checkbox.setChecked(i < DEVICES_COUNT)
             gui.leader_buttons.button(DEFAULT_LEADER).setChecked(True)
             gui._apply_devices()
             gui._apply_config()
