@@ -1,0 +1,24 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": "${command:pickArgs}"
+        },
+        {
+            "name": "send_test_data",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "send_test_data.py",
+            "console": "integratedTerminal",
+            "args": ["--ip", "192.168.137.121", "-S", "-c", "sin", "-c", "3", "-R", "-s", "5000", "tests\\send_test_data\\header_semi_dot.csv"] //"${command:pickArgs}"
+        }
+    ]
+}
