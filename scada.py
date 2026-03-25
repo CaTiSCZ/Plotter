@@ -49,7 +49,7 @@ SAMPLING_PERIOD    = 1/(SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 PACKET_PERIOD      = 1/(PACKET_RATE_HZ)
 BUFFER_LENGTH_S    = 30
 BUFFER_SIZE        = int(BUFFER_LENGTH_S*SAMPLES_PER_PACKET*PACKET_RATE_HZ)
-DEFAULT_AVG_LEN_MS = 1000
+DEFAULT_AVG_LEN_MS = 1000 # could be overwritten by default_settings.py
 CCU_DEVICE_INDEX   = 0
 
 # Features
@@ -1013,10 +1013,12 @@ def main(argv):
                 DEFAULT_FIRST_IP = ds.DEFAULT_FIRST_IP
                 DEFAULT_LEADER = ds.DEFAULT_LEADER
                 DEVICES_COUNT = ds.DEVICES_COUNT
+                DEFAULT_AVG_LEN_MS = ds.DEFAULT_AVG_LEN_MS
             except ImportError:
                 DEFAULT_FIRST_IP = "192.168.137.100"
                 DEFAULT_LEADER = 1
                 DEVICES_COUNT = len(gui.device_checks)
+                # DEFAULT_AVG_LEN_MS is defined at file begin
             gui._update_defaults(DEFAULT_FIRST_IP + ':')
             debug = len(argv) > 1 and argv[1] == "DEBUG"
             for i, checkbox in enumerate(gui.device_checks):
