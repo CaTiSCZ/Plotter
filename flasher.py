@@ -67,6 +67,12 @@ FINISH_REQ_SIZE = struct.calcsize(FINISH_REQ_FMT)
 FINISH_ACK_FMT = "<BBHI"   # ok, reserved0, reserved1, detail
 FINISH_ACK_SIZE = struct.calcsize(FINISH_ACK_FMT)
 
+STATUS_REQ_FMT = "<I"
+STATUS_REQ_SIZE = struct.calcsize(STATUS_REQ_FMT)
+
+STATUS_ACK_FMT = "<IIBBH"
+STATUS_ACK_SIZE = struct.calcsize(STATUS_ACK_FMT)
+
 NACK_FMT = "<BBHI"         # error, reserved0, reserved1, detail
 NACK_SIZE = struct.calcsize(NACK_FMT)
 
@@ -253,6 +259,26 @@ class UdpBootFlasher:
             self.request(BOOT_CMD_ABORT, b"", {BOOT_CMD_FINISH_ACK})
         except Exception:
             pass
+    
+    def get_status(self):
+        payload = struct.pack(STATUS_REQ_FMT, 0)
+        _, resp_payload = self.request(BOOT_CMD_STATUS, payload, {BOOT_CMD_STATUS})
+
+        if len(resp_payload) != STATUS_ACK_SIZE:
+            raise RuntimeError(f"STATUS_ACK payload wrong size: {len(resp_payload)}")
+
+        current_bank_base, inactive_bank_base, current_bank, inactive_bank, _reserved = struct.unpack(
+            STATUS_ACK_FMT, resp_payload
+        )
+
+        return {
+            "current_bank_base": current_bank_base,
+            "inactive_bank_base": inactive_bank_base,
+            "current_bank": current_bank,
+            "inactive_bank": inactive_bank,
+            "current_bank_name": bank_base_to_name(current_bank_base),
+            "inactive_bank_name": bank_base_to_name(inactive_bank_base),
+        }
 
 
 def print_progress(done: int, total: int, start_time: float):
@@ -268,6 +294,13 @@ def print_progress(done: int, total: int, start_time: float):
         flush=True,
     )
 
+def print_target_status(prefix: str, status: dict):
+    print(
+        f"{prefix}: current={status['current_bank_name']} "
+        f"(0x{status['current_bank_base']:08X}), "
+        f"inactive={status['inactive_bank_name']} "
+        f"(0x{status['inactive_bank_base']:08X})"
+    )
 
 def flash_image(args) -> int:
     image_path = Path(args.bin)
@@ -299,6 +332,9 @@ def flash_image(args) -> int:
     )
 
     try:
+        status_before = flasher.get_status()
+        print_target_status("Before update", status_before)
+
         start_info = flasher.send_start(image_size, image_crc, args.version)
         chunk_max = start_info["chunk_max"]
         expected_size = start_info["expected_size"]
@@ -344,6 +380,14 @@ def flash_image(args) -> int:
             f"(0x{finish_info['programmed_bank_base']:08X})"
         )
         print("Flash completed. Target should reset and ROM dual-boot logic should choose the valid bank.")
+        print("Waiting for target reboot...")
+
+        time.sleep(args.reboot_wait)
+
+        status_after = flasher.get_status()
+        print_target_status("After reboot", status_after)
+
+        print("Flash completed.")
         return 0
 
     except KeyboardInterrupt:
@@ -371,6 +415,7 @@ def main():
     parser.add_argument("--timeout", type=float, default=1.0, help="UDP response timeout in seconds")
     parser.add_argument("--retries", type=int, default=8, help="Retries per packet")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
+    parser.add_argument("--reboot-wait", type=float, default=3.0, help="Seconds to wait after FINISH before querying STATUS again")
     args = parser.parse_args()
 
     rc = flash_image(args)
