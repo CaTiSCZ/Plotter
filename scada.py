@@ -1081,6 +1081,7 @@ def main(argv):
                 DEFAULT_LEADER = ds.DEFAULT_LEADER
                 DEVICES_COUNT = ds.DEVICES_COUNT
                 DEFAULT_AVG_LEN_MS = ds.DEFAULT_AVG_LEN_MS
+                ptp_mode.enabled = ds.DEFAULT_PTP_MODE_ENABLED
             except ImportError:
                 DEFAULT_FIRST_IP = "192.168.137.100"
                 DEFAULT_LEADER = 1
