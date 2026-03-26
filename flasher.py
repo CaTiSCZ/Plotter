@@ -164,6 +164,7 @@ class UdpBootFlasher:
 
     def request(self, cmd: int, payload: bytes, expect_cmds):
         packet = build_message(cmd, payload)
+        #print(f"TX len={len(packet)} cmd={cmd} hex={packet.hex()}")
 
         for attempt in range(1, self.retries + 1):
             try:
@@ -424,4 +425,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-# python flasher.py --ip 192.168.137.101 --port 10579 --bin FDDS_F7.bin --version 12
+# python flasher.py --ip 192.168.137.101 --port 10579 --bin FDDS_F7.bin --timeout 10.0 --version 12
