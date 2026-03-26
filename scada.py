@@ -1047,7 +1047,7 @@ class Plotter(QWidget):
         #self._penetrate_firewall()
         #for i, f in enumerate((self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._register_all, self._reset_counter)):
         # TODO: add self._leader_changed
-        for i, f in enumerate((self._ping_all, self._get_ids, self._get_clock_config, self._register_all, self._register_ccu, self._reset_counter)):
+        for i, f in enumerate((self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._register_all, self._register_ccu, self._reset_counter)):
             QTimer(self).singleShot(i * 100, f)
 
 def main(argv):
