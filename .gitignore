@@ -9,8 +9,14 @@ __pycache__/
 build
 dist
 
+# environment
+env
+
 # scada logs
 logs
 
 RICE_mereni
 default_settings.py
+
+# generated tests
+tests/send_test_data/*.csv
