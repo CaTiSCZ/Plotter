@@ -71,7 +71,7 @@ def _resolve_buffered_socket_class(backend: str):
                 import cppimport.import_hook  # noqa: F401
             except Exception:
                 pass
-            mod = importlib.import_module('buffered_socket_cpp')
+            mod = importlib.import_module('buffered_socket.buffered_socket_cpp')
             return mod.BufferedSocket, 'cpp'
         except Exception as e:
             if backend == 'cpp':
