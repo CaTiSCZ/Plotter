@@ -73,9 +73,14 @@ def _resolve_buffered_socket_class(backend: str):
                 pass
             mod = importlib.import_module('buffered_socket.buffered_socket_cpp')
             return mod.BufferedSocket, 'cpp'
-        except Exception as e:
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, GeneratorExit)):
+                raise
             if backend == 'cpp':
                 raise
+            logging.getLogger(__name__).warning(
+                f"C++ buffered socket import failed ({type(e).__name__}: {e}). Falling back to Python backend."
+            )
 
     if backend in ('auto', 'py', 'python'):
         from buffered_socket_py import BufferedSocket as PyBufferedSocket
