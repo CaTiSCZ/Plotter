@@ -184,6 +184,7 @@ class Device:
         self.silent_ping = False
         self.packet_counter = 0
         self.ptp_triggered = False
+        self.received_last = 0
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None):
         pkt = struct.pack('<I', code) + payload
@@ -1014,9 +1015,17 @@ class Plotter(QWidget):
                 sent += 1
             #received = int(len(x)//SAMPLES_PER_PACKET)
             sent = max(sent, received) # sent is updated in data_ready signal, which can be delayed from receiving buffer on heavy load
-            lines.append(f'{ip}: packets = {received}/{sent}/{self.expected_samples}; errs = {errs}; avg = {avgs}')
+            stat_line = f'{ip}: packets = {received}/{sent}/{self.expected_samples}; errs = {errs}; avg = {avgs}'
+
+            if (received == dev.received_last):
+                if received != self.expected_samples:
+                    stat_line = f'<span style="color:red;">{stat_line}</span>'
+            lines.append(stat_line)
+            dev.received_last = received
+
         self.error_lbl.setText(f'Statistic (ip: received / sent / expected packets (ms); channels parity errors; channels average per {DEFAULT_AVG_LEN_MS} ms):\n' + 
                                "\n".join(lines))
+        self.error_lbl.setTextFormat(Qt.RichText)
     
     def _update_clock_settings(self, row: int, index: int):
         """Compose command using index as type and send a single command."""
