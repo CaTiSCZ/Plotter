@@ -67,11 +67,8 @@ def _resolve_buffered_socket_class(backend: str):
 
     if backend in ('auto', 'cpp'):
         try:
-            try:
-                import cppimport.import_hook  # noqa: F401
-            except Exception:
-                pass
-            mod = importlib.import_module('buffered_socket.buffered_socket_cpp')
+            import cppimport
+            mod = cppimport.imp('buffered_socket.buffered_socket_cpp')
             return mod.BufferedSocket, 'cpp'
         except BaseException as e:
             if isinstance(e, (KeyboardInterrupt, GeneratorExit)):
