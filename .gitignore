@@ -4,6 +4,7 @@ __pycache__/
 
 # cppimport generated files
 *.rendered.*
+*.pdb
 
 # Pyinstaller generated files
 build

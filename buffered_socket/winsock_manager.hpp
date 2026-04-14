@@ -6,32 +6,17 @@
 class WinsockManager {
 public:
     static void ensure_initialized() {
-        std::lock_guard<std::mutex> lock(get_mutex());
-        if (!initialized()) {
+        std::call_once(get_once_flag(), []() {
             WSADATA wsaData;
             if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
                 throw std::runtime_error("WSAStartup failed");
             }
-            initialized() = true;
-            // Registrace úklidu při ukončení procesu
-            std::atexit(&WinsockManager::cleanup);
-        }
+        });
     }
 
 private:
-    static bool& initialized() {
-        static bool flag = false;
+    static std::once_flag& get_once_flag() {
+        static std::once_flag flag;
         return flag;
-    }
-    static std::mutex& get_mutex() {
-        static std::mutex m;
-        return m;
-    }
-    static void cleanup() {
-        std::lock_guard<std::mutex> lock(get_mutex());
-        if (initialized()) {
-            WSACleanup();
-            initialized() = false;
-        }
     }
 };

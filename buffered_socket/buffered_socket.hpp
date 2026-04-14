@@ -12,15 +12,14 @@
 #include <ws2tcpip.h>
 #include <atomic>
 #include <algorithm>
-#include <iostream>
 
 #undef min // defined in minwindef.h; conflicts with std::min from algorithm
 
 #pragma comment(lib, "Ws2_32.lib")
 
-namespace buffered_socket {
+// In case of standalone use (without Python binding), ensure Winsock is initialized by calling WSAStartup
 
-#include "winsock_manager.hpp"
+namespace buffered_socket {
 
 class SocketTimeout : public std::runtime_error {
 public:
@@ -33,9 +32,7 @@ public:
     BufferedSocket(int max_size = 4096, const std::string& name = "BufferedSocket")
         : max_size_(max_size), running_(false), sock_(INVALID_SOCKET),
           timeout_(1.0), received_count_(0), name_(name)
-    {
-        WinsockManager::ensure_initialized();
-    }
+    {}
 
     ~BufferedSocket() {
         close();
@@ -88,12 +85,28 @@ public:
         return {local_ip, port};
     }
 
+    void attach(SOCKET sock) {
+        close();
+        std::lock_guard<std::mutex> lock(sock_mutex_);
+        sock_ = sock;
+        DWORD tv = (DWORD)(timeout_ * 1000);
+        setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+        start();
+    }
+
     void close() {
         running_ = false;
-        if (sock_ != INVALID_SOCKET) {
-            closesocket(sock_);
-            sock_ = INVALID_SOCKET;
+        send_cv_.notify_all();
+        recv_cv_.notify_all();
+
+        {
+            std::lock_guard<std::mutex> lock(sock_mutex_);
+            if (sock_ != INVALID_SOCKET) {
+                closesocket(sock_);
+                sock_ = INVALID_SOCKET;
+            }
         }
+
         if (listener_thread_.joinable()) listener_thread_.join();
         if (sender_thread_.joinable()) sender_thread_.join();
         // Empty buffers:
@@ -139,7 +152,10 @@ public:
     void settimeout(double timeout_sec) {
         timeout_ = timeout_sec;
         DWORD tv = (DWORD)(timeout_ * 1000);
-        setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+        std::lock_guard<std::mutex> lock(sock_mutex_);
+        if (sock_ != INVALID_SOCKET) {
+            setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+        }
     }
     
     int get_received_count() {
@@ -158,8 +174,13 @@ public:
 private:
     void listen_loop() {
         while (running_) {
-            // Kontrola, jestli je socket platný
-            if (sock_ == INVALID_SOCKET) {
+            SOCKET sock_local = INVALID_SOCKET;
+            {
+                std::lock_guard<std::mutex> lock(sock_mutex_);
+                sock_local = sock_;
+            }
+
+            if (sock_local == INVALID_SOCKET) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
@@ -168,7 +189,7 @@ private:
             int addrlen = sizeof(src_addr);
             Container buffer;
             buffer.resize(max_size_);
-            int ret = ::recvfrom(sock_, (char*)buffer.data(), max_size_, 0, (sockaddr*)&src_addr, &addrlen);
+            int ret = ::recvfrom(sock_local, (char*)buffer.data(), max_size_, 0, (sockaddr*)&src_addr, &addrlen);
             if (ret > 0) {
                 buffer.resize(ret);
                 {
@@ -193,13 +214,18 @@ private:
                 item = std::move(send_buffer_.front());
                 send_buffer_.pop();
             }
-            
-            // Kontrola, jestli je socket platný před odesláním
-            if (sock_ == INVALID_SOCKET) {
+
+            SOCKET sock_local = INVALID_SOCKET;
+            {
+                std::lock_guard<std::mutex> lock(sock_mutex_);
+                sock_local = sock_;
+            }
+
+            if (sock_local == INVALID_SOCKET) {
                 continue;
             }
-            
-            ::sendto(sock_, (const char*)item.first.data(), (int)item.first.size(),
+
+            ::sendto(sock_local, (const char*)item.first.data(), (int)item.first.size(),
                    0, (sockaddr*)&item.second, sizeof(item.second));
         }
     }
