@@ -3,4 +3,4 @@ DEFAULT_LEADER = 1
 DEVICES_COUNT = 5
 DEFAULT_AVG_LEN_MS = 1000
 DEFAULT_PTP_MODE_ENABLED = False
-DEFAULT_SOCKET_BACKEND = 'auto'
+DEFAULT_SOCKET_BACKEND = 'auto' ## 'auto' tries to use C++ and falls back to Python on fail; 'py' uses Python socket, 'cpp' uses C++ socket and crashes when not available
