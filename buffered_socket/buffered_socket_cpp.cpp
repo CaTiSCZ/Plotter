@@ -71,8 +71,15 @@ PYBIND11_MODULE(buffered_socket_cpp, m) {
 /*
 <%
 cfg["dependencies"] = ["buffered_socket.hpp"]
-cfg["extra_compile_args"] = ["/MT", "/Z7", "/Od", "/Ob0", "/Oy-"]
-cfg["extra_link_args"] = ["/NODEFAULTLIB:msvcrt.lib", "/DEBUG:FULL", "/INCREMENTAL:NO", "/PDB:buffered_socket_cpp.pdb"]
+
+# Debug build:
+# cfg["extra_compile_args"] = ["/MT", "/Z7", "/Od", "/Ob0", "/Oy-"]
+# cfg["extra_link_args"] = ["/NODEFAULTLIB:msvcrt.lib", "/DEBUG:FULL", "/INCREMENTAL:NO", "/PDB:buffered_socket_cpp.pdb"]
+
+# Release build (optimized, no debug symbols):
+cfg["extra_compile_args"] = ["/MT", "/O2", "/GL", "/DNDEBUG"]
+cfg["extra_link_args"] = ["/NODEFAULTLIB:msvcrt.lib", "/LTCG", "/INCREMENTAL:NO"]
+
 setup_pybind11(cfg)
 %>
 */

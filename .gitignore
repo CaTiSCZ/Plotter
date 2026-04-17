@@ -1,6 +1,7 @@
 # Python chaches
 __pycache__/
 *.py[cod]
+*.pyd.old
 
 # cppimport generated files
 *.rendered.*
