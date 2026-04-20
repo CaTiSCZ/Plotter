@@ -1153,8 +1153,8 @@ class Plotter(QWidget):
             lines.append(stat_line)
             dev.received_last = received
 
-        self.error_lbl.setText(f'Statistic (ip: received / sent / expected packets (ms); channels parity errors; channels average per {DEFAULT_AVG_LEN_MS} ms):\n' + 
-                               "\n".join(lines))
+        self.error_lbl.setText(f'Statistic (ip: received / sent / expected packets (ms); channels parity errors; channels average per {DEFAULT_AVG_LEN_MS} ms):<br>' + 
+                               "<br>".join(lines))
         self.error_lbl.setTextFormat(Qt.RichText)
     
     def _update_clock_settings(self, row: int, index: int):
