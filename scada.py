@@ -18,6 +18,7 @@ Features:
 from __future__ import annotations
 import logging
 import logger
+import importlib
 import asyncio, struct, socket, sys, time, threading, csv, os, tempfile
 from collections import deque
 from dataclasses import dataclass
@@ -51,11 +52,38 @@ BUFFER_LENGTH_S    = 30
 BUFFER_SIZE        = int(BUFFER_LENGTH_S*SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 DEFAULT_AVG_LEN_MS = 1000 # could be overwritten by default_settings.py
 CCU_DEVICE_INDEX   = 0
+DEFAULT_SOCKET_BACKEND = 'auto'
+DATA_SOCKET_RECV_TIMEOUT_S = 0.02
+DATA_SOCKET_DRAIN_TIMEOUT_S = 0.3
 
 # Features
 FCN_QT_LOGGING = True  # Enable Qt logging handler
 
 CLOCK_SETTINGS = ['Internal isolated', 'Internal OUT', 'External', 'External OUT', 'PTP isolated', 'PTP OUT']
+
+
+def _resolve_buffered_socket_class(backend: str):
+    backend = (backend or DEFAULT_SOCKET_BACKEND).strip().lower()
+
+    if backend in ('auto', 'cpp'):
+        try:
+            import cppimport
+            mod = cppimport.imp('buffered_socket.buffered_socket_cpp')
+            return mod.BufferedSocket, 'cpp'
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, GeneratorExit)):
+                raise
+            if backend == 'cpp':
+                raise
+            logging.getLogger(__name__).warning(
+                f"C++ buffered socket import failed ({type(e).__name__}: {e}). Falling back to Python backend."
+            )
+
+    if backend in ('auto', 'py', 'python'):
+        from buffered_socket_py import BufferedSocket as PyBufferedSocket
+        return PyBufferedSocket, 'python'
+
+    raise ValueError(f"Unknown socket backend '{backend}'. Expected one of: auto, cpp, py")
 
 # CRC-16/CCITT checksum
 def crc16_ccitt(data: bytes, poly: int=0x1021, crc: int=0xFFFF) -> int:
@@ -120,25 +148,57 @@ class DeviceBuffer:
 
 # Async UDP socket
 class AsyncSocket:
-    def __init__(self, loop, local_port:int, label:str):
+    def __init__(self, loop, local_port:int, label:str, backend: str = DEFAULT_SOCKET_BACKEND):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.loop = loop
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32*1024*1024)
-        sock.setblocking(False)
-        sock.bind(('0.0.0.0', local_port))
-        self.sock,self.queue = sock, asyncio.Queue()
-        loop.add_reader(sock.fileno(), self._on_ready)
+        self.queue = asyncio.Queue()
+        self._closed = False
+        self._recv_task = None
+        self.backend_name = 'unknown'
 
-    def _on_ready(self):
-        try:
-            data, addr = self.sock.recvfrom(4096)
-            self.queue.put_nowait((data, addr))
-        except:
-            pass
+        socket_cls, self.backend_name = _resolve_buffered_socket_class(backend)
+        self.sock = socket_cls(max_size=4096, name=label)
+        self.sock.bind(port=local_port)
+        self.sock.settimeout(DATA_SOCKET_RECV_TIMEOUT_S)
+
+        self._recv_task = loop.create_task(self._recv_loop())
+        self._logger.info(f'AsyncSocket backend={self.backend_name}')
+
+    async def _recv_loop(self):
+        while not self._closed:
+            try:
+                data, addr = self.sock.recvfrom(4096)
+                self.queue.put_nowait((data, addr))
+                await asyncio.sleep(0)
+            except socket.timeout:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if self._closed:
+                    break
+                self._logger.warning(f'AsyncSocket recv loop exception: {e}')
+                await asyncio.sleep(0.01)
 
     def sendto(self, data:bytes, target:Tuple[str,int]):
         self.sock.sendto(data, target)
+
+    async def stop_receiver(self):
+        if self._recv_task and not self._recv_task.done():
+            self._recv_task.cancel()
+            await asyncio.gather(self._recv_task, return_exceptions=True)
+        self._recv_task = None
+
+    async def aclose(self):
+        if self._closed:
+            return
+        self._closed = True
+        await self.stop_receiver()
+        try:
+            if self.sock:
+                self.sock.close()
+        finally:
+            self.sock = None
 
 # PTP mode container
 class PTPMode:
@@ -376,12 +436,15 @@ class Device:
 # Manager of multiple devices
 class DeviceManager:
     MAX_DEVICES = 5
-    def __init__(self, data_port:int = DEFAULT_DATA_PORT):
+    def __init__(self, data_port:int = DEFAULT_DATA_PORT, socket_backend: str = DEFAULT_SOCKET_BACKEND):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.data_port = data_port
+        self.socket_backend = socket_backend
         self.devices: Dict[str,Device] = {}
         self.loop = None
         self.data_socket = None
+        self.dispatch_task = None
+        self.loop_thread = None
 
     def broadcast(self, method:str, *args, **kwargs):
         for dev in self.devices.values():
@@ -389,9 +452,17 @@ class DeviceManager:
 
     def attach_loop(self, loop):
         self.loop = loop
-        self.data_socket = AsyncSocket(loop, self.data_port, 'data')
+        self.data_socket = AsyncSocket(loop, self.data_port, 'data', backend=self.socket_backend)
+
+    def set_loop_thread(self, loop_thread):
+        self.loop_thread = loop_thread
 
     def clear(self):
+        for dev in self.devices.values():
+            try:
+                dev.cmd_sock.close()
+            except Exception:
+                pass
         self.devices.clear()
 
     def add_device(self, ip:str, cmd_port:int = DEFAULT_CMD_PORT):
@@ -428,16 +499,74 @@ class DeviceManager:
 
     def dispatch_loop(self, signal):
         async def run():
-            while True:
-                pkt, (ip, _) = await self.data_socket.queue.get()
-                #print("packet len ", len(pkt), "from ", ip)
-                dev = self.devices.get(ip)
-                if not dev:
-                    continue
-                order = dev.on_raw_packet(pkt)
-                if order is not None:
-                    signal.emit(ip, order)
-        self.loop.create_task(run())
+            try:
+                while True:
+                    pkt, (ip, _) = await self.data_socket.queue.get()
+                    dev = self.devices.get(ip)
+                    if not dev:
+                        continue
+                    order = dev.on_raw_packet(pkt)
+                    if order is not None:
+                        signal.emit(ip, order)
+            except asyncio.CancelledError:
+                return
+        self.dispatch_task = self.loop.create_task(run())
+
+    async def _shutdown_async(self, drain_timeout: float = DATA_SOCKET_DRAIN_TIMEOUT_S):
+        if self.data_socket is not None:
+            await self.data_socket.stop_receiver()
+
+        deadline = time.monotonic() + max(0.0, drain_timeout)
+        while self.data_socket is not None and not self.data_socket.queue.empty() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+
+        if self.dispatch_task and not self.dispatch_task.done():
+            self.dispatch_task.cancel()
+            await asyncio.gather(self.dispatch_task, return_exceptions=True)
+        self.dispatch_task = None
+
+        if self.data_socket is not None:
+            await self.data_socket.aclose()
+            self.data_socket = None
+
+        for dev in self.devices.values():
+            try:
+                dev.cmd_sock.close()
+            except Exception:
+                pass
+
+    def shutdown(self, drain_timeout: float = DATA_SOCKET_DRAIN_TIMEOUT_S):
+        if self.loop is not None and self.loop.is_running():
+            try:
+                fut = asyncio.run_coroutine_threadsafe(self._shutdown_async(drain_timeout), self.loop)
+                fut.result(timeout=5)
+            except Exception as e:
+                self._logger.warning(f'Event loop shutdown warning: {e}')
+
+            try:
+                self.loop.call_soon_threadsafe(self.loop.stop)
+            except Exception:
+                pass
+
+            if self.loop_thread and self.loop_thread.is_alive() and self.loop_thread is not threading.current_thread():
+                self.loop_thread.join(timeout=5)
+
+        else:
+            for dev in self.devices.values():
+                try:
+                    dev.cmd_sock.close()
+                except Exception:
+                    pass
+
+            if self.data_socket is not None and self.data_socket.sock is not None:
+                try:
+                    self.data_socket.sock.close()
+                except Exception:
+                    pass
+                self.data_socket = None
+
+        self.loop = None
+        self.devices.clear()
 
 # Main GUI application
 class Plotter(QWidget):
@@ -643,6 +772,7 @@ class Plotter(QWidget):
         #self.data_ready.connect(self._check_order) # TODO: enable packet order checking
 
     def closeEvent(self, event):
+        self.manager.shutdown()
         super().closeEvent(event)
 
     def _check_order(self, ip:str, order:int):
@@ -1063,12 +1193,24 @@ def main(argv):
     with ExitStack() as stack:
         stack.enter_context(logging_:=logger.Logging())
 
+        try:
+            import default_settings as ds
+        except ImportError:
+            ds = None
+
+        DEFAULT_FIRST_IP = getattr(ds, 'DEFAULT_FIRST_IP', "192.168.137.100")
+        DEFAULT_LEADER = getattr(ds, 'DEFAULT_LEADER', 1)
+        DEVICES_COUNT = getattr(ds, 'DEVICES_COUNT', 5)
+        DEFAULT_AVG_LEN_MS = getattr(ds, 'DEFAULT_AVG_LEN_MS', 1000)
+        ptp_mode.enabled = getattr(ds, 'DEFAULT_PTP_MODE_ENABLED', False)
+        SOCKET_BACKEND = getattr(ds, 'SOCKET_BACKEND', DEFAULT_SOCKET_BACKEND)
+
         if sys.platform.startswith('win'):
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling,True)
         QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps,True)
         app=QApplication(argv)
-        manager=DeviceManager()
+        manager=DeviceManager(socket_backend=SOCKET_BACKEND)
         gui=Plotter(manager)
         gui_log_handler = logger.CallbackHandler(sink_text=gui.log_signal.emit)
         gui_log_handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d\t%(levelname)-8s\t%(name)-10s\t%(message)s"))
@@ -1081,21 +1223,14 @@ def main(argv):
             asyncio.set_event_loop(loop)
             manager.attach_loop(loop)
             manager.dispatch_loop(gui.data_ready)
-            loop.run_forever()
-        threading.Thread(target=start_loop,daemon=True).start()
-        def autoinit():
             try:
-                import default_settings as ds
-                DEFAULT_FIRST_IP = ds.DEFAULT_FIRST_IP
-                DEFAULT_LEADER = ds.DEFAULT_LEADER
-                DEVICES_COUNT = ds.DEVICES_COUNT
-                DEFAULT_AVG_LEN_MS = ds.DEFAULT_AVG_LEN_MS
-                ptp_mode.enabled = ds.DEFAULT_PTP_MODE_ENABLED
-            except ImportError:
-                DEFAULT_FIRST_IP = "192.168.137.100"
-                DEFAULT_LEADER = 1
-                DEVICES_COUNT = len(gui.device_checks)
-                # DEFAULT_AVG_LEN_MS is defined at file begin
+                loop.run_forever()
+            finally:
+                loop.close()
+        loop_thread = threading.Thread(target=start_loop, daemon=False, name='udp_loop')
+        manager.set_loop_thread(loop_thread)
+        loop_thread.start()
+        def autoinit():
             gui._update_defaults(DEFAULT_FIRST_IP + ':')
             debug = len(argv) > 1 and argv[1] == "DEBUG"
             for i, checkbox in enumerate(gui.device_checks):
@@ -1110,7 +1245,10 @@ def main(argv):
         QTimer(gui).singleShot(500, autoinit)
         #gui.show()
         gui.showMaximized()
-        return app.exec_()
+        try:
+            return app.exec_()
+        finally:
+            manager.shutdown()
 
 if __name__=='__main__':
     sys.exit(main(sys.argv))

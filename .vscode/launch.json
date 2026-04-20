@@ -27,6 +27,64 @@
             "program": "send_test_data.py",
             "console": "integratedTerminal",
             "args": ["--ip", "192.168.137.121", "-S", "-c", "sin", "-c", "3", "-R", "-s", "5000", "tests\\send_test_data\\header_semi_dot.csv"] //"${command:pickArgs}"
+        },
+        {
+            "name": "scada.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}\\scada.py",
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "scada.py: Attach remote (SSH tunel)",
+            "type": "debugpy",
+            "request": "attach",
+            "connect": {
+                "host": "localhost",
+                "port": 5678
+            },
+            "pathMappings": [
+                {
+                    "localRoot": "${workspaceFolder}",
+                    "remoteRoot": "C:\\FDDS\\Plotter"
+                }
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "C++: Attach to Python",
+            "type": "cppvsdbg",
+            "request": "attach",
+            "processId": "${command:pickProcess}",
+            "symbolSearchPath": "${workspaceFolder};${workspaceFolder}\\buffered_socket;${workspaceFolder}\\.cppimport",
+            "logging": {
+                "engineLogging": true,
+                "moduleLoad": true,
+                "trace": true
+            }
+        },
+        {
+            "name": "C++: Attach to python.exe",
+            "type": "cppvsdbg",
+            "request": "attach",
+            "processName": "python.exe",
+            "symbolSearchPath": "${workspaceFolder};${workspaceFolder}\\buffered_socket;${workspaceFolder}\\.cppimport",
+            "logging": {
+                "engineLogging": true,
+                "moduleLoad": true,
+                "trace": true
+            }
+        }
+    ],
+    "compounds": [
+        {
+            "name": "SCADA Mixed (Python + C++)",
+            "configurations": [
+                "scada.py",
+                "C++: Attach to python.exe"
+            ],
+            "stopAll": true
         }
     ]
 }
