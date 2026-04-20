@@ -394,9 +394,11 @@ class Device:
                 # data = _verify_crc(pkt)
                 # if not data:
                 #     return
+                self._logger.info('PTP trigger received, before processing.')
                 packet_num = struct.unpack('<H', data[2:4])
                 sample_num = struct.unpack('<B', data[5])
                 ptp_mode.fire_trigger()
+                return
             case self.PKT_TYPE_LOG:
                 log_msg = pkt[4:].decode('utf-8').strip()
                 self._logger.info(f"Dev {self.ip} log[{order}]: {log_msg}")
@@ -405,6 +407,10 @@ class Device:
                 if ptp_mode.enabled:
                     if not self.ptp_triggered:
                         return
+                    if self.packet_counter >= ptp_mode.samples_awaited:
+                        self.ptp_triggered = False
+                        return
+                    self.packet_counter += 1
 
                 data = _verify_crc(pkt)
                 if data is None:
@@ -800,8 +806,10 @@ class Plotter(QWidget):
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 s.connect((ip, port))
                 my_ip = s.getsockname()[0]
+                self._logger.debug(f'Detected local IP: {my_ip}')
                 s.close()
-            except socket.error:
+            except socket.error as e:
+                self._logger.debug(f'Can not detect local IP for {ip}:{port}, because of socket error "{e}", using default receiver address.')
                 my_ip = None
             if len(octs) !=4 :
                 return
@@ -1218,6 +1226,7 @@ def main(argv):
         gui_log_handler.setLevel(logging.DEBUG)
         logging_.log_printer.add_handler(gui_log_handler)
         logging_.logger.critical(f"Logging to file: {logging_.log_path}") # This has to be in console, so critical
+        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}")  
         def start_loop():
             loop=asyncio.SelectorEventLoop()
             asyncio.set_event_loop(loop)
