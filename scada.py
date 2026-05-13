@@ -331,9 +331,13 @@ class Device:
             return
         self.packet_counter = 0
         self.ptp_triggered = True
-
-    def wait_trigger_ptp(self):
+    
+    def ptp_wait_trigger(self):
         return self._send_cmd(20)
+
+    def ptp_reset(self):
+        self.packet_counter = 0
+        self.ptp_triggered = False
 
     def set_clock_ctrl(self, clock_ctrl:int, save: bool = False):
         """According CLOCK_SETTINGS index."""
@@ -375,7 +379,6 @@ class Device:
                         return
                     if self.packet_counter >= ptp_mode.samples_awaited:
                         self.ptp_triggered = False
-                        ptp_mode.samples_awaited = 0
                         return
                     self.packet_counter += 1
 
@@ -405,11 +408,12 @@ class Device:
                 # data = _verify_crc(pkt)
                 # if not data:
                 #     return
-                self._logger.info('PTP trigger received, before processing.')
-                packet_num = struct.unpack('<H', data[2:4])
-                sample_num = struct.unpack('<B', data[5])
+                #packet_num = struct.unpack('<H', data[2:4])
+                #sample_num = struct.unpack('<B', data[4])
+                sample_num = pkt[4]
                 #ptp_mode.fire_trigger() # the path from one node to others
                 self.ptp_triggered = True
+                self._logger.info(f'PTP trigger received on {self.id} in packet {order} and sample {sample_num}.')
                 return
             case self.PKT_TYPE_LOG:
                 log_msg = pkt[4:].decode('utf-8').strip()
@@ -423,7 +427,6 @@ class Device:
                         return
                     if self.packet_counter >= ptp_mode.samples_awaited:
                         self.ptp_triggered = False
-                        ptp_mode.samples_awaited = 0
                         return
                     self.packet_counter += 1
 
@@ -519,7 +522,10 @@ class DeviceManager:
         for dev in self.devices.values(): dev.ptp_trigger()
     
     def ptp_wait_trigger(self):
-        for dev in self.devices.values(): dev.wait_trigger_ptp()
+        for dev in self.devices.values(): dev.ptp_wait_trigger()
+    
+    def ptp_reset(self):
+        for dev in self.devices.values(): dev.ptp_reset()
 
     def dispatch_loop(self, signal):
         async def run():
@@ -933,6 +939,7 @@ class Plotter(QWidget):
             ptp_mode.waiting_for_trigger = False
             ptp_mode.trigger_mode = False
             ptp_mode.samples_awaited = n
+            self.manager.ptp_reset()
             self._logger.info(f'Started PTP sampling (n={n})')
         else:
             leader_id=self.leader_buttons.checkedId()
@@ -958,6 +965,7 @@ class Plotter(QWidget):
             ptp_mode.waiting_for_trigger = True
             ptp_mode.trigger_mode = True
             ptp_mode.samples_awaited = n
+            self.manager.ptp_reset()
             self.manager.ptp_wait_trigger()
             self._logger.info(f'Wait trigger PTP sampling (n={n})')
         else:
