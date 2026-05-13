@@ -332,6 +332,9 @@ class Device:
         self.packet_counter = 0
         self.ptp_triggered = True
 
+    def wait_trigger_ptp(self):
+        return self._send_cmd(20)
+
     def set_clock_ctrl(self, clock_ctrl:int, save: bool = False):
         """According CLOCK_SETTINGS index."""
         param = clock_ctrl & 0xFF
@@ -405,7 +408,8 @@ class Device:
                 self._logger.info('PTP trigger received, before processing.')
                 packet_num = struct.unpack('<H', data[2:4])
                 sample_num = struct.unpack('<B', data[5])
-                ptp_mode.fire_trigger()
+                #ptp_mode.fire_trigger() # the path from one node to others
+                self.ptp_triggered = True
                 return
             case self.PKT_TYPE_LOG:
                 log_msg = pkt[4:].decode('utf-8').strip()
@@ -513,6 +517,9 @@ class DeviceManager:
 
     def ptp_trigger(self):
         for dev in self.devices.values(): dev.ptp_trigger()
+    
+    def ptp_wait_trigger(self):
+        for dev in self.devices.values(): dev.wait_trigger_ptp()
 
     def dispatch_loop(self, signal):
         async def run():
@@ -951,6 +958,7 @@ class Plotter(QWidget):
             ptp_mode.waiting_for_trigger = True
             ptp_mode.trigger_mode = True
             ptp_mode.samples_awaited = n
+            self.manager.ptp_wait_trigger()
             self._logger.info(f'Wait trigger PTP sampling (n={n})')
         else:
             leader_id = self.leader_buttons.checkedId()
