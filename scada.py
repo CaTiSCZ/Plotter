@@ -207,11 +207,14 @@ class PTPMode:
     
     def __init__(self):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
-        self.waiting_for_trigger = False
         self.samples_awaited = 0
+        self.waiting_for_trigger = False
+        self.trigger_mode = False
 
     def fire_trigger(self):
         if not self.enabled:
+            return
+        if not self.trigger_mode:
             return
         if not self.waiting_for_trigger:
             return
@@ -324,6 +327,8 @@ class Device:
     def ptp_trigger(self):
         if not ptp_mode.enabled:
             return
+        if not ptp_mode.trigger_mode:
+            return
         self.packet_counter = 0
         self.ptp_triggered = True
 
@@ -361,10 +366,13 @@ class Device:
                 return
             case self.PKT_TYPE_DATA:
                 if ptp_mode.enabled:
-                    if not self.ptp_triggered:
+                    if ptp_mode.samples_awaited <= 0:
+                        return
+                    if ptp_mode.trigger_mode and not self.ptp_triggered:
                         return
                     if self.packet_counter >= ptp_mode.samples_awaited:
                         self.ptp_triggered = False
+                        ptp_mode.samples_awaited = 0
                         return
                     self.packet_counter += 1
 
@@ -405,10 +413,13 @@ class Device:
                 return
             case self.PKT_TYPE_RESULT:
                 if ptp_mode.enabled:
-                    if not self.ptp_triggered:
+                    if ptp_mode.samples_awaited <= 0:
+                        return
+                    if ptp_mode.trigger_mode and not self.ptp_triggered:
                         return
                     if self.packet_counter >= ptp_mode.samples_awaited:
                         self.ptp_triggered = False
+                        ptp_mode.samples_awaited = 0
                         return
                     self.packet_counter += 1
 
@@ -912,9 +923,9 @@ class Plotter(QWidget):
         self.expected_samples = n
 
         if ptp_mode.enabled:
+            ptp_mode.waiting_for_trigger = False
+            ptp_mode.trigger_mode = False
             ptp_mode.samples_awaited = n
-            ptp_mode.waiting_for_trigger = True
-            ptp_mode.fire_trigger()
             self._logger.info(f'Started PTP sampling (n={n})')
         else:
             leader_id=self.leader_buttons.checkedId()
@@ -937,8 +948,9 @@ class Plotter(QWidget):
         self.expected_samples = n
 
         if ptp_mode.enabled:
-            ptp_mode.samples_awaited = n
             ptp_mode.waiting_for_trigger = True
+            ptp_mode.trigger_mode = True
+            ptp_mode.samples_awaited = n
             self._logger.info(f'Wait trigger PTP sampling (n={n})')
         else:
             leader_id = self.leader_buttons.checkedId()
