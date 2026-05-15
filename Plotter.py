@@ -1,15 +1,27 @@
 import logging
 import logger
 
-USE_PYTHON_SOCKET = False
-if USE_PYTHON_SOCKET:
-    from buffered_socket_py import BufferedSocket
-else:
-    import cppimport
-    print("Importuji C++ BufferedSocket...")
-    buffered_socket = cppimport.imp("buffered_socket.buffered_socket_cpp")
-    BufferedSocket = buffered_socket.BufferedSocket
-    print("C++ BufferedSocket importován")
+DEFAULT_SOCKET_BACKEND = 'auto'  # 'auto', 'cpp', or 'py'
+
+def _resolve_buffered_socket_class(backend: str = DEFAULT_SOCKET_BACKEND):
+    backend = (backend or DEFAULT_SOCKET_BACKEND).strip().lower()
+    if backend in ('auto', 'cpp'):
+        try:
+            import cppimport
+            mod = cppimport.imp('buffered_socket.buffered_socket_cpp')
+            return mod.BufferedSocket, 'cpp'
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, GeneratorExit)):
+                raise
+            if backend == 'cpp':
+                raise
+            logging.getLogger(__name__).warning(
+                f"C++ buffered socket import failed ({type(e).__name__}: {e}). Falling back to Python backend."
+            )
+    if backend in ('auto', 'py', 'python'):
+        from buffered_socket_py import BufferedSocket as PyBufferedSocket
+        return PyBufferedSocket, 'python'
+    raise ValueError(f"Unknown socket backend '{backend}'. Expected one of: auto, cpp, py")
 
 from contextlib import ExitStack
 
@@ -36,8 +48,6 @@ UDP_PORT_DATA = 10577  # port pro příjem dat
 
 # -------------------- GUI s více tlačítky ----------------------
 class Plotter:
-
-
     def __init__(self):
         super().__init__()
         self.isShown = False
@@ -45,8 +55,10 @@ class Plotter:
         self._logger.debug("Plotter GUI start")
 
 # === Sockets ===
-        self.cmd_socket = AsyncSocket(BufferedSocket(name="cmd_buffered"), name="cmd_async")
-        self.data_socket = AsyncSocket(BufferedSocket(name="data_buffered"), name="data_async")
+        socket_cls, self.backend_name = _resolve_buffered_socket_class()
+        self._logger.info(f"Using buffered socket backend: {self.backend_name}")
+        self.cmd_socket = AsyncSocket(socket_cls(name="cmd_buffered"), name="cmd_async")
+        self.data_socket = AsyncSocket(socket_cls(name="data_buffered"), name="data_async")
 
         self.udp_device_addr = UDP_DEVICE_IP
         self.udp_device_port = UDP_PORT_SEND #generátor
