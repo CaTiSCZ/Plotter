@@ -22,7 +22,7 @@ def set_calibration(ip_address: str, channels: int, info: list[tuple[float, floa
     sock.bind(("", LOCAL_PORT))   # Bind to local port for receiving
     sock.settimeout(TIMEOUT_SEC)
 
-    pkt = struct.pack('<IHH', 16, 0x00AC if save else 0, channels)
+    pkt = struct.pack('<IHH', 17, 0x00AC if save else 0, channels)
     for unit, offset, gain in info:
         pkt += struct.pack('<3sxff', unit.encode('utf-8'), offset, gain)
     crc = crc16_ccitt(pkt)
