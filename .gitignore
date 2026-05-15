@@ -11,3 +11,6 @@ dist
 
 # scada logs
 logs
+
+# Plotter settings
+plotter_config.ini

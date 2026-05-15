@@ -7,10 +7,11 @@ import numpy as np
 import time
 
 class DeviceManager:
-    SAMPLES_PER_PACKET = 200
-    PACKET_RATE_HZ = 1000
+    SAMPLES_PER_PACKET = Device.SAMPLES_PER_PACKET
+    PACKET_RATE_HZ = Device.PACKETS_PER_SECOND
     SAMPLE_RATE_HZ = SAMPLES_PER_PACKET * PACKET_RATE_HZ
-    BUFFER_LENGTH_SECONDS = 10 
+    BUFFER_LENGTH_SECONDS = Device.DEFAULT_BUFFER_SIZE / SAMPLE_RATE_HZ 
+    
     def __init__(self, cmd_socket, data_socket):
         self._logger = logging.getLogger(__class__.__name__ if application_logger is None else f'{application_logger}.{__class__.__name__}')
         self._logger.debug("Device manager start")

@@ -7,6 +7,18 @@ from PyQt5.QtGui import QFont
 
 from device_manager import DeviceManager
 
+"""
+TODO:
+- ukládání stavu rozložení panelů a jejich nastavení (např. zobrazené křivky, filtry v logu) do konfiguračního souboru (json?)
+    - při zavření aplikace a na tlačítko "Save layout" se uloží aktuální rozložení a nastavení panelů do konfiguračního souboru
+    - přidat "default layout" do menu, který obnoví výchozí rozložení a nastavení panelů a save as default layout, který uloží aktuální rozložení jako výchozí
+- sjednotit seznamy otevřených panelů a jejich počítadel (např. "Graf #1", "Logy #1" atd.) a zajistit, že se správně aktualizují při zavírání panelů
+- přidat možnost přejmenovat panely (např. "Graf - Zařízení 1", "Logy - Plotter" atd.)
+- opravit přesouvání panelů v rámci okna (ne vždy lze dát panely např. pod sebe atd., špatně se strefuje do místa kde by se to mělo zobrazovat)
+- přesunout záložky nahoru a moct přesouvat panel chycením za záložku.
+
+"""
+
 
 class GraphPanel(QWidget):
     """Samostatný panel pro zobrazení grafu s možností výběru zdroje dat."""

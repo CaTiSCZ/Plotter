@@ -9,7 +9,7 @@ from typing import Any
 import socket
 from event import Event
 import numpy as np
-from queue import Queue, Empty
+from collections import deque
 
     # ---------------------- CMD a packety -------------------
 class IntEnumName(IntEnum):
@@ -57,9 +57,9 @@ class Device:
 
     RAW_DATA_TYPE = np.int16
     DATA_TYPE = np.float64
-    SAMPLES_PER_PACKET = 200
+    SAMPLES_PER_PACKET = 2
     PACKETS_PER_SECOND = 1000
-    DEFAULT_BUFFER_SIZE = 10 * SAMPLES_PER_PACKET * PACKETS_PER_SECOND
+    DEFAULT_BUFFER_SIZE = 4 #int(0.4 * SAMPLES_PER_PACKET * PACKETS_PER_SECOND)
     BUFFER_EXTEND = 3
 
 
@@ -115,6 +115,8 @@ class Device:
         self.id = {}
         self.channels_count = None
         self.channel_info = []
+        self.raw_buffer = None
+        self.buffer = None
         self.buffer_size = Device.DEFAULT_BUFFER_SIZE
         self.buffer_start_index = self.buffer_size
         self.raw_buffer_read_index = self.buffer_start_index
@@ -128,7 +130,8 @@ class Device:
         self.packet_counter_cycle = 0
         self.data_packet_size = 0
         self.max_packet_num = -1
-        self.out_of_order_packets = Queue()
+        self.last_calculated_packet = -1
+        self.out_of_order_packets = deque()
         self.lost_packets = 0
         self.error_packets = 0
         self.pending_ack_on_stop_sampling = None
@@ -303,7 +306,7 @@ class Device:
                         self._logger.warning(f"Lost packets detected. Count: {lost}, {self.lost_packets} total.")
                     self.max_packet_num = max(self.max_packet_num, packet_num)
                     if packet_num < self.max_packet_num:
-                        self.out_of_order_packets.put(buffer_write_index)
+                        self.out_of_order_packets.append(buffer_write_index)
                         self.lost_packets -= 1
                         self._logger.info(f"Out of order packet: {packet_num} (expected up to {self.max_packet_num}, Lost packets: {self.lost_packets})")  
                     
@@ -409,27 +412,36 @@ class Device:
                 self.buffer_size = buffer_size
             self.buffer = np.zeros((self.channels_count, Device.BUFFER_EXTEND * self.buffer_size), dtype=Device.DATA_TYPE)
 
-    def get_data(self):
+    def get_data(self, raw = False):
         def calc(begin, end):
             self.buffer[:, begin:end] = self.raw_buffer[:, begin:end] * self.gain[:, np.newaxis] + self.offset[:, np.newaxis]
         
         # Kontrola, jestli je zařízení správně inicializované
         if self.channels_count is None or self.channels_count == 0:
             self._logger.debug("get_data: Zařízení není inicializované (channels_count)")
-            return (np.array([]), 0, 0, 0)
+            return (np.array([]), 0, 0, 0, 0)
             
-        if not hasattr(self, 'buffer') or not hasattr(self, 'raw_buffer'):
+        if self.buffer is None or self.raw_buffer is None:
             self._logger.debug("get_data: Buffer není inicializovaný")
-            return (np.array([]), 0, 0, 0)
+            return (np.array([]), 0, 0, 0, 0)
             
         with self.buffer_lock:
-            new_data_size = self.raw_buffer_write_max - (self.buffer_read_index + self.buffer_read_size)
+            if raw:
+                return (self.raw_buffer[:, self.raw_buffer_read_index:self.raw_buffer_read_index + self.raw_buffer_read_size], 
+                        self.max_packet_num * Device.SAMPLES_PER_PACKET, 
+                        self.raw_buffer_read_size,
+                        self.channels_count, 
+                        self.last_packet_num)
+            new_data_size = self.max_packet_num - self.last_calculated_packet
+            self.last_calculated_packet = self.max_packet_num
             if new_data_size > 0:
-                calc(self.raw_buffer_write_max - new_data_size, self.raw_buffer_write_max)
-            elif new_data_size < 0:
-                new_data_size += 3 * self.buffer_size
-                self.buffer[:, self.buffer_start_index:self.buffer_start_index + self.buffer_read_size] = self.buffer[:, self.buffer_read_index:self.buffer_read_index + self.buffer_read_size]
-                calc(self.raw_buffer_write_max - new_data_size, self.raw_buffer_write_max)
+                if new_data_size > self.buffer_size:
+                    new_data_size = self.buffer_size
+            #     calc(self.raw_buffer_write_max - new_data_size, self.raw_buffer_write_max)
+            # elif new_data_size < 0:
+            #     new_data_size += 3 * self.buffer_size
+            #     self.buffer[:, self.buffer_start_index:self.buffer_start_index + self.buffer_read_size] = self.buffer[:, self.buffer_read_index:self.buffer_read_index + self.buffer_read_size]
+            #     calc(self.raw_buffer_write_max - new_data_size, self.raw_buffer_write_max)
             while True:
                 try:
                     buffer_write_index = self.out_of_order_packets.get_nowait()
