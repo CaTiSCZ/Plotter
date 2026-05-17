@@ -55,6 +55,7 @@ CCU_DEVICE_INDEX   = 0
 DEFAULT_SOCKET_BACKEND = 'auto'
 DATA_SOCKET_RECV_TIMEOUT_S = 0.02
 DATA_SOCKET_DRAIN_TIMEOUT_S = 0.3
+PTP_TRIGGER_RING_PACKETS = 500
 
 # Features
 FCN_QT_LOGGING = True  # Enable Qt logging handler
@@ -211,7 +212,7 @@ class PTPMode:
         self.waiting_for_trigger = False
         self.trigger_mode = False
 
-    def fire_trigger(self):
+    def fire_trigger(self, trigger_order:int|None = None):
         if not self.enabled:
             return
         if not self.trigger_mode:
@@ -219,7 +220,7 @@ class PTPMode:
         if not self.waiting_for_trigger:
             return
         self.waiting_for_trigger = False
-        self.device_manager.ptp_trigger()
+        self.device_manager.ptp_trigger(trigger_order)
         self._logger.info('PTP trigger received, starting sampling.')
 
 ptp_mode = PTPMode()
@@ -248,6 +249,7 @@ class Device:
         self.packet_counter = 0
         self.ptp_triggered = False
         self.received_last = 0
+        self.input_packet_ring = deque(maxlen=PTP_TRIGGER_RING_PACKETS)
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None):
         pkt = struct.pack('<I', code) + payload
@@ -324,20 +326,37 @@ class Device:
     def reset_device(self):
         return self._send_cmd(14, struct.pack('<B', 0xFE))
     
-    def ptp_trigger(self):
+    def ptp_trigger(self, trigger_order:int|None = None):
         if not ptp_mode.enabled:
             return
         if not ptp_mode.trigger_mode:
             return
+        if self.ptp_triggered:
+            return
         self.packet_counter = 0
         self.ptp_triggered = True
-    
+        if trigger_order is not None:
+            self.flush_input_packet_ring(trigger_order)
+
     def ptp_wait_trigger(self):
+        self.input_packet_ring.clear()
         return self._send_cmd(20)
 
     def ptp_reset(self):
         self.packet_counter = 0
         self.ptp_triggered = False
+        self.input_packet_ring.clear()
+    
+    def flush_input_packet_ring(self, trigger_order:int):
+        packets = [pkt for pkt in self.input_packet_ring
+                if ((trigger_order - self.header_struct.unpack(pkt[:4])[1]) & 0xFFFF) < 0x8000]
+        packets.sort(key=lambda pkt: (trigger_order - self.header_struct.unpack(pkt[:4])[1]) & 0xFFFF,
+                    reverse=True)
+        self.input_packet_ring.clear()
+        for buffered_pkt in packets:
+            if self.packet_counter >= ptp_mode.samples_awaited:
+                break
+            self.on_raw_packet(buffered_pkt)
 
     def set_clock_ctrl(self, clock_ctrl:int, save: bool = False):
         """According CLOCK_SETTINGS index."""
@@ -411,8 +430,7 @@ class Device:
                 #packet_num = struct.unpack('<H', data[2:4])
                 #sample_num = struct.unpack('<B', data[4])
                 sample_num = pkt[4]
-                #ptp_mode.fire_trigger() # the path from one node to others
-                self.ptp_triggered = True
+                ptp_mode.fire_trigger(order)
                 self._logger.info(f'PTP trigger received on {self.id} in packet {order} and sample {sample_num}.')
                 return
             case self.PKT_TYPE_LOG:
@@ -518,8 +536,8 @@ class DeviceManager:
     def get_clock_config_all(self):
         return {ip: dev.get_clock_config() for ip, dev in self.devices.items()}
 
-    def ptp_trigger(self):
-        for dev in self.devices.values(): dev.ptp_trigger()
+    def ptp_trigger(self, trigger_order:int|None = None):
+        for dev in self.devices.values(): dev.ptp_trigger(trigger_order)
     
     def ptp_wait_trigger(self):
         for dev in self.devices.values(): dev.ptp_wait_trigger()
@@ -1003,8 +1021,11 @@ class Plotter(QWidget):
         self.last_order.clear()
 
     def _force_trigger(self):
-        self.manager.broadcast('force_trigger')
-        self._logger.info('Force trigger on all devices')
+        #self.manager.broadcast('force_trigger')
+        #self._logger.info('Force trigger on all devices')
+        leader_id = self.leader_buttons.checkedId()
+        leader_ip = self.device_edits[leader_id].text().strip().split(':')[0]
+        self.manager.devices[leader_ip].force_trigger()
 
     def _penetrate_firewall(self):
         self._logger.info('Trying to penetrate firewall')
