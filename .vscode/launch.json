@@ -33,6 +33,7 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}\\scada.py",
+            "python": "${workspaceFolder}\\env\\Scripts\\python.exe",
             "console": "integratedTerminal",
             "justMyCode": false
         },

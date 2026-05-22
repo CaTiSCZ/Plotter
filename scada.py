@@ -250,6 +250,7 @@ class Device:
         self.ptp_triggered = False
         self.received_last = 0
         self.input_packet_ring = deque(maxlen=PTP_TRIGGER_RING_PACKETS)
+        self.first_data_order = None
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None):
         pkt = struct.pack('<I', code) + payload
@@ -346,6 +347,7 @@ class Device:
         self.packet_counter = 0
         self.ptp_triggered = False
         self.input_packet_ring.clear()
+        self.first_data_order = None
     
     def flush_input_packet_ring(self, trigger_order:int):
         packets = [pkt for pkt in self.input_packet_ring
@@ -395,6 +397,7 @@ class Device:
                     if ptp_mode.samples_awaited <= 0:
                         return
                     if ptp_mode.trigger_mode and not self.ptp_triggered:
+                        self.input_packet_ring.append(bytes(pkt))
                         return
                     if self.packet_counter >= ptp_mode.samples_awaited:
                         self.ptp_triggered = False
@@ -411,7 +414,10 @@ class Device:
                     return
                 #print(f"[DBG] Dev {self.id} dataPacket {order} length {len(pkt)}")
                 off = 4
-                t = [order*SAMPLES_PER_PACKET + k for k in range(SAMPLES_PER_PACKET)]
+                if self.first_data_order is None:
+                    self.first_data_order = order
+                rel_order = (order - self.first_data_order) & 0xFFFF
+                t = [rel_order*SAMPLES_PER_PACKET + k for k in range(SAMPLES_PER_PACKET)]
                 samples = []
                 for _ in range(self.channels):
                     sig = self.data_struct.unpack(data[off:off+2*SAMPLES_PER_PACKET])
@@ -442,6 +448,7 @@ class Device:
                     if ptp_mode.samples_awaited <= 0:
                         return
                     if ptp_mode.trigger_mode and not self.ptp_triggered:
+                        self.input_packet_ring.append(bytes(pkt))
                         return
                     if self.packet_counter >= ptp_mode.samples_awaited:
                         self.ptp_triggered = False
@@ -455,7 +462,10 @@ class Device:
                 elif data is False:
                     self._logger.warning(f"Dev {self.ip} returned RESULT packet with incorrect CRC.")
                     return
-                t = [order + 1]
+                if self.first_result_order is None:
+                    self.first_result_order = order
+                rel_order = (order - self.first_result_order) & 0xFFFF
+                t = [rel_order]
                 samples = []
                 result_code = struct.unpack('<H', data[4:6])[0]
 
@@ -1032,8 +1042,13 @@ class Plotter(QWidget):
         self.manager.penetrate_firewall(False)
     
     def _reset_devices(self):
-        self.manager.broadcast('reset_device')
         self._logger.info('Reset devices')
+        #self.manager.broadcast('reset_device')
+        for i, (ip, dev) in enumerate(self.manager.devices.items()):
+            if i == 0:
+                dev.reset_device()
+            else:
+                QTimer(self).singleShot(2000, dev.reset_device)
 
     def _get_clock_config(self):
         cfgs = self.manager.get_clock_config_all()
