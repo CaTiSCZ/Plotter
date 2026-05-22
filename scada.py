@@ -260,7 +260,6 @@ class Device:
         self.received_last = 0
         self.input_packet_ring = deque(maxlen=PTP_TRIGGER_RING_PACKETS)
         self.first_data_order = None
-        self.reject_orders_above = None
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None):
         pkt = struct.pack('<I', code) + payload
@@ -355,14 +354,12 @@ class Device:
         self.ptp_triggered = False
         self.input_packet_ring.clear()
         self.first_data_order = None
-        self.reject_orders_above = None
     
     def begin_capture(self, n: int):
         self.capture_active = True
         self.capture_limit = n
         self.capture_counter = 0
         self.first_data_order = None
-        self.reject_orders_above = n + 50
     
     def flush_input_packet_ring(self, trigger_order:int):
         packets = [pkt for pkt in self.input_packet_ring
@@ -542,22 +539,9 @@ class DeviceManager:
                 pass
         self.devices.clear()
     
-    def clear_data_queue_sync(self, timeout=1.0):
-        if not self.loop or not self.data_socket:
-            return
-
-        fut = asyncio.run_coroutine_threadsafe(
-            self._clear_data_queue_async(),
-            self.loop
-        )
-        fut.result(timeout=timeout)
-    
-    async def _clear_data_queue_async(self):
-        if self.data_socket:
-            self.data_socket.clear_queue()
-        await asyncio.sleep(0)
-        if self.data_socket:
-            self.data_socket.clear_queue()
+    def clear_data_queue(self):
+        if self.loop and self.data_socket:
+            self.loop.call_soon_threadsafe(self.data_socket.clear_queue)
 
     def add_device(self, ip:str, cmd_port:int = DEFAULT_CMD_PORT):
         if len(self.devices) >= self.MAX_DEVICES or ip in self.devices:
@@ -1020,11 +1004,9 @@ class Plotter(QWidget):
             ptp_mode.waiting_for_trigger = False
             ptp_mode.trigger_mode = False
             ptp_mode.samples_awaited = n
-
             self.manager.ptp_reset()
-            self.manager.clear_data_queue_sync()
+            self.manager.clear_data_queue()
             self.manager.begin_capture_all(n)
-
             self._logger.info(f'Started PTP sampling (n={n})')
         else:
             leader_id=self.leader_buttons.checkedId()
@@ -1048,7 +1030,7 @@ class Plotter(QWidget):
 
         if ptp_mode.enabled:
             self.manager.ptp_reset()
-            self.manager.clear_data_queue_sync()
+            self.manager.clear_data_queue()
             
             ptp_mode.waiting_for_trigger = True
             ptp_mode.trigger_mode = True
@@ -1074,12 +1056,12 @@ class Plotter(QWidget):
     def _start_new_sampling(self):
         self._reset_counter()
         self.clear_plot()
-        QTimer(self).singleShot(200, self._start_sampling)
+        QTimer(self).singleShot(100, self._start_sampling)
 
     def _start_new_sampling_on_trigger(self):
         self._reset_counter()
         self.clear_plot()
-        QTimer(self).singleShot(200, self._start_sampling_on_trigger)
+        QTimer(self).singleShot(100, self._start_sampling_on_trigger)
 
     def _stop_sampling(self):
         self.manager.broadcast('stop_sampling')
