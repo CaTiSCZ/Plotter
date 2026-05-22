@@ -200,6 +200,13 @@ class AsyncSocket:
                 self.sock.close()
         finally:
             self.sock = None
+    
+    def clear_queue(self):
+        while True:
+            try:
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
 # PTP mode container
 class PTPMode:
@@ -246,7 +253,9 @@ class Device:
         self.header_struct = struct.Struct('<HH')
         self.data_struct = struct.Struct('<'+'h'*SAMPLES_PER_PACKET)
         self.silent_ping = False
-        self.packet_counter = 0
+        self.capture_active = False
+        self.capture_counter = 0
+        self.capture_limit = 0
         self.ptp_triggered = False
         self.received_last = 0
         self.input_packet_ring = deque(maxlen=PTP_TRIGGER_RING_PACKETS)
@@ -328,25 +337,28 @@ class Device:
         return self._send_cmd(14, struct.pack('<B', 0xFE))
     
     def ptp_trigger(self, trigger_order:int|None = None):
-        if not ptp_mode.enabled:
+        if not ptp_mode.enabled or not ptp_mode.trigger_mode:
             return
-        if not ptp_mode.trigger_mode:
-            return
-        if self.ptp_triggered:
-            return
-        self.packet_counter = 0
         self.ptp_triggered = True
-        if trigger_order is not None:
-            self.flush_input_packet_ring(trigger_order)
+        #if trigger_order is not None:
+        #    self.flush_input_packet_ring(trigger_order)
 
     def ptp_wait_trigger(self):
         self.input_packet_ring.clear()
         return self._send_cmd(20)
 
     def ptp_reset(self):
-        self.packet_counter = 0
+        self.capture_active = False
+        self.capture_counter = 0
+        self.capture_limit = 0
         self.ptp_triggered = False
         self.input_packet_ring.clear()
+        self.first_data_order = None
+    
+    def begin_capture(self, n: int):
+        self.capture_active = True
+        self.capture_limit = n
+        self.capture_counter = 0
         self.first_data_order = None
     
     def flush_input_packet_ring(self, trigger_order:int):
@@ -356,7 +368,7 @@ class Device:
                     reverse=True)
         self.input_packet_ring.clear()
         for buffered_pkt in packets:
-            if self.packet_counter >= ptp_mode.samples_awaited:
+            if self.capture_counter >= self.capture_limit:
                 break
             self.on_raw_packet(buffered_pkt)
 
@@ -394,15 +406,24 @@ class Device:
                 return
             case self.PKT_TYPE_DATA:
                 if ptp_mode.enabled:
-                    if ptp_mode.samples_awaited <= 0:
+                    if not self.capture_active:
+                        if ptp_mode.trigger_mode:
+                            self.input_packet_ring.append(bytes(pkt))
                         return
-                    if ptp_mode.trigger_mode and not self.ptp_triggered:
-                        self.input_packet_ring.append(bytes(pkt))
+
+                    if self.capture_limit > 0 and self.capture_counter >= self.capture_limit:
+                        self.capture_active = False
                         return
-                    if self.packet_counter >= ptp_mode.samples_awaited:
-                        self.ptp_triggered = False
-                        return
-                    self.packet_counter += 1
+
+                    self.capture_counter += 1
+                    #if ptp_mode.samples_awaited <= 0:
+                    #    return
+                    #if ptp_mode.trigger_mode and not self.ptp_triggered:
+                    #    self.input_packet_ring.append(bytes(pkt))
+                    #    return
+                    #if self.packet_counter >= ptp_mode.samples_awaited:
+                    #    self.ptp_triggered = False
+                    #self.packet_counter += 1
 
                 data = _verify_crc(pkt)
                 if data is None:
@@ -445,15 +466,16 @@ class Device:
                 return
             case self.PKT_TYPE_RESULT:
                 if ptp_mode.enabled:
-                    if ptp_mode.samples_awaited <= 0:
+                    if not self.capture_active:
+                        if ptp_mode.trigger_mode:
+                            self.input_packet_ring.append(bytes(pkt))
                         return
-                    if ptp_mode.trigger_mode and not self.ptp_triggered:
-                        self.input_packet_ring.append(bytes(pkt))
+
+                    if self.capture_limit > 0 and self.capture_counter >= self.capture_limit:
+                        self.capture_active = False
                         return
-                    if self.packet_counter >= ptp_mode.samples_awaited:
-                        self.ptp_triggered = False
-                        return
-                    self.packet_counter += 1
+
+                    self.capture_counter += 1
 
                 data = _verify_crc(pkt)
                 if data is None:
@@ -462,9 +484,9 @@ class Device:
                 elif data is False:
                     self._logger.warning(f"Dev {self.ip} returned RESULT packet with incorrect CRC.")
                     return
-                if self.first_result_order is None:
-                    self.first_result_order = order
-                rel_order = (order - self.first_result_order) & 0xFFFF
+                if self.first_data_order is None:
+                    self.first_data_order = order
+                rel_order = (order - self.first_data_order) & 0xFFFF
                 t = [rel_order]
                 samples = []
                 result_code = struct.unpack('<H', data[4:6])[0]
@@ -516,6 +538,10 @@ class DeviceManager:
             except Exception:
                 pass
         self.devices.clear()
+    
+    def clear_data_queue(self):
+        if self.loop and self.data_socket:
+            self.loop.call_soon_threadsafe(self.data_socket.clear_queue)
 
     def add_device(self, ip:str, cmd_port:int = DEFAULT_CMD_PORT):
         if len(self.devices) >= self.MAX_DEVICES or ip in self.devices:
@@ -547,13 +573,18 @@ class DeviceManager:
         return {ip: dev.get_clock_config() for ip, dev in self.devices.items()}
 
     def ptp_trigger(self, trigger_order:int|None = None):
-        for dev in self.devices.values(): dev.ptp_trigger(trigger_order)
+        for dev in self.devices.values():
+            dev.ptp_trigger(trigger_order)
+            dev.begin_capture(ptp_mode.samples_awaited)
     
     def ptp_wait_trigger(self):
         for dev in self.devices.values(): dev.ptp_wait_trigger()
     
     def ptp_reset(self):
         for dev in self.devices.values(): dev.ptp_reset()
+    
+    def begin_capture_all(self, n: int):
+        for dev in self.devices.values(): dev.begin_capture(n)
 
     def dispatch_loop(self, signal):
         async def run():
@@ -563,7 +594,13 @@ class DeviceManager:
                     dev = self.devices.get(ip)
                     if not dev:
                         continue
-                    order = dev.on_raw_packet(pkt)
+                    
+                    try:
+                        order = dev.on_raw_packet(pkt)
+                    except Exception as e:
+                        self._logger.exception(f'Packet dispatch failed from {ip}: {e}')
+                        continue
+
                     if order is not None:
                         signal.emit(ip, order)
             except asyncio.CancelledError:
@@ -968,6 +1005,8 @@ class Plotter(QWidget):
             ptp_mode.trigger_mode = False
             ptp_mode.samples_awaited = n
             self.manager.ptp_reset()
+            self.manager.clear_data_queue()
+            self.manager.begin_capture_all(n)
             self._logger.info(f'Started PTP sampling (n={n})')
         else:
             leader_id=self.leader_buttons.checkedId()
@@ -990,10 +1029,13 @@ class Plotter(QWidget):
         self.expected_samples = n
 
         if ptp_mode.enabled:
+            self.manager.ptp_reset()
+            self.manager.clear_data_queue()
+            
             ptp_mode.waiting_for_trigger = True
             ptp_mode.trigger_mode = True
             ptp_mode.samples_awaited = n
-            self.manager.ptp_reset()
+            
             self.manager.ptp_wait_trigger()
             self._logger.info(f'Wait trigger PTP sampling (n={n})')
         else:
@@ -1170,16 +1212,23 @@ class Plotter(QWidget):
                     received = int(len(x))
                     # interpolete x to stretch graph to the same width as signal plot, so each packet corresponds to SAMPLES_PER_PACKET samples on the graph 
                     n = x.size
-                    x_idx = np.arange(n, dtype=float)
-                    x_idx_new = (
-                        np.arange(n * SAMPLES_PER_PACKET, dtype=float) / SAMPLES_PER_PACKET
-                        - (SAMPLES_PER_PACKET - 1) / SAMPLES_PER_PACKET
+                    if n < 2:
+                        received = n
+                        avgs = [0]
+                        errs = ','.join('0' for _ in range(dev.channels))
+                        continue
+
+                    x_pkt = np.array(buf.signal[0], dtype=float) * PACKET_PERIOD
+                    received = int(len(x_pkt))
+                    avgs = [0]
+                    if received == 0:
+                        continue
+                    # create 200 samples per 1 ms packet interval:
+                    # packet result at t=0 is valid on <0 ms, 1 ms>
+                    x = (
+                        np.repeat(x_pkt, SAMPLES_PER_PACKET)
+                        + np.tile(np.arange(SAMPLES_PER_PACKET), received) * SAMPLING_PERIOD
                     )
-                    x_interpolated = np.interp(x_idx_new, x_idx, x)
-                    m_left = (x[1] - x[0]) / (x_idx[1] - x_idx[0])
-                    left = x_idx_new < x_idx[0]
-                    x_interpolated[left] = x[0] + m_left * (x_idx_new[left] - x_idx[0])
-                    x = x_interpolated
 
                     avgs = [0]  # Dummy for uniform output
 
@@ -1196,7 +1245,7 @@ class Plotter(QWidget):
                             #self.ax_result_curves[bit_idx] = self.ax_result.step(pen=color, where='post', name=f'bit{bit_idx}')
 
                         #bit_vals = ((byte_values >> bit_idx) & 1).astype(float)
-                        y = np.array(buf.signal[bit_idx + 1])[-len(x):]
+                        y = np.array(buf.signal[bit_idx + 1], dtype=float)
                         y = np.repeat(y, SAMPLES_PER_PACKET) # Y interpolation - steps
                         # Slight offset so bits with same logical value are still visible
                         offset = (bit_idx - center) * offset_step
