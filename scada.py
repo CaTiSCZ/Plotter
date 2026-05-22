@@ -572,13 +572,18 @@ class DeviceManager:
     def get_clock_config_all(self):
         return {ip: dev.get_clock_config() for ip, dev in self.devices.items()}
 
+    def force_trigger(self):
+        #for dev in self.devices.values(): dev.force_trigger()
+        self.devices[0].force_trigger()
+
     def ptp_trigger(self, trigger_order:int|None = None):
         for dev in self.devices.values():
             dev.ptp_trigger(trigger_order)
             dev.begin_capture(ptp_mode.samples_awaited)
     
     def ptp_wait_trigger(self):
-        for dev in self.devices.values(): dev.ptp_wait_trigger()
+        #for dev in self.devices.values(): dev.ptp_wait_trigger()
+        self.devices[0].ptp_wait_trigger()
     
     def ptp_reset(self):
         for dev in self.devices.values(): dev.ptp_reset()
@@ -1075,9 +1080,9 @@ class Plotter(QWidget):
     def _force_trigger(self):
         #self.manager.broadcast('force_trigger')
         #self._logger.info('Force trigger on all devices')
-        leader_id = self.leader_buttons.checkedId()
-        leader_ip = self.device_edits[leader_id].text().strip().split(':')[0]
-        self.manager.devices[leader_ip].force_trigger()
+        #leader_id = self.leader_buttons.checkedId()
+        #leader_ip = self.device_edits[leader_id].text().strip().split(':')[0]
+        self.manager.force_trigger()
 
     def _penetrate_firewall(self):
         self._logger.info('Trying to penetrate firewall')
