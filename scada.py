@@ -102,8 +102,8 @@ def _verify_crc(pkt: bytes) -> bytes|None:
     data, recv_crc = pkt[:-2], CRC_STRUCT.unpack(pkt[-2:])[0]
     return data if crc16_ccitt(data)==recv_crc else False
 
-# ID packet parsing from GrafTest
-ID_HEADER_STRUCT = struct.Struct('<HHHBBI3I HBB I HBB 8s 30s H')
+# ID packet parsing
+ID_HEADER_STRUCT = struct.Struct('<HH HBB HBBI3I HBBI HH')
 
 def parse_id_packet(data):
     if len(data) < ID_HEADER_STRUCT.size:
@@ -112,21 +112,41 @@ def parse_id_packet(data):
     return {
         'packet_type': unpacked[0],
         'state': unpacked[1],
-        'hw_id': unpacked[2],
-        'hw_ver_major': unpacked[3],
-        'hw_ver_minor': unpacked[4],
-        'mcu_serial': unpacked[5],
-        'cpu_uid': (unpacked[6], unpacked[7], unpacked[8]),
-        'adc_hw_id': unpacked[9],
-        'adc_ver_major': unpacked[10],
-        'adc_ver_minor': unpacked[11],
-        'adc_serial': unpacked[12],
-        'fw_id': unpacked[13],
-        'fw_ver_major': unpacked[14],
-        'fw_ver_minor': unpacked[15],
-        'fw_config': unpacked[16].decode('ascii').rstrip('\x00'),
-        'build_time': unpacked[17].decode('ascii').rstrip('\x00'),
-        'channels_count': unpacked[18],
+        'fw_id': unpacked[2],
+        'fw_ver_major': unpacked[3],
+        'fw_ver_minor': unpacked[4],
+        'hw_id': unpacked[5],
+        'hw_ver_major': unpacked[6],
+        'hw_ver_minor': unpacked[7],
+        'mcu_serial': unpacked[8],
+        'cpu_uid': (unpacked[9], unpacked[10], unpacked[11]),
+        'adc_hw_id': unpacked[12],
+        'adc_ver_major': unpacked[13],
+        'adc_ver_minor': unpacked[14],
+        'adc_serial': unpacked[15],
+        'channels_count': unpacked[16],
+    }
+
+# FW info struct (response to CMD_GET_FW_ID = 29)
+FW_INFO_STRUCT = struct.Struct('<HBB I 8s 30s 48s BBH II')
+
+def parse_fw_info(data):
+    """Parse fw_info_t from ACK data of CMD_GET_FW_ID."""
+    if len(data) < FW_INFO_STRUCT.size:
+        return None
+    unpacked = FW_INFO_STRUCT.unpack(data[:FW_INFO_STRUCT.size])
+    return {
+        'fw_id': unpacked[0],
+        'fw_ver_major': unpacked[1],
+        'fw_ver_minor': unpacked[2],
+        'build_number': unpacked[3],
+        'build_cfg': unpacked[4].decode('ascii').rstrip('\x00'),
+        'build_time': unpacked[5].decode('ascii').rstrip('\x00'),
+        'built_by': unpacked[6].decode('ascii').rstrip('\x00'),
+        'variant_id': unpacked[7],
+        'boot_bank': unpacked[8],
+        'uptime_ms': unpacked[10],
+        'reset_reason': unpacked[11],
     }
 
 # Buffer container
@@ -240,6 +260,8 @@ class Device:
     PKT_TYPE_TRIGGER = 3
     PKT_TYPE_LOG  = 4
     PKT_TYPE_RESULT  = 5
+    PKT_TYPE_DS_RESULT = 6
+    PKT_TYPE_SAMPLE_RESULT = 7
 
     def __init__(self, ip:str, cmd_port:int, data_port:int, loop):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
@@ -301,6 +323,25 @@ class Device:
 
     def get_id(self)->dict|None:
         return self._parse_id(self._send_cmd(1) or b'')
+
+    def get_fw_id(self)->dict|None:
+        """Send CMD_GET_FW_ID (29) and parse fw_info_t from ACK data."""
+        pkt = self._send_cmd(29)
+        if not pkt or len(pkt) < 8:  # ACK header = 8 bytes
+            self._logger.warning(f"Dev {self.ip} did not respond to get FW ID cmd.")
+            return None
+        packet_type, error, cmd = struct.unpack('<HHI', pkt[:8])
+        if packet_type != self.PKT_TYPE_ACK or cmd != 29:
+            self._logger.warning(f"Dev {self.ip} unexpected response to get FW ID cmd (type={packet_type}, cmd={cmd}).")
+            return None
+        if error != 0:
+            self._logger.warning(f"Dev {self.ip} FW ID cmd returned error {error}.")
+            return None
+        fw_data = pkt[8:]
+        info = parse_fw_info(fw_data)
+        if info is None:
+            self._logger.warning(f"Dev {self.ip} FW info data too short ({len(fw_data)} bytes).")
+        return info
 
     def set_id(self, new_id:int):
         payload = struct.pack('<B', new_id)
@@ -434,7 +475,7 @@ class Device:
                     self._logger.warning(f"Dev {self.ip} returned DATA packet with incorrect CRC.")
                     return
                 #print(f"[DBG] Dev {self.id} dataPacket {order} length {len(pkt)}")
-                off = 4
+                off = 12  # skip packet_type(2) + packet_num(2) + ptp_seconds(4) + ptp_nanoseconds(4)
                 if self.first_data_order is None:
                     self.first_data_order = order
                 rel_order = (order - self.first_data_order) & 0xFFFF
@@ -445,8 +486,7 @@ class Device:
                     samples.append(sig)
                     off += 2*SAMPLES_PER_PACKET
                 errs = list(data[off:off+self.channels])
-                off += self.channels
-                # result_code = struct.unpack('<H', data[4:6])
+                off += self.channels + (self.channels % 2)  # parity_errors + padding
                 fault_state = data[off:off+2]
                 self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
                 return order
@@ -506,6 +546,12 @@ class Device:
                 self._logger.info(f"Dev {self.ip} ID packet received on data socket.")
                 self._parse_id(pkt)
                 return
+            case self.PKT_TYPE_DS_RESULT:
+                self._logger.debug(f"Dev {self.ip} DS_RESULT packet {order} received (ignored).")
+                return
+            case self.PKT_TYPE_SAMPLE_RESULT:
+                self._logger.debug(f"Dev {self.ip} SAMPLE_RESULT packet {order} received (ignored).")
+                return
 
 # Manager of multiple devices
 class DeviceManager:
@@ -556,6 +602,9 @@ class DeviceManager:
 
     def get_all_ids(self):
         return {ip: dev.get_id() for ip,dev in self.devices.items()}
+
+    def get_all_fw_ids(self):
+        return {ip: dev.get_fw_id() for ip,dev in self.devices.items()}
     
     def register_all(self, addr:str, port:int):
         for dev in self.devices.values(): dev.register_receiver(addr, port)
@@ -958,7 +1007,14 @@ class Plotter(QWidget):
 
     def _get_ids(self):
         for ip,info in self.manager.get_all_ids().items():
-            self._logger.info(f'ID {ip}: ' + (f"FW {info['fw_id']} v{info['fw_ver_major']}.{info['fw_ver_minor']} {info['fw_config']} from {info['build_time']}; channels={info['channels_count']}" if info else 'FAIL'))
+            self._logger.info(f'ID {ip}: ' + (f"FW {info['fw_id']} v{info['fw_ver_major']}.{info['fw_ver_minor']}; channels={info['channels_count']}" if info else 'FAIL'))
+
+    def _get_fw_ids(self):
+        for ip,info in self.manager.get_all_fw_ids().items():
+            if info:
+                self._logger.info(f'FW_ID {ip}: {info["build_cfg"]} #{info["build_number"]} from {info["build_time"]} by {info["built_by"]}; uptime={info["uptime_ms"]}ms bank={info["boot_bank"]}')
+            else:
+                self._logger.warning(f'FW_ID {ip}: FAIL')
 
     def _register_all(self):
         try:
@@ -1312,7 +1368,7 @@ class Plotter(QWidget):
         #self._penetrate_firewall()
         #for i, f in enumerate((self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._register_all, self._reset_counter)):
         # TODO: add self._leader_changed
-        for i, f in enumerate((self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._register_all, self._register_ccu, self._reset_counter)):
+        for i, f in enumerate((self._ping_all, self._register_logger_all, self._get_ids, self._get_fw_ids, self._get_clock_config, self._register_all, self._register_ccu, self._reset_counter)):
             QTimer(self).singleShot(i * 100, f)
 
 def main(argv):

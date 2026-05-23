@@ -30,6 +30,9 @@ class PACKET(IntEnumName):
     DATA_packet             =  2
     TRIGGER_packet          =  3
     LOG_packet              =  4
+    RESULT_packet           =  5
+    DS_RESULT_packet        =  6
+    SAMPLE_RESULT_packet    =  7
 
 @unique
 class CMD(IntEnumName):
@@ -49,18 +52,34 @@ class CMD(IntEnumName):
     DEVICE_ID_CONFIG        = 13
     RESET_DEVICE            = 14
     GET_CLOCK_CONFIG        = 15
-    SET_CALIBRATION         = 16
-    ENABLE_TEST_MODE        = 17
-    DISABLE_TEST_MODE       = 18
+    FW_UPDATE_REQUEST       = 16
+    SET_CALIBRATION         = 17
+    ENABLE_TEST_DATA_INPUT  = 18
+    DISABLE_TEST_DATA_INPUT = 19
+    WAIT_TRIGGER_PTP        = 20
+    RESET_FAULT_STATE       = 21
+    HW_CONFIG               = 22
+    GET_SYSTEM_STATE        = 23
+    STARTUP_CONTROL         = 24
+    STOP_SYSTEM             = 25
+    SET_NODE_SERIALS        = 26
+    GET_CCU_CALIBRATION     = 27
+    SET_CCU_CALIBRATION     = 28
+    GET_FW_ID               = 29
+    GET_NET_CONFIG          = 30
+    SET_NET_CONFIG          = 31
+    GET_CALIBRATION         = 32
+    START_SAMPLING_DEFERRED = 33
+    GET_PTP_TIME            = 34
 
 class STRUCT:
     CMD = struct.Struct("<I")
     ACK = struct.Struct("<HHI")
-    ID = struct.Struct("<HHHBBI3I HBB I HBB 8s 30s H")
+    ID = struct.Struct("<HH HBB HBBI3I HBBI HH")
     CHANNEL = struct.Struct("<4s ff")
     CRC = struct.Struct("<H")
     PORT = struct.Struct("<H")
-    DATA_HEADER = struct.Struct("<HH")
+    DATA_HEADER = struct.Struct("<HHII")
     FAULT_STATE = struct.Struct("<H")
 
 def load_csv(file_path: str) -> tuple[np.ndarray, list[str]]:
@@ -179,7 +198,7 @@ class TestDataSender:
         if crc != recv_crc:
             print(f"CRC mismatch: calculated {crc:04X}, received {recv_crc:04X}")
             return False
-        self.channels = id_info[-1]
+        self.channels = id_info[16]  # channels_count (index 17 is _reserved)
         self.channel_info = []
         for i in range(self.channels):
             offset = STRUCT.CHANNEL.size * i + STRUCT.ID.size
@@ -193,7 +212,7 @@ class TestDataSender:
 
     def enable_test_mode(self) -> bool:
         port = b'' if self.data_port is None else STRUCT.PORT.pack(self.data_port)
-        data = self._send_cmd_with_ack(CMD.ENABLE_TEST_MODE, port)
+        data = self._send_cmd_with_ack(CMD.ENABLE_TEST_DATA_INPUT, port)
         if data is False:
             self.test_mode_enabled = False
             return False
@@ -213,7 +232,7 @@ class TestDataSender:
         return True
 
     def disable_test_mode(self) -> bool:
-        data = self._send_cmd_with_ack(CMD.DISABLE_TEST_MODE)
+        data = self._send_cmd_with_ack(CMD.DISABLE_TEST_DATA_INPUT)
         if data is not False:
             self.test_mode_enabled = False
             return True
@@ -360,7 +379,7 @@ class TestDataSender:
         fault_state = STRUCT.FAULT_STATE.pack(0)
         start_time = time.monotonic()
         for i in range(total_packets):
-            pkt = STRUCT.DATA_HEADER.pack(PACKET.DATA_packet, packet_num & 0xFFFF) \
+            pkt = STRUCT.DATA_HEADER.pack(PACKET.DATA_packet, packet_num & 0xFFFF, 0, 0) \
                 + data[i].tobytes() \
                 + parity_errors \
                 + fault_state
