@@ -220,6 +220,7 @@ class PTPMode:
         self.trigger_mode = False
 
     def fire_trigger(self, trigger_order:int|None = None):
+        self._logger.info('PTP trigger received, processing.')
         if not self.enabled:
             return
         if not self.trigger_mode:
@@ -574,7 +575,7 @@ class DeviceManager:
 
     def force_trigger(self):
         #for dev in self.devices.values(): dev.force_trigger()
-        self.devices[0].force_trigger()
+        self.devices[next(iter(self.devices))].force_trigger()
 
     def ptp_trigger(self, trigger_order:int|None = None):
         for dev in self.devices.values():
@@ -583,7 +584,7 @@ class DeviceManager:
     
     def ptp_wait_trigger(self):
         #for dev in self.devices.values(): dev.ptp_wait_trigger()
-        self.devices[0].ptp_wait_trigger()
+        self.devices[next(iter(self.devices))].ptp_wait_trigger()
     
     def ptp_reset(self):
         for dev in self.devices.values(): dev.ptp_reset()
@@ -1040,7 +1041,7 @@ class Plotter(QWidget):
             ptp_mode.waiting_for_trigger = True
             ptp_mode.trigger_mode = True
             ptp_mode.samples_awaited = n
-            
+
             self.manager.ptp_wait_trigger()
             self._logger.info(f'Wait trigger PTP sampling (n={n})')
         else:
