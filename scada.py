@@ -537,7 +537,11 @@ class Device:
     
     def stop_sampling(self):
         return self._send_cmd(7)
-    
+
+    def startup_start(self, n: int = 0):
+        """Send CMD_STARTUP_CONTROL start (sub_cmd=1) to CCU. Equivalent to system_control.py start --samples n."""
+        return self._send_cmd(24, struct.pack('<BI', 1, n))
+
     def force_trigger(self):
         return self._send_cmd(9)
     
@@ -1231,6 +1235,13 @@ class Plotter(QWidget):
             self.manager.ptp_reset()
             self.manager.clear_data_queue()
             self.manager.begin_capture_all(n)
+            ccu_ip = self.device_edits[CCU_DEVICE_INDEX].text().strip().split(':')[0]
+            ccu_dev = self.manager.devices.get(ccu_ip)
+            if ccu_dev:
+                ccu_dev.startup_start(n)
+                self._logger.info(f'Sent CCU startup_start (n={n}) to {ccu_ip}')
+            else:
+                self._logger.warning(f'CCU device not found ({ccu_ip}), startup_start not sent')
             self._logger.info(f'Started PTP sampling (n={n})')
         else:
             leader_id=self.leader_buttons.checkedId()
