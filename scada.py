@@ -220,7 +220,6 @@ class PTPMode:
         self.trigger_mode = False
 
     def fire_trigger(self, trigger_order:int|None = None):
-        self._logger.info('PTP trigger received, processing.')
         if not self.enabled:
             return
         if not self.trigger_mode:
@@ -229,7 +228,6 @@ class PTPMode:
             return
         self.waiting_for_trigger = False
         self.device_manager.ptp_trigger(trigger_order)
-        self._logger.info('PTP trigger received, starting sampling.')
 
 ptp_mode = PTPMode()
 
