@@ -518,6 +518,10 @@ class DeviceManager:
         self.data_socket = None
         self.dispatch_task = None
         self.loop_thread = None
+        self.cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.cmd_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.cmd_sock.settimeout(RECV_TIMEOUT_S)
+        self.cmd_sock.connect(('192.168.137.255', DEFAULT_CMD_PORT))
 
     def broadcast(self, method:str, *args, **kwargs):
         for dev in self.devices.values():
@@ -529,6 +533,19 @@ class DeviceManager:
 
     def set_loop_thread(self, loop_thread):
         self.loop_thread = loop_thread
+    
+    def _send_cmd_broadcast(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None):
+        pkt = struct.pack('<I', code) + payload
+        if socket_ is None:
+            self.cmd_sock.send(pkt)
+        else:
+            socket_.sendto(pkt, (self.ip, self.cmd_port))
+        if not expect:
+            return None
+        try:
+            return (socket_ or self.cmd_sock).recv(2048)
+        except socket.timeout:
+            return None
 
     def clear(self):
         for dev in self.devices.values():
@@ -570,6 +587,9 @@ class DeviceManager:
 
     def get_clock_config_all(self):
         return {ip: dev.get_clock_config() for ip, dev in self.devices.items()}
+
+    def reset_counter(self):
+        return self._send_cmd_broadcast(10)      
 
     def force_trigger(self):
         #for dev in self.devices.values(): dev.force_trigger()
@@ -868,7 +888,7 @@ class Plotter(QWidget):
         self.timer.timeout.connect(self._update_plot)
         self.timer.start()
 
-        #self.data_ready.connect(self._check_order) # TODO: enable packet order checking
+        self.data_ready.connect(self._check_order)
 
     def closeEvent(self, event):
         self.manager.shutdown()
@@ -1072,7 +1092,8 @@ class Plotter(QWidget):
         self._logger.info('Stopped all sampling')
 
     def _reset_counter(self):
-        self.manager.broadcast('reset_counter')
+        #self.manager.broadcast('reset_counter')
+        self.manager.reset_counter()
         self._logger.info('Reset counter on all devices')
         self.last_order.clear()
 
