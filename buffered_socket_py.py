@@ -43,6 +43,11 @@ class BufferedSocket:
 
             self._addr = (local_ip, port)
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Increase OS receive buffer to reduce kernel drops under load
+            try:
+                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            except OSError:
+                pass
             self._sock.bind(self._addr)
             self._sock.settimeout(5.0)
             self._start()

@@ -77,6 +77,10 @@ public:
             throw std::runtime_error("Bind failed");
         }
 
+        // Increase OS receive buffer to reduce kernel drops under high packet rates
+        int rcvbuf = 4 * 1024 * 1024;  // 4 MB
+        setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvbuf, sizeof(rcvbuf));
+
         DWORD tv = (DWORD)(timeout_ * 1000);
         setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
 
@@ -89,6 +93,9 @@ public:
         close();
         std::lock_guard<std::mutex> lock(sock_mutex_);
         sock_ = sock;
+        // Increase OS receive buffer to reduce kernel drops under high packet rates
+        int rcvbuf = 4 * 1024 * 1024;  // 4 MB
+        setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvbuf, sizeof(rcvbuf));
         DWORD tv = (DWORD)(timeout_ * 1000);
         setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
         start();
@@ -147,6 +154,36 @@ public:
             throw std::runtime_error("inet_ntop failed");
         sender_ip.resize(std::min(strlen(sender_ip.c_str()), size_t(INET_ADDRSTRLEN)));
         return std::make_pair(std::move(data), std::make_pair(std::move(sender_ip), ntohs(p.second.sin_port)));
+    }
+
+    /// Drain up to max_count packets from receive buffer without throwing on empty.
+    /// Waits up to timeout for the first packet, then drains all immediately available.
+    std::vector<std::pair<Container, std::pair<std::string, int>>> drain(int bufsize, int max_count) {
+        std::vector<std::pair<Container, std::pair<std::string, int>>> results;
+        results.reserve(std::min(max_count, 256));
+
+        std::unique_lock<std::mutex> l(recv_mutex_);
+        // Wait for at least one packet (up to timeout)
+        if (!recv_cv_.wait_for(l, std::chrono::milliseconds(int(timeout_ * 1000)), [&]{ return !receive_buffer_.empty(); })) {
+            return results;  // empty — no exception thrown
+        }
+
+        // Drain all available up to max_count
+        while (!receive_buffer_.empty() && (int)results.size() < max_count) {
+            auto p = std::move(receive_buffer_.front());
+            receive_buffer_.pop();
+
+            Container& data = p.first;
+            if (data.size() > (size_t)bufsize)
+                data.resize(bufsize);
+            std::string sender_ip(INET_ADDRSTRLEN, '\0');
+            if (inet_ntop(AF_INET, &p.second.sin_addr, &sender_ip[0], INET_ADDRSTRLEN))
+                sender_ip.resize(strlen(sender_ip.c_str()));
+            else
+                sender_ip = "0.0.0.0";
+            results.emplace_back(std::move(data), std::make_pair(std::move(sender_ip), ntohs(p.second.sin_port)));
+        }
+        return results;
     }
 
     void settimeout(double timeout_sec) {

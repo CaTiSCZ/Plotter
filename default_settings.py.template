@@ -1,6 +1,8 @@
 DEFAULT_FIRST_IP = "192.168.137.120"
-DEFAULT_LEADER = 1
 DEVICES_COUNT = 5
 DEFAULT_AVG_LEN_MS = 1000
-DEFAULT_PTP_MODE_ENABLED = False
-DEFAULT_SOCKET_BACKEND = 'auto' ## 'auto' tries to use C++ and falls back to Python on fail; 'py' uses Python socket, 'cpp' uses C++ socket and crashes when not available
+SOCKET_BACKEND = 'auto'  ## 'auto' tries C++ then falls back to Python; 'py' = Python socket; 'cpp' = C++ socket
+DEFAULT_PRE_TRIGGER_S = 0.2       ## seconds of data to capture before trigger
+DEFAULT_POST_TRIGGER_S = 0.8      ## seconds of data to capture after trigger
+DEFAULT_DISPLAY_WINDOW_S = 1.0    ## rolling plot window width in seconds
+DEFAULT_PENETRATE_FIREWALL = True  ## periodic keepalive ping to open firewall for incoming UDP

@@ -60,6 +60,21 @@ PYBIND11_MODULE(buffered_socket_cpp, m) {
             return py::make_tuple(py::bytes(reinterpret_cast<const char*>(result.first.data()), result.first.size()),
                                   py::make_tuple(result.second.first, result.second.second));
         })
+        .def("drain", [](BufferedSocket& self, int bufsize, int max_count) {
+            std::vector<std::pair<BufferedSocket_Container, std::pair<std::string, int>>> results;
+            {
+                py::gil_scoped_release release;
+                results = std::move(self.drain(bufsize, max_count));
+            }
+            py::list out;
+            for (auto& item : results) {
+                out.append(py::make_tuple(
+                    py::bytes(reinterpret_cast<const char*>(item.first.data()), item.first.size()),
+                    py::make_tuple(item.second.first, item.second.second)
+                ));
+            }
+            return out;
+        }, py::arg("bufsize") = 4096, py::arg("max_count") = 500)
         .def("settimeout", &BufferedSocket::settimeout)
         .def("get_received_count", &BufferedSocket::get_received_count)
         .def("get_buffered_items_count", &BufferedSocket::get_buffered_items_count)
