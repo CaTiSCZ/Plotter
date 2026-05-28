@@ -102,6 +102,9 @@ def _verify_crc(pkt: bytes) -> bytes|None:
     data, recv_crc = pkt[:-2], CRC_STRUCT.unpack(pkt[-2:])[0]
     return data if crc16_ccitt(data)==recv_crc else False
 
+def _signed_u16_delta(new: int, old: int) -> int:
+        return ((new - old + 0x8000) & 0xFFFF) - 0x8000
+
 # ID packet parsing from GrafTest
 ID_HEADER_STRUCT = struct.Struct('<HHHBBI3I HBB I HBB 8s 30s H')
 
@@ -259,6 +262,8 @@ class Device:
         self.received_last = 0
         self.input_packet_ring = deque(maxlen=PTP_TRIGGER_RING_PACKETS)
         self.first_data_order = None
+        self.last_data_order = None
+        self.packet_index = 0
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None):
         pkt = struct.pack('<I', code) + payload
@@ -353,12 +358,16 @@ class Device:
         self.ptp_triggered = False
         self.input_packet_ring.clear()
         self.first_data_order = None
+        self.last_data_order = None
+        self.packet_index = 0
     
     def begin_capture(self, n: int):
         self.capture_active = True
         self.capture_limit = n
         self.capture_counter = 0
         self.first_data_order = None
+        self.last_data_order = None
+        self.packet_index = 0
     
     def flush_input_packet_ring(self, trigger_order:int):
         packets = [pkt for pkt in self.input_packet_ring
@@ -436,7 +445,20 @@ class Device:
                 off = 4
                 if self.first_data_order is None:
                     self.first_data_order = order
-                rel_order = (order - self.first_data_order) & 0xFFFF
+                    self.last_data_order = order
+                    self.packet_index = 0
+                else:
+                    delta = _signed_u16_delta(order, self.last_data_order)
+                    if delta == -1:
+                        delta = 1
+                    if delta > 1000:
+                        self._logger.warning(
+                            f"Dev {self.ip} large packet jump: order={order}, "
+                            f"last={self.last_data_order}, delta={delta}"
+                        )
+                    self.packet_index += 1
+                    self.last_data_order = order
+                rel_order = self.packet_index
                 t = [rel_order*SAMPLES_PER_PACKET + k for k in range(SAMPLES_PER_PACKET)]
                 samples = []
                 for _ in range(self.channels):
@@ -485,7 +507,20 @@ class Device:
                     return
                 if self.first_data_order is None:
                     self.first_data_order = order
-                rel_order = (order - self.first_data_order) & 0xFFFF
+                    self.last_data_order = order
+                    self.packet_index = 0
+                else:
+                    delta = _signed_u16_delta(order, self.last_data_order)
+                    if delta == -1:
+                        delta = 1
+                    if delta > 1000:
+                        self._logger.warning(
+                            f"Dev {self.ip} large packet jump: order={order}, "
+                            f"last={self.last_data_order}, delta={delta}"
+                        )
+                    self.packet_index += 1
+                    self.last_data_order = order
+                rel_order = self.packet_index
                 t = [rel_order]
                 samples = []
                 result_code = struct.unpack('<H', data[4:6])[0]
@@ -888,7 +923,7 @@ class Plotter(QWidget):
         self.timer.timeout.connect(self._update_plot)
         self.timer.start()
 
-        self.data_ready.connect(self._check_order)
+        #self.data_ready.connect(self._check_order)
 
     def closeEvent(self, event):
         self.manager.shutdown()
@@ -1258,7 +1293,7 @@ class Plotter(QWidget):
 
         self._logger.info('Saved data: ' + ', '.join(files))
         return files
-
+        
     def _update_plot(self):
         lines = []
         #for (ip, dev) in self.manager.devices.items():
