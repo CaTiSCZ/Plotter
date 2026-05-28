@@ -785,7 +785,7 @@ class Plotter(QWidget):
         cfg.addWidget(self.receiver_edit, 0, 7)
 
         cfg.addWidget(QLabel('Measurement number'), 2, 6)
-        self.measurement_number_edit = QLineEdit(f'1')
+        self.measurement_number_edit = QLineEdit(f'0')
         cfg.addWidget(self.measurement_number_edit, 2, 7)
 
         self.apply_btn = QPushButton('Apply Device List')
@@ -1167,16 +1167,38 @@ class Plotter(QWidget):
         self._logger.info('Graf cleaned')
     
     def save_measurement(self):
-        measurement_nr = int(self.measurement_number_edit.text())
-        dir_path = 'RICE_mereni'
-        if not os.path.exists(dir_path):
-            os.mkdir(dir_path)
-        file_name = os.path.join(dir_path, str(measurement_nr).zfill(4))
-        self.save_data(file_prefix=file_name)
+        try:
+            measurement_nr = int(self.measurement_number_edit.text())
+        except ValueError:
+            QMessageBox.warning(self, "Saving error", "Measurement number is invalid.")
+            return
+
+        try:
+            dir_path = 'RICE_mereni'
+            os.makedirs(dir_path, exist_ok=True)
+
+            file_name = os.path.join(dir_path, str(measurement_nr).zfill(4))
+            files = self.save_data(file_prefix=file_name, strict=True)
+
+        except Exception as e:
+            self._logger.exception("Measurement save failed")
+            QMessageBox.critical(
+                self,
+                "Measurement was not saved correctly",
+                f"Saving failed:\n{e}"
+            )
+            return
+
         measurement_nr += 1
         self.measurement_number_edit.setText(str(measurement_nr))
 
-    def save_data(self, file_prefix=None):
+        QMessageBox.information(
+            self,
+            "Measurement saved",
+            "Saved files:\n" + "\n".join(files)
+        )
+
+    def save_data(self, file_prefix=None, strict=True):
         if not file_prefix:
             path, _ = QFileDialog.getSaveFileName(self, 'Save Data', '', 'CSV Files (*.csv)')
             if not path:
@@ -1186,23 +1208,56 @@ class Plotter(QWidget):
             base = file_prefix
 
         files = []
+
+        if not self.manager.devices:
+            raise RuntimeError("Nejsou aplikovaná žádná zařízení.")
+
         for idx, (ip, dev) in enumerate(self.manager.devices.items()):
             fname = f"{base}_dev{idx}.csv"
-            with open(fname, 'w', newline='') as f:
+
+            with dev.buffer.lock:
+                times = list(dev.buffer.time)
+                signals = [list(dev.buffer.signal[c + 1]) for c in range(dev.channels)]
+
+            if strict and not times:
+                raise RuntimeError(f"Zařízení {ip} nemá žádná data k uložení.")
+
+            row_count = min(len(times), *(len(s) for s in signals)) if signals else len(times)
+
+            if strict and row_count == 0:
+                raise RuntimeError(f"Zařízení {ip} má prázdný buffer.")
+
+            tmp_name = fname + ".tmp"
+
+            with open(tmp_name, 'w', newline='') as f:
                 w = csv.writer(f)
                 header = ['time'] + [f'ch{c}' for c in range(dev.channels)]
                 w.writerow(header)
-                with dev.buffer.lock:
-                    times = list(dev.buffer.time)
-                    cols = list(zip(*[list(dev.buffer.signal[c + 1]) for c in range(dev.channels)]))
-                for t, row in zip(times, cols):
-                    w.writerow([t * SAMPLING_PERIOD, *row])
+
+                for i in range(row_count):
+                    row = [signals[ch][i] for ch in range(dev.channels)]
+                    w.writerow([times[i] * SAMPLING_PERIOD, *row])
+
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(tmp_name, fname)
             files.append(fname)
-        fname = f"{base}.png"
+
+            if strict and os.path.getsize(fname) == 0:
+                raise RuntimeError(f"Soubor {fname} je prázdný.")
+
+        png_name = f"{base}.png"
         exporter = pyqtgraph.exporters.ImageExporter(self.ax)
-        exporter.export(fname)
-        files.append(fname)
+        exporter.export(png_name)
+
+        if strict and not os.path.exists(png_name):
+            raise RuntimeError(f"Nepodařilo se vytvořit obrázek {png_name}.")
+
+        files.append(png_name)
+
         self._logger.info('Saved data: ' + ', '.join(files))
+        return files
 
     def _update_plot(self):
         lines = []
