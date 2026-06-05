@@ -37,7 +37,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 
 APPLICATION_NAME = 'Eaton FDDS SCADA'
-APPLICATION_VERSION = '1.5.1'
+APPLICATION_VERSION = '1.5.3'
 APPLICATION_TITLE = f"{APPLICATION_NAME} v{APPLICATION_VERSION}"
 
 # Constants
@@ -449,14 +449,12 @@ class Device:
                     self.packet_index = 0
                 else:
                     delta = _signed_u16_delta(order, self.last_data_order)
-                    if delta == -1:
-                        delta = 1
                     if delta > 1000:
                         self._logger.warning(
                             f"Dev {self.ip} large packet jump: order={order}, "
                             f"last={self.last_data_order}, delta={delta}"
                         )
-                    self.packet_index += 1
+                    self.packet_index += delta
                     self.last_data_order = order
                 rel_order = self.packet_index
                 t = [rel_order*SAMPLES_PER_PACKET + k for k in range(SAMPLES_PER_PACKET)]
@@ -511,14 +509,12 @@ class Device:
                     self.packet_index = 0
                 else:
                     delta = _signed_u16_delta(order, self.last_data_order)
-                    if delta == -1:
-                        delta = 1
                     if delta > 1000:
                         self._logger.warning(
                             f"Dev {self.ip} large packet jump: order={order}, "
                             f"last={self.last_data_order}, delta={delta}"
                         )
-                    self.packet_index += 1
+                    self.packet_index += delta
                     self.last_data_order = order
                 rel_order = self.packet_index
                 t = [rel_order]
@@ -923,7 +919,7 @@ class Plotter(QWidget):
         self.timer.timeout.connect(self._update_plot)
         self.timer.start()
 
-        #self.data_ready.connect(self._check_order)
+        self.data_ready.connect(self._check_order)
 
     def closeEvent(self, event):
         self.manager.shutdown()
