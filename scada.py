@@ -27,6 +27,7 @@ from datetime import datetime
 from contextlib import ExitStack
 
 import numpy as np
+os.environ.setdefault('PYQTGRAPH_QT_LIB', 'PyQt5') # ensure PyQt5 is used for pyqtgraph in case of PyQt6 also being installed
 import pyqtgraph as pg
 import pyqtgraph.exporters
 from PyQt5.QtWidgets import (
@@ -37,7 +38,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 
 APPLICATION_NAME = 'Eaton FDDS SCADA'
-APPLICATION_VERSION = '1.5.3'
+APPLICATION_VERSION = '1.6.0'
 APPLICATION_TITLE = f"{APPLICATION_NAME} v{APPLICATION_VERSION}"
 
 # Constants
@@ -60,8 +61,14 @@ PTP_TRIGGER_RING_PACKETS = 500
 # Features
 FCN_QT_LOGGING = True  # Enable Qt logging handler
 
-CLOCK_SETTINGS = ['Internal isolated', 'Internal OUT', 'External', 'External OUT', 'PTP isolated', 'PTP OUT']
-
+CLOCK_FORCED = ['', 'Forced ']
+CLOCK_SOURCES = ['Internal', 'External', 'PTP HW', 'PTP SW']
+CLOKC_OUTPUTS = ['', ' OUT']
+CLOCK_SETTINGS = []
+for f in CLOCK_FORCED:
+    for s in CLOCK_SOURCES:
+        for o in CLOKC_OUTPUTS:
+            CLOCK_SETTINGS.append(f"{f}{s}{o}")
 
 def _resolve_buffered_socket_class(backend: str):
     backend = (backend or DEFAULT_SOCKET_BACKEND).strip().lower()
@@ -106,31 +113,38 @@ def _signed_u16_delta(new: int, old: int) -> int:
         return ((new - old + 0x8000) & 0xFFFF) - 0x8000
 
 # ID packet parsing from GrafTest
-ID_HEADER_STRUCT = struct.Struct('<HHHBBI3I HBB I HBB 8s 30s H')
+ID_HEADER_STRUCT = struct.Struct("<HH HBB HBBI3I HBBI HH") # last HH = channels_count + _reserved
+CHANNEL_HEADER_STRUCT = struct.Struct("<4s ff")       # unit(4 bytes), offset, gain
+DATA_HEADER_STRUCT = struct.Struct("<HHII") # packet_type, packet_num, ptp_seconds, ptp_nanoseconds
+TRIGGER_PACKET_STRUCT = struct.Struct("<HHB3xII") # packet_type, packet_num, sample_num, ptp_seconds, ptp_nanoseconds
 
 def parse_id_packet(data):
     if len(data) < ID_HEADER_STRUCT.size:
         raise ValueError("[ERR]: ID packet is short")
     unpacked = ID_HEADER_STRUCT.unpack(data[:ID_HEADER_STRUCT.size])
-    return {
-        'packet_type': unpacked[0],
-        'state': unpacked[1],
-        'hw_id': unpacked[2],
-        'hw_ver_major': unpacked[3],
-        'hw_ver_minor': unpacked[4],
-        'mcu_serial': unpacked[5],
-        'cpu_uid': (unpacked[6], unpacked[7], unpacked[8]),
-        'adc_hw_id': unpacked[9],
-        'adc_ver_major': unpacked[10],
-        'adc_ver_minor': unpacked[11],
-        'adc_serial': unpacked[12],
-        'fw_id': unpacked[13],
-        'fw_ver_major': unpacked[14],
-        'fw_ver_minor': unpacked[15],
-        'fw_config': unpacked[16].decode('ascii').rstrip('\x00'),
-        'build_time': unpacked[17].decode('ascii').rstrip('\x00'),
-        'channels_count': unpacked[18],
-    }
+    fields = ('packet_type',
+              'state',
+              'fw_id',
+              'fw_ver_major',
+              'fw_ver_minor',
+              'hw_id',
+              'hw_ver_major',
+              'hw_ver_minor',
+              'mcu_serial',
+              'cpu_uid0',
+              'cpu_uid1',
+              'cpu_uid2',
+              'adc_hw_id',
+              'adc_ver_major',
+              'adc_ver_minor',
+              'adc_serial',
+              'channels_count',
+              'reserved')
+    channels_info = ('unit', 'offset', 'gain')
+    info = dict(zip(fields, unpacked))
+    info['cpu_uid'] = (info.pop('cpu_uid0'), info.pop('cpu_uid1'), info.pop('cpu_uid2'))
+    info['channels'] = [dict(zip(channels_info, CHANNEL_HEADER_STRUCT.unpack(data[ID_HEADER_STRUCT.size+i*CHANNEL_HEADER_STRUCT.size:ID_HEADER_STRUCT.size+(i+1)*CHANNEL_HEADER_STRUCT.size]))) for i in range(info['channels_count'])]
+    return info
 
 # Buffer container
 @dataclass
@@ -442,7 +456,9 @@ class Device:
                     self._logger.warning(f"Dev {self.ip} returned DATA packet with incorrect CRC.")
                     return
                 #print(f"[DBG] Dev {self.id} dataPacket {order} length {len(pkt)}")
-                off = 4
+                # off 4 = uint32 ptp_seconds
+                # off 8 = uint32 ptp_nanoseconds
+                off = 12 # off 12 = data
                 if self.first_data_order is None:
                     self.first_data_order = order
                     self.last_data_order = order
@@ -470,14 +486,9 @@ class Device:
                 self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
                 return order
             case self.PKT_TYPE_TRIGGER:
-                # data = _verify_crc(pkt)
-                # if not data:
-                #     return
-                #packet_num = struct.unpack('<H', data[2:4])
-                #sample_num = struct.unpack('<B', data[4])
-                sample_num = pkt[4]
+                _, packet_num, sample_num, ptp_seconds, ptp_nanoseconds = TRIGGER_PACKET_STRUCT.unpack(pkt[:TRIGGER_PACKET_STRUCT.size])
                 ptp_mode.fire_trigger(order)
-                self._logger.info(f'PTP trigger received on {self.id} in packet {order} and sample {sample_num}.')
+                self._logger.info(f'PTP trigger received on {self.id} in packet {order} and sample {sample_num}, sent at {ptp_seconds}.{ptp_nanoseconds:09d} s.')
                 return
             case self.PKT_TYPE_LOG:
                 log_msg = pkt[4:].decode('utf-8').strip()
@@ -1008,7 +1019,7 @@ class Plotter(QWidget):
 
     def _get_ids(self):
         for ip,info in self.manager.get_all_ids().items():
-            self._logger.info(f'ID {ip}: ' + (f"FW {info['fw_id']} v{info['fw_ver_major']}.{info['fw_ver_minor']} {info['fw_config']} from {info['build_time']}; channels={info['channels_count']}" if info else 'FAIL'))
+            self._logger.info(f'ID {ip}: ' + (f"FW {info['fw_id']} v{info['fw_ver_major']}.{info['fw_ver_minor']}; channels={info['channels_count']}" if info else 'FAIL'))
 
     def _register_all(self):
         try:
