@@ -767,6 +767,7 @@ class Plotter(QWidget):
         self.default_cmd_port = DEFAULT_CMD_PORT
         self.last_order: Dict[str,int] = {}
         self.expected_samples = 0
+        self.sampling_indicator_button = None
         ptp_mode.device_manager = manager
 
         self.setWindowTitle(APPLICATION_TITLE)
@@ -852,11 +853,15 @@ class Plotter(QWidget):
         self.sample_spin.setValue(10)
         btns.addWidget(self.sample_spin)
 
-        for label, fn in (#('Start Sampling'                 , self._start_sampling                  ),
-                          ('Start New Sampling'             , self._start_new_sampling              ),
-                          #('Start Sampling on trigger'      , self._start_sampling_on_trigger       ),
-                          ('Start New Sampling on trigger'  , self._start_new_sampling_on_trigger   ),
-                          ('Save Measurement'               , self.save_measurement                 ),
+        self.start_sampling_btn = QPushButton('Start New Sampling')
+        self.start_sampling_btn.clicked.connect(self._start_new_sampling)
+        btns.addWidget(self.start_sampling_btn)
+
+        self.start_sampling_trigger_btn = QPushButton('Start New Sampling on trigger')
+        self.start_sampling_trigger_btn.clicked.connect(self._start_new_sampling_on_trigger)
+        btns.addWidget(self.start_sampling_trigger_btn)
+
+        for label, fn in (('Save Measurement'               , self.save_measurement                 ),
                           ('Force trigger'                  , self._force_trigger                   ),
                           #('Stop Sampling'                  , self._stop_sampling                   ),
                           ('Reset Counter'                  , self._reset_counter                   ),
@@ -1051,6 +1056,20 @@ class Plotter(QWidget):
         except:
             self._logger.warning('Bad logger receiver address')
 
+    def _set_sampling_indicator(self, button: QPushButton | None):
+        for b in (self.start_sampling_btn, self.start_sampling_trigger_btn):
+            b.setStyleSheet("")
+
+        self.sampling_indicator_button = button
+        if button is not None:
+            button.setStyleSheet("background-color: #ffd84d; color: black;")
+
+    def _clear_sampling_indicator_if_complete(self, received_counts: List[int]):
+        if self.sampling_indicator_button is None or self.expected_samples <= 0:
+            return
+        if received_counts and all(received >= self.expected_samples for received in received_counts):
+            self._set_sampling_indicator(None)
+
     def _start_sampling(self):
         n = self.sample_spin.value()
         self.expected_samples = n
@@ -1109,17 +1128,20 @@ class Plotter(QWidget):
                     self._logger.info(f'Start on {ip} (n={n})')
 
     def _start_new_sampling(self):
+        self._set_sampling_indicator(self.start_sampling_btn)
         self._reset_counter()
         self.clear_plot()
         QTimer(self).singleShot(100, self._start_sampling)
 
     def _start_new_sampling_on_trigger(self):
+        self._set_sampling_indicator(self.start_sampling_trigger_btn)
         self._reset_counter()
         self.clear_plot()
         QTimer(self).singleShot(100, self._start_sampling_on_trigger)
 
     def _stop_sampling(self):
         self.manager.broadcast('stop_sampling')
+        self._set_sampling_indicator(None)
         self._logger.info('Stopped all sampling')
 
     def _reset_counter(self):
@@ -1223,11 +1245,11 @@ class Plotter(QWidget):
         measurement_nr += 1
         self.measurement_number_edit.setText(str(measurement_nr))
 
-        QMessageBox.information(
-            self,
-            "Measurement saved",
-            "Saved files:\n" + "\n".join(files)
-        )
+        #QMessageBox.information(
+        #    self,
+        #    "Measurement saved",
+        #    "Saved files:\n" + "\n".join(files)
+        #)
 
     def save_data(self, file_prefix=None, strict=True):
         if not file_prefix:
@@ -1292,6 +1314,7 @@ class Plotter(QWidget):
         
     def _update_plot(self):
         lines = []
+        received_counts = []
         #for (ip, dev) in self.manager.devices.items():
         for dev_index, (ip, dev) in enumerate(self.manager.devices.items()):
             buf = dev.buffer
@@ -1369,6 +1392,7 @@ class Plotter(QWidget):
                     errs = ','.join(str(sum(list(buf.error[c])[-1:])) for c in range(dev.channels))
 
             # Statistics
+            received_counts.append(received)
             avgs = ', '.join(map(lambda v: f'{v:.3f}', avgs))
             sent = self.last_order.get(ip)
             if sent is None:
@@ -1388,6 +1412,7 @@ class Plotter(QWidget):
         self.error_lbl.setText(f'Statistic (ip: received / sent / expected packets (ms); channels parity errors; channels average per {DEFAULT_AVG_LEN_MS} ms):<br>' + 
                                "<br>".join(lines))
         self.error_lbl.setTextFormat(Qt.RichText)
+        self._clear_sampling_indicator_if_complete(received_counts)
     
     def _update_clock_settings(self, row: int, index: int):
         """Compose command using index as type and send a single command."""
