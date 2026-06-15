@@ -38,7 +38,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 
 APPLICATION_NAME = 'Eaton FDDS SCADA'
-APPLICATION_VERSION = '1.6.0'
+APPLICATION_VERSION = '1.6.1'
 APPLICATION_TITLE = f"{APPLICATION_NAME} v{APPLICATION_VERSION}"
 
 # Constants
@@ -898,7 +898,7 @@ class Plotter(QWidget):
         # Detection plot
         self.plot_widget.nextRow()  # move to next row in the graphics layout
         self.ax_result = self.plot_widget.addPlot(title='Detection result')
-        self.ax_result.showGrid(x=True, y=True, alpha=0.3)
+        self.ax_result.showGrid(x=True, y=True, alpha=0.5)
         self.ax_result.setLabel('bottom', 'Time', units='s')
         self.ax_result.setLabel('left', 'Errors')
         self.ax_result.addLegend()
@@ -1340,7 +1340,33 @@ class Plotter(QWidget):
                         key = (ip, ch)
                         if key not in self.curves:
                             self.curves[key] = self.ax.plot(pen=Plotter.Colors[len(self.curves)], name=f'{ip}[{ch}]')
-                        y = np.array(buf.signal[ch + 1])[-len(x):]
+
+                        #y = np.array(buf.signal[ch + 1])[-len(x):]
+                        raw = np.array(buf.signal[ch + 1])[-len(x):]
+                        # Kalibrace z ID paketu
+                        gain = 1.0
+                        offset = 0.0
+                        unit = ""
+                        if hasattr(dev, "info"):
+                            try:
+                                gain = dev.info["channels"][ch]["gain"]
+                                offset = dev.info["channels"][ch]["offset"]
+                                unit_raw = dev.info["channels"][ch]["unit"]
+                                if isinstance(unit_raw, bytes):
+                                    unit = unit_raw.decode("ascii", errors="ignore").rstrip("\0").strip()
+                                else:
+                                    unit = str(unit_raw)
+                            except Exception:
+                                pass
+                        # Přepočet pouze pro zobrazení
+                        y = raw * gain + offset
+                        if key not in self.curves:
+                            pen = pg.mkPen(Plotter.Colors[len(self.curves)], width=2)
+                            curve_name = f'{ip}[{ch}]'
+                            if unit:
+                                curve_name += f' [{unit}]'
+                            self.curves[key] = self.ax.plot(pen=pen, name=curve_name)
+
                         avgs[ch] = np.mean(y[-min(len(y), SAMPLES_PER_PACKET * DEFAULT_AVG_LEN_MS):])
                         self.curves[key].setData(x[-len(y):], y)
                 
