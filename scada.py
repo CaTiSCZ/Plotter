@@ -143,7 +143,13 @@ def parse_id_packet(data):
     channels_info = ('unit', 'offset', 'gain')
     info = dict(zip(fields, unpacked))
     info['cpu_uid'] = (info.pop('cpu_uid0'), info.pop('cpu_uid1'), info.pop('cpu_uid2'))
-    info['channels'] = [dict(zip(channels_info, CHANNEL_HEADER_STRUCT.unpack(data[ID_HEADER_STRUCT.size+i*CHANNEL_HEADER_STRUCT.size:ID_HEADER_STRUCT.size+(i+1)*CHANNEL_HEADER_STRUCT.size]))) for i in range(info['channels_count'])]
+    # channels_count may exceed the number of channel_info entries the device
+    # actually ships (e.g. the CCU reports fault_output_get_count() but only
+    # carries ACQUISITION_CHANNELS channel_info slots), so only parse the
+    # entries that are present to avoid reading past the packet.
+    available_channels = (len(data) - ID_HEADER_STRUCT.size) // CHANNEL_HEADER_STRUCT.size
+    parsed_channels = max(0, min(info['channels_count'], available_channels))
+    info['channels'] = [dict(zip(channels_info, CHANNEL_HEADER_STRUCT.unpack(data[ID_HEADER_STRUCT.size+i*CHANNEL_HEADER_STRUCT.size:ID_HEADER_STRUCT.size+(i+1)*CHANNEL_HEADER_STRUCT.size]))) for i in range(parsed_channels)]
     return info
 
 # Buffer container
@@ -536,9 +542,11 @@ class Device:
                     bit_vals = (result_code >> bit_idx) & 1
                     samples.append([bit_vals])
 
-                errs = []
-                for e in list(data[6:10]):
-                    errs.extend([e, e])
+                # parity_errors[GATHERING_DEVICES=4][ACQUISITION_CHANNELS=2] follows
+                # value (2 B) + fault_state[4] (8 B), so it starts at offset 14.
+                # Use the real per-node, per-channel values (8 distinct bytes) instead
+                # of duplicating one byte per node.
+                errs = list(data[14:22])
 
                 self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
                 #self._logger.info(f"Dev {self.ip} packetNumber[{order}]: result {result_code}")
