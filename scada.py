@@ -49,6 +49,7 @@ SAMPLES_PER_PACKET = 200
 PACKET_RATE_HZ     = 1000
 SAMPLING_PERIOD    = 1/(SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 PACKET_PERIOD      = 1/(PACKET_RATE_HZ)
+NS_PER_SAMPLE      = round(SAMPLING_PERIOD*1e9)  # per-sample PTP step in nanoseconds (5 us)
 GATHERING_DEVICES  = 4   # CCU result packet: number of nodes the CCU gathers from (FW GATHERING_DEVICES)
 ACQUISITION_CHANNELS = 2 # CCU result packet: ADC channels per node (FW ACQUISITION_CHANNELS)
 BUFFER_LENGTH_S    = 30
@@ -163,20 +164,23 @@ class DeviceBuffer:
         self.time   = deque(maxlen=BUFFER_SIZE)
         self.signal = [deque(maxlen=BUFFER_SIZE) for _ in range(channels+1)]
         self.error  = [deque(maxlen=BUFFER_SIZE) for _ in range(channels)]
+        # PTP timestamp per row in integer nanoseconds (mirrors the packet PTP time)
+        self.ptp    = deque(maxlen=BUFFER_SIZE)
         # CCU RESULT-packet metadata (one entry per result packet; empty for nodes)
         self.result_fault_state    = deque(maxlen=BUFFER_SIZE)  # tuple per row: per-node fault_state[GATHERING_DEVICES]
         self.result_parity_errors  = deque(maxlen=BUFFER_SIZE)  # tuple per row: parity_errors[GATHERING_DEVICES][ACQUISITION_CHANNELS]
         self.result_crc_error_mask = deque(maxlen=BUFFER_SIZE)  # int per row
 
-    def extend(self, t:List[int], samples:List[List[int]], errs:List[int]):
+    def extend(self, t:List[int], samples:List[List[int]], errs:List[int], ptp:List[int]):
         with self.lock:
             self.time.extend(t)
             for ch, sig in enumerate(samples):
                 self.signal[ch+1].extend(sig)
                 self.error[ch].extend([errs[ch]]*len(sig))
             self.signal[0].extend(t)
+            self.ptp.extend(ptp)
 
-    def extend_result(self, t:List[int], samples:List[List[int]], errs:List[int],
+    def extend_result(self, t:List[int], samples:List[List[int]], errs:List[int], ptp:List[int],
                       fault_state:Tuple[int, ...], parity_errors:Tuple[int, ...], crc_error_mask:int):
         with self.lock:
             self.time.extend(t)
@@ -184,6 +188,7 @@ class DeviceBuffer:
                 self.signal[ch+1].extend(sig)
                 self.error[ch].extend([errs[ch]]*len(sig))
             self.signal[0].extend(t)
+            self.ptp.extend(ptp)
             self.result_fault_state.extend([fault_state]*len(t))
             self.result_parity_errors.extend([parity_errors]*len(t))
             self.result_crc_error_mask.extend([crc_error_mask]*len(t))
@@ -482,6 +487,7 @@ class Device:
                 #print(f"[DBG] Dev {self.id} dataPacket {order} length {len(pkt)}")
                 # off 4 = uint32 ptp_seconds
                 # off 8 = uint32 ptp_nanoseconds
+                ptp_seconds, ptp_nanoseconds = struct.unpack('<II', data[4:12])
                 off = 12 # off 12 = data
                 if self.first_data_order is None:
                     self.first_data_order = order
@@ -498,6 +504,10 @@ class Device:
                     self.last_data_order = order
                 rel_order = self.packet_index
                 t = [rel_order*SAMPLES_PER_PACKET + k for k in range(SAMPLES_PER_PACKET)]
+                # The packet PTP timestamp marks the last sample in the window; earlier
+                # samples are NS_PER_SAMPLE older each.
+                ptp_last_ns = ptp_seconds*1_000_000_000 + ptp_nanoseconds
+                ptp = [ptp_last_ns - (SAMPLES_PER_PACKET-1-k)*NS_PER_SAMPLE for k in range(SAMPLES_PER_PACKET)]
                 samples = []
                 for _ in range(self.channels):
                     sig = self.data_struct.unpack(data[off:off+2*SAMPLES_PER_PACKET])
@@ -505,7 +515,7 @@ class Device:
                     off += 2*SAMPLES_PER_PACKET
                 errs = list(data[off:off+self.channels])
                 off += self.channels
-                self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs)
+                self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs, ptp)
                 return order
             case self.PKT_TYPE_TRIGGER:
                 _, packet_num, sample_num, ptp_seconds, ptp_nanoseconds = TRIGGER_PACKET_STRUCT.unpack(pkt[:TRIGGER_PACKET_STRUCT.size])
@@ -551,19 +561,25 @@ class Device:
                     self.last_data_order = order
                 rel_order = self.packet_index
                 t = [rel_order]
+                # result_packet_t header: packet_type, packet_num, ptp_seconds,
+                # ptp_nanoseconds, value (the PTP time mirrors the node DATA packet's
+                # first sample of this window).
+                ptp_seconds, ptp_nanoseconds = struct.unpack('<II', data[4:12])
+                ptp = [ptp_seconds*1_000_000_000 + ptp_nanoseconds]
+                val_off = 12
+                result_code = struct.unpack('<H', data[val_off:val_off+2])[0]
                 samples = []
-                result_code = struct.unpack('<H', data[4:6])[0]
 
                 for bit_idx in range(self.channels):
                     bit_vals = (result_code >> bit_idx) & 1
                     samples.append([bit_vals])
 
-                # result_packet_t layout after value (offset 4-5), derived from
-                # the shared constants GATHERING_DEVICES and ACQUISITION_CHANNELS:
+                # result_packet_t layout after value, derived from the shared
+                # constants GATHERING_DEVICES and ACQUISITION_CHANNELS:
                 #   fault_state[GATHERING_DEVICES]                   GATHERING_DEVICES x uint16
                 #   parity_errors[GATHERING_DEVICES][ACQ_CHANNELS]   GATHERING_DEVICES*ACQ_CHANNELS x uint8
                 #   crc_error_mask                                   uint16
-                fs_off = 6
+                fs_off = val_off + 2
                 pe_off = fs_off + GATHERING_DEVICES * 2
                 cem_off = pe_off + GATHERING_DEVICES * ACQUISITION_CHANNELS
                 fault_state = struct.unpack(f'<{GATHERING_DEVICES}H', data[fs_off:pe_off])
@@ -573,7 +589,7 @@ class Device:
                 errs = list(parity_errors)
 
                 self.loop.call_soon_threadsafe(self.buffer.extend_result, t, samples, errs,
-                                               fault_state, parity_errors, crc_error_mask)
+                                               ptp, fault_state, parity_errors, crc_error_mask)
                 #self._logger.info(f"Dev {self.ip} packetNumber[{order}]: result {result_code}")
                 return order
             case self.PKT_TYPE_ID:
@@ -1253,6 +1269,7 @@ class Plotter(QWidget):
                 dev.buffer.time.clear()
                 for dq in dev.buffer.signal: dq.clear()
                 for dq in dev.buffer.error: dq.clear()
+                dev.buffer.ptp.clear()
                 dev.buffer.result_fault_state.clear()
                 dev.buffer.result_parity_errors.clear()
                 dev.buffer.result_crc_error_mask.clear()
@@ -1317,6 +1334,7 @@ class Plotter(QWidget):
 
             with dev.buffer.lock:
                 times = list(dev.buffer.time)
+                ptp = list(dev.buffer.ptp)
                 signals = [list(dev.buffer.signal[c + 1]) for c in range(dev.channels)]
                 result_fault_state = list(dev.buffer.result_fault_state)
                 result_parity_errors = list(dev.buffer.result_parity_errors)
@@ -1328,7 +1346,7 @@ class Plotter(QWidget):
             if strict and not times:
                 raise RuntimeError(f"Zařízení {ip} nemá žádná data k uložení.")
 
-            lengths = [len(times), *(len(s) for s in signals)]
+            lengths = [len(times), len(ptp), *(len(s) for s in signals)]
             if has_result_meta:
                 lengths += [len(result_fault_state), len(result_parity_errors), len(result_crc_error_mask)]
             row_count = min(lengths)
@@ -1340,7 +1358,7 @@ class Plotter(QWidget):
 
             with open(tmp_name, 'w', newline='') as f:
                 w = csv.writer(f)
-                header = ['time'] + [f'ch{c}' for c in range(dev.channels)]
+                header = ['time', 'ptp_ns'] + [f'ch{c}' for c in range(dev.channels)]
                 if has_result_meta:
                     n_fault = GATHERING_DEVICES
                     n_parity = GATHERING_DEVICES * ACQUISITION_CHANNELS
@@ -1355,7 +1373,7 @@ class Plotter(QWidget):
                         row += list(result_fault_state[i])
                         row += list(result_parity_errors[i])
                         row += [result_crc_error_mask[i]]
-                    w.writerow([times[i] * SAMPLING_PERIOD, *row])
+                    w.writerow([times[i] * SAMPLING_PERIOD, ptp[i], *row])
 
                 f.flush()
                 os.fsync(f.fileno())
