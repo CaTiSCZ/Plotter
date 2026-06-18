@@ -38,7 +38,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 
 APPLICATION_NAME = 'Eaton FDDS SCADA'
-APPLICATION_VERSION = '1.7.0'
+APPLICATION_VERSION = '1.7.1'
 APPLICATION_TITLE = f"{APPLICATION_NAME} v{APPLICATION_VERSION}"
 
 # Constants
@@ -1384,13 +1384,22 @@ class Plotter(QWidget):
             if strict and os.path.getsize(fname) == 0:
                 raise RuntimeError(f"Soubor {fname} je prázdný.")
 
+        #png_data = f"{base}_data.png"
+        #exporter_data = pyqtgraph.exporters.ImageExporter(self.ax)
+        #exporter_data.export(png_data)
+
         png_name = f"{base}.png"
-        exporter = pyqtgraph.exporters.ImageExporter(self.ax)
-        exporter.export(png_name)
+        # Export celé GUI části s oběma grafy pod sebou
+        pixmap = self.plot_widget.grab()
+        if not pixmap.save(png_name, "PNG"):
+            raise RuntimeError(f"Nepodařilo se uložit obrázek {png_name}.")
 
-        if strict and not os.path.exists(png_name):
-            raise RuntimeError(f"Nepodařilo se vytvořit obrázek {png_name}.")
-
+        if strict:
+            if not os.path.exists(png_name):
+                raise RuntimeError(f"Nepodařilo se vytvořit obrázek {png_name}.")
+            if os.path.getsize(png_name) == 0:
+                raise RuntimeError(f"Obrázek {png_name} je prázdný.")
+        
         files.append(png_name)
 
         self._logger.info('Saved data: ' + ', '.join(files))
