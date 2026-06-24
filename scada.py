@@ -54,6 +54,7 @@ GATHERING_DEVICES  = 4   # CCU result packet: number of nodes the CCU gathers fr
 ACQUISITION_CHANNELS = 2 # CCU result packet: ADC channels per node (FW ACQUISITION_CHANNELS)
 BUFFER_LENGTH_S    = 30
 BUFFER_SIZE        = int(BUFFER_LENGTH_S*SAMPLES_PER_PACKET*PACKET_RATE_HZ)
+MAX_CAPTURE_PACKETS = BUFFER_SIZE // SAMPLES_PER_PACKET  # max pre+post packets that fit the sample buffer
 DEFAULT_AVG_LEN_MS = 1000 # could be overwritten by default_settings.py
 CCU_DEVICE_INDEX   = 0
 DEFAULT_SOCKET_BACKEND = 'auto'
@@ -965,9 +966,12 @@ class Plotter(QWidget):
 
         btns.addWidget(QLabel('Post-trigger packets:'))
         self.sample_spin = QSpinBox()
-        self.sample_spin.setRange(0,BUFFER_SIZE)
+        self.sample_spin.setRange(0, MAX_CAPTURE_PACKETS)
         self.sample_spin.setValue(10)
         btns.addWidget(self.sample_spin)
+        # Keep pre-trigger + post-trigger packets within the sample buffer capacity.
+        self.pretrigger_spin.valueChanged.connect(self._update_capture_limits)
+        self._update_capture_limits()
 
         self.start_sampling_btn = QPushButton('Start New Sampling')
         self.start_sampling_btn.clicked.connect(self._start_new_sampling)
@@ -1186,8 +1190,17 @@ class Plotter(QWidget):
         if received_counts and all(received >= self.expected_samples for received in received_counts):
             self._set_sampling_indicator(None)
 
+    def _update_capture_limits(self):
+        """Cap post-trigger packets so pre-trigger + post-trigger fit the sample buffer."""
+        pre = self.pretrigger_spin.value()
+        self.sample_spin.setMaximum(max(0, MAX_CAPTURE_PACKETS - pre))
+
     def _start_sampling(self):
         n = self.sample_spin.value()
+        if n > MAX_CAPTURE_PACKETS:
+            self._logger.warning(f"Post-trigger packets {n} exceeds buffer capacity {MAX_CAPTURE_PACKETS}, clamping.")
+            n = MAX_CAPTURE_PACKETS
+            self.sample_spin.setValue(n)
         self.expected_samples = n
 
         if ptp_mode.enabled:
@@ -1218,6 +1231,10 @@ class Plotter(QWidget):
     def _start_sampling_on_trigger(self):
         n = self.sample_spin.value()
         pretrigger_packets = self.pretrigger_spin.value()
+        if n + pretrigger_packets > MAX_CAPTURE_PACKETS:
+            self._logger.warning(f"Pre-trigger ({pretrigger_packets}) + post-trigger ({n}) packets exceed buffer capacity {MAX_CAPTURE_PACKETS}, clamping post-trigger.")
+            n = max(0, MAX_CAPTURE_PACKETS - pretrigger_packets)
+            self.sample_spin.setValue(n)
         self.expected_samples = n + pretrigger_packets
 
         if ptp_mode.enabled:
