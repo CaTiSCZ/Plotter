@@ -556,6 +556,29 @@ class Device:
                     sig = self.data_struct.unpack(data[off:off+2*SAMPLES_PER_PACKET])
                     samples.append(sig)
                     off += 2*SAMPLES_PER_PACKET
+                # DIAGNOSTIC (temporary): pinpoint the single -5 glitch sample. Flags a
+                # lone spike - one sample that differs from BOTH neighbours far more than
+                # the packet's typical sample-to-sample variation - and logs the packet
+                # order, linear packet index, in-packet position, the value and its
+                # neighbours. Scale-independent, so it works for any calibration gain.
+                # Tells us whether the bad value is already in the raw packet bytes
+                # (FW/transport) or introduced later in SCADA.
+                if self.capture_active:
+                    for _ch, _sig in enumerate(samples):
+                        _diffs = sorted(abs(_sig[k+1] - _sig[k]) for k in range(len(_sig)-1))
+                        _md = _diffs[len(_diffs)//2] if _diffs else 0   # median |delta|
+                        _thr = max(50, 20*_md)
+                        for _i in range(1, len(_sig)-1):
+                            _dl = abs(_sig[_i] - _sig[_i-1])
+                            _dr = abs(_sig[_i] - _sig[_i+1])
+                            if min(_dl, _dr) > _thr:
+                                self._logger.warning(
+                                    f"GLITCH? Dev {self.ip} order={order} pkt_index={rel_order} "
+                                    f"ch={_ch} sample_in_pkt={_i} value={_sig[_i]} "
+                                    f"prev={_sig[_i-1]} next={_sig[_i+1]} "
+                                    f"median_delta={_md} thr={_thr}"
+                                )
+                                break
                 errs = list(data[off:off+self.channels])
                 off += self.channels
                 self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs, ptp)
