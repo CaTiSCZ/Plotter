@@ -391,6 +391,7 @@ class Device:
         if not ptp_mode.enabled or not ptp_mode.trigger_mode:
             return
         self.ptp_triggered = True
+        self.time_offset = ptp_mode.pretrigger_packets * SAMPLES_PER_PACKET + ptp_mode.trigger_sample_num
         if trigger_order is not None and ptp_mode.pretrigger_packets > 0:
             self.flush_input_packet_ring(trigger_order, ptp_mode.pretrigger_packets)
 
@@ -511,10 +512,6 @@ class Device:
                     self.packet_index += delta
                     self.last_data_order = order
                 
-                # Compute time_offset when trigger data packet arrives
-                if self.trigger_order is not None and order == self.trigger_order and self.time_offset == 0:
-                    self.time_offset = self.packet_index * SAMPLES_PER_PACKET + ptp_mode.trigger_sample_num
-                
                 rel_order = self.packet_index
                 t = [rel_order*SAMPLES_PER_PACKET + k - self.time_offset for k in range(SAMPLES_PER_PACKET)]
                 # The packet PTP timestamp marks the last sample in the window; earlier
@@ -573,10 +570,6 @@ class Device:
                         )
                     self.packet_index += delta
                     self.last_data_order = order
-                
-                # Compute time_offset when trigger result packet arrives
-                if self.trigger_order is not None and order == self.trigger_order and self.time_offset == 0:
-                    self.time_offset = self.packet_index * SAMPLES_PER_PACKET + ptp_mode.trigger_sample_num
                 
                 rel_order = self.packet_index
                 t = [rel_order - self.time_offset // SAMPLES_PER_PACKET]
