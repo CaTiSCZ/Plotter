@@ -309,8 +309,9 @@ class Device:
         self.first_data_order = None
         self.last_data_order = None
         self.packet_index = 0
-        self.time_offset = 0
         self.trigger_order = None
+        self.trigger_sample_num = 0
+        self.pretrigger_packets = 0
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None):
         pkt = struct.pack('<I', code) + payload
@@ -391,9 +392,20 @@ class Device:
         if not ptp_mode.enabled or not ptp_mode.trigger_mode:
             return
         self.ptp_triggered = True
-        self.time_offset = ptp_mode.pretrigger_packets * SAMPLES_PER_PACKET + ptp_mode.trigger_sample_num
-        if trigger_order is not None and ptp_mode.pretrigger_packets > 0:
+        self.trigger_order = trigger_order
+        self.trigger_sample_num = ptp_mode.trigger_sample_num
+        self.pretrigger_packets = ptp_mode.pretrigger_packets
+        if trigger_order is not None:
             self.flush_input_packet_ring(trigger_order, ptp_mode.pretrigger_packets)
+
+    def trigger_sample_index(self):
+        """Linear sample index (in buffer.signal[0] units) of the trigger sample
+        (t = 0), or None when no trigger reference is available. Derived from the
+        packet order of the trigger packet, so it is independent of how many
+        pre-/post-trigger packets were actually captured."""
+        if self.trigger_order is None or self.first_data_order is None:
+            return None
+        return _signed_u16_delta(self.trigger_order, self.first_data_order) * SAMPLES_PER_PACKET + self.trigger_sample_num
 
     def ptp_wait_trigger(self):
         self.input_packet_ring.clear()
@@ -408,8 +420,9 @@ class Device:
         self.first_data_order = None
         self.last_data_order = None
         self.packet_index = 0
-        self.time_offset = 0
         self.trigger_order = None
+        self.trigger_sample_num = 0
+        self.pretrigger_packets = 0
     
     def begin_capture(self, n: int):
         self.capture_active = True
@@ -420,16 +433,36 @@ class Device:
         self.packet_index = 0
     
     def flush_input_packet_ring(self, trigger_order:int, pretrigger_packets:int):
-        packets = [pkt for pkt in self.input_packet_ring
-                if ((trigger_order - self.header_struct.unpack(pkt[:4])[1]) & 0xFFFF) < 0x8000]
-        packets.sort(key=lambda pkt: (trigger_order - self.header_struct.unpack(pkt[:4])[1]) & 0xFFFF)
-        if pretrigger_packets > 0:
-            packets = packets[:pretrigger_packets]
-        packets.reverse()
+        """Replay buffered packets around the trigger from the input ring.
+
+        Processes, in chronological order:
+          * up to ``pretrigger_packets`` packets immediately before the trigger,
+          * the trigger packet itself (the one carrying t = 0),
+          * any packets that arrived just after the trigger but before this flush
+            ran (so the pre/post boundary has no missing-packet gap).
+        """
+        pre = []   # (distance_back, pkt) for order <= trigger_order
+        post = []  # (distance_fwd, pkt) for order >  trigger_order
+        for pkt in self.input_packet_ring:
+            order = self.header_struct.unpack(pkt[:4])[1]
+            back = (trigger_order - order) & 0xFFFF
+            if back < 0x8000:
+                pre.append((back, pkt))
+            else:
+                post.append(((order - trigger_order) & 0xFFFF, pkt))
         self.input_packet_ring.clear()
-        for buffered_pkt in packets:
-            if self.capture_counter >= self.capture_limit:
-                break
+        # Keep the trigger packet (back == 0) plus the requested pre-trigger packets.
+        pre.sort(key=lambda e: e[0])
+        pre = pre[:pretrigger_packets + 1]
+        pre.reverse()                      # chronological order (oldest first)
+        post.sort(key=lambda e: e[0])      # chronological order
+        for _, buffered_pkt in pre:
+            if self.capture_limit > 0 and self.capture_counter >= self.capture_limit:
+                return
+            self.on_raw_packet(buffered_pkt)
+        for _, buffered_pkt in post:
+            if self.capture_limit > 0 and self.capture_counter >= self.capture_limit:
+                return
             self.on_raw_packet(buffered_pkt)
 
     def set_clock_ctrl(self, clock_ctrl:int, save: bool = False):
@@ -513,7 +546,7 @@ class Device:
                     self.last_data_order = order
                 
                 rel_order = self.packet_index
-                t = [rel_order*SAMPLES_PER_PACKET + k - self.time_offset for k in range(SAMPLES_PER_PACKET)]
+                t = [rel_order*SAMPLES_PER_PACKET + k for k in range(SAMPLES_PER_PACKET)]
                 # The packet PTP timestamp marks the last sample in the window; earlier
                 # samples are NS_PER_SAMPLE older each.
                 ptp_last_ns = ptp_seconds*1_000_000_000 + ptp_nanoseconds
@@ -572,7 +605,7 @@ class Device:
                     self.last_data_order = order
                 
                 rel_order = self.packet_index
-                t = [rel_order - self.time_offset // SAMPLES_PER_PACKET]
+                t = [rel_order]
                 # result_packet_t header: packet_type, packet_num, ptp_seconds,
                 # ptp_nanoseconds, value (the PTP time mirrors the node DATA packet's
                 # first sample of this window).
@@ -699,7 +732,9 @@ class DeviceManager:
         self.devices[next(iter(self.devices))].force_trigger()
 
     def ptp_trigger(self, trigger_order:int|None = None):
-        capture_limit = max(0, ptp_mode.samples_awaited + ptp_mode.pretrigger_packets)
+        # +1 for the trigger packet itself (carries t = 0); it is replayed from the
+        # input ring together with the pre-trigger packets.
+        capture_limit = max(0, ptp_mode.samples_awaited + ptp_mode.pretrigger_packets + 1)
         for dev in self.devices.values():
             dev.trigger_order = trigger_order
             dev.begin_capture(capture_limit)
@@ -1366,6 +1401,10 @@ class Plotter(QWidget):
             # CCU devices carry per-result-packet metadata; nodes leave these empty.
             has_result_meta = bool(result_crc_error_mask)
 
+            # Align CSV time so the trigger sample is at t = 0 (matches the plot).
+            _tsi = dev.trigger_sample_index()
+            time_zero_s = _tsi * SAMPLING_PERIOD if _tsi is not None else 0.0
+
             if strict and not times:
                 raise RuntimeError(f"Zařízení {ip} nemá žádná data k uložení.")
 
@@ -1396,7 +1435,7 @@ class Plotter(QWidget):
                         row += list(result_fault_state[i])
                         row += list(result_parity_errors[i])
                         row += [result_crc_error_mask[i]]
-                    w.writerow([times[i] * SAMPLING_PERIOD, ptp[i], *row])
+                    w.writerow([times[i] * SAMPLING_PERIOD - time_zero_s, ptp[i], *row])
 
                 f.flush()
                 os.fsync(f.fileno())
@@ -1439,7 +1478,18 @@ class Plotter(QWidget):
             with buf.lock:
                 # Data processing
                 if (dev_index != CCU_DEVICE_INDEX):
-                    x = np.array(buf.signal[0]) * SAMPLING_PERIOD
+                    idx = np.array(buf.signal[0], dtype=float)
+                    tsi = dev.trigger_sample_index()
+                    if tsi is not None:
+                        # Shift so the trigger sample sits at t = 0, then drop the
+                        # leading samples that fall before the requested pre-trigger
+                        # window (-pretrigger_packets ms). Done here, on the unified
+                        # per-sample buffer, not per packet.
+                        idx -= tsi
+                        trim = int(np.searchsorted(idx, -dev.pretrigger_packets * SAMPLES_PER_PACKET, side='left'))
+                        x = (idx * SAMPLING_PERIOD)[trim:]
+                    else:
+                        x = idx * SAMPLING_PERIOD
                     avgs = [0] * dev.channels
                     for ch in range(dev.channels):
                         key = (ip, ch)
@@ -1506,6 +1556,16 @@ class Plotter(QWidget):
                         + np.tile(np.arange(SAMPLES_PER_PACKET), received) * SAMPLING_PERIOD
                     )
 
+                    tsi = dev.trigger_sample_index()
+                    if tsi is not None:
+                        # Same per-sample time-zero shift + pre-trigger window trim
+                        # as the node path (tsi is in sample units).
+                        x = x - tsi * SAMPLING_PERIOD
+                        trim = int(np.searchsorted(x, -dev.pretrigger_packets * PACKET_PERIOD, side='left'))
+                    else:
+                        trim = 0
+                    x = x[trim:]
+
                     avgs = [0]  # Dummy for uniform output
 
                     center = (dev.channels - 1) / 2.0
@@ -1525,7 +1585,7 @@ class Plotter(QWidget):
                         y = np.repeat(y, SAMPLES_PER_PACKET) # Y interpolation - steps
                         # Slight offset so bits with same logical value are still visible
                         offset = (bit_idx - center) * offset_step
-                        y_bits = y + offset
+                        y_bits = (y + offset)[trim:]
 
                         self.ax_result_curves[bit_idx].setData(x[-len(y_bits):], y_bits)
                         #self.ax_result.step(x[-len(y_bits):], y_bits, where='post', linewidth=2)
