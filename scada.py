@@ -262,6 +262,7 @@ class PTPMode:
     def __init__(self):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.samples_awaited = 0
+        self.pretrigger_packets = 0
         self.waiting_for_trigger = False
         self.trigger_mode = False
 
@@ -387,8 +388,8 @@ class Device:
         if not ptp_mode.enabled or not ptp_mode.trigger_mode:
             return
         self.ptp_triggered = True
-        #if trigger_order is not None:
-        #    self.flush_input_packet_ring(trigger_order)
+        if trigger_order is not None and ptp_mode.pretrigger_packets > 0:
+            self.flush_input_packet_ring(trigger_order, ptp_mode.pretrigger_packets)
 
     def ptp_wait_trigger(self):
         self.input_packet_ring.clear()
@@ -412,11 +413,13 @@ class Device:
         self.last_data_order = None
         self.packet_index = 0
     
-    def flush_input_packet_ring(self, trigger_order:int):
+    def flush_input_packet_ring(self, trigger_order:int, pretrigger_packets:int):
         packets = [pkt for pkt in self.input_packet_ring
                 if ((trigger_order - self.header_struct.unpack(pkt[:4])[1]) & 0xFFFF) < 0x8000]
-        packets.sort(key=lambda pkt: (trigger_order - self.header_struct.unpack(pkt[:4])[1]) & 0xFFFF,
-                    reverse=True)
+        packets.sort(key=lambda pkt: (trigger_order - self.header_struct.unpack(pkt[:4])[1]) & 0xFFFF)
+        if pretrigger_packets > 0:
+            packets = packets[:pretrigger_packets]
+        packets.reverse()
         self.input_packet_ring.clear()
         for buffered_pkt in packets:
             if self.capture_counter >= self.capture_limit:
@@ -687,9 +690,10 @@ class DeviceManager:
         self.devices[next(iter(self.devices))].force_trigger()
 
     def ptp_trigger(self, trigger_order:int|None = None):
+        capture_limit = max(0, ptp_mode.samples_awaited + ptp_mode.pretrigger_packets)
         for dev in self.devices.values():
+            dev.begin_capture(capture_limit)
             dev.ptp_trigger(trigger_order)
-            dev.begin_capture(ptp_mode.samples_awaited)
     
     def ptp_wait_trigger(self):
         #for dev in self.devices.values(): dev.ptp_wait_trigger()
@@ -912,6 +916,12 @@ class Plotter(QWidget):
         self.sample_spin.setRange(0,BUFFER_SIZE)
         self.sample_spin.setValue(10)
         btns.addWidget(self.sample_spin)
+
+        btns.addWidget(QLabel('Pre-trigger packets:'))
+        self.pretrigger_spin = QSpinBox()
+        self.pretrigger_spin.setRange(0, PTP_TRIGGER_RING_PACKETS)
+        self.pretrigger_spin.setValue(0)
+        btns.addWidget(self.pretrigger_spin)
 
         self.start_sampling_btn = QPushButton('Start New Sampling')
         self.start_sampling_btn.clicked.connect(self._start_new_sampling)
@@ -1138,6 +1148,7 @@ class Plotter(QWidget):
             ptp_mode.waiting_for_trigger = False
             ptp_mode.trigger_mode = False
             ptp_mode.samples_awaited = n
+            ptp_mode.pretrigger_packets = 0
             self.manager.ptp_reset()
             self.manager.clear_data_queue()
             self.manager.begin_capture_all(n)
@@ -1160,7 +1171,8 @@ class Plotter(QWidget):
 
     def _start_sampling_on_trigger(self):
         n = self.sample_spin.value()
-        self.expected_samples = n
+        pretrigger_packets = self.pretrigger_spin.value()
+        self.expected_samples = n + pretrigger_packets
 
         if ptp_mode.enabled:
             self.manager.ptp_reset()
@@ -1169,9 +1181,10 @@ class Plotter(QWidget):
             ptp_mode.waiting_for_trigger = True
             ptp_mode.trigger_mode = True
             ptp_mode.samples_awaited = n
+            ptp_mode.pretrigger_packets = pretrigger_packets
 
             self.manager.ptp_wait_trigger()
-            self._logger.info(f'Wait trigger PTP sampling (n={n})')
+            self._logger.info(f'Wait trigger PTP sampling (n={n}, pretrigger_packets={pretrigger_packets})')
         else:
             leader_id = self.leader_buttons.checkedId()
             leader_ip = self.device_edits[leader_id].text().strip().split(':')[0]
@@ -1578,6 +1591,7 @@ def main(argv):
         DEFAULT_LEADER = getattr(ds, 'DEFAULT_LEADER', 1)
         DEVICES_COUNT = getattr(ds, 'DEVICES_COUNT', 5)
         DEFAULT_AVG_LEN_MS = getattr(ds, 'DEFAULT_AVG_LEN_MS', 1000)
+        DEFAULT_PRETRIGGER_PACKETS = getattr(ds, 'DEFAULT_PRETRIGGER_PACKETS', 0)
         ptp_mode.enabled = getattr(ds, 'DEFAULT_PTP_MODE_ENABLED', False)
         SOCKET_BACKEND = getattr(ds, 'SOCKET_BACKEND', DEFAULT_SOCKET_BACKEND)
 
@@ -1594,7 +1608,7 @@ def main(argv):
         gui_log_handler.setLevel(logging.DEBUG)
         logging_.log_printer.add_handler(gui_log_handler)
         logging_.logger.critical(f"Logging to file: {logging_.log_path}") # This has to be in console, so critical
-        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}")  
+        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PRETRIGGER_PACKETS={DEFAULT_PRETRIGGER_PACKETS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}")  
         def start_loop():
             loop=asyncio.SelectorEventLoop()
             asyncio.set_event_loop(loop)
@@ -1619,6 +1633,7 @@ def main(argv):
             gui._apply_devices()
             gui._apply_config()
             gui.sample_spin.setValue(int(DEFAULT_AVG_LEN_MS))
+            gui.pretrigger_spin.setValue(int(DEFAULT_PRETRIGGER_PACKETS))
         QTimer(gui).singleShot(500, autoinit)
         #gui.show()
         gui.showMaximized()
