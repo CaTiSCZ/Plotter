@@ -310,6 +310,7 @@ class Device:
         self.last_data_order = None
         self.packet_index = 0
         self.time_offset = 0
+        self.trigger_order = None
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None):
         pkt = struct.pack('<I', code) + payload
@@ -407,6 +408,7 @@ class Device:
         self.last_data_order = None
         self.packet_index = 0
         self.time_offset = 0
+        self.trigger_order = None
     
     def begin_capture(self, n: int):
         self.capture_active = True
@@ -508,6 +510,11 @@ class Device:
                         )
                     self.packet_index += delta
                     self.last_data_order = order
+                
+                # Compute time_offset when trigger data packet arrives
+                if self.trigger_order is not None and order == self.trigger_order and self.time_offset == 0:
+                    self.time_offset = self.packet_index * SAMPLES_PER_PACKET + ptp_mode.trigger_sample_num
+                
                 rel_order = self.packet_index
                 t = [rel_order*SAMPLES_PER_PACKET + k - self.time_offset for k in range(SAMPLES_PER_PACKET)]
                 # The packet PTP timestamp marks the last sample in the window; earlier
@@ -566,6 +573,11 @@ class Device:
                         )
                     self.packet_index += delta
                     self.last_data_order = order
+                
+                # Compute time_offset when trigger result packet arrives
+                if self.trigger_order is not None and order == self.trigger_order and self.time_offset == 0:
+                    self.time_offset = self.packet_index * SAMPLES_PER_PACKET + ptp_mode.trigger_sample_num
+                
                 rel_order = self.packet_index
                 t = [rel_order - self.time_offset // SAMPLES_PER_PACKET]
                 # result_packet_t header: packet_type, packet_num, ptp_seconds,
@@ -695,12 +707,8 @@ class DeviceManager:
 
     def ptp_trigger(self, trigger_order:int|None = None):
         capture_limit = max(0, ptp_mode.samples_awaited + ptp_mode.pretrigger_packets)
-        if ptp_mode.pretrigger_packets > 0:
-            time_offset = (ptp_mode.pretrigger_packets - 1) * SAMPLES_PER_PACKET + ptp_mode.trigger_sample_num
-        else:
-            time_offset = 0
         for dev in self.devices.values():
-            dev.time_offset = time_offset
+            dev.trigger_order = trigger_order
             dev.begin_capture(capture_limit)
             dev.ptp_trigger(trigger_order)
     
