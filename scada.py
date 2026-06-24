@@ -911,17 +911,17 @@ class Plotter(QWidget):
             b.clicked.connect(fn)
             btns.addWidget(b)
         
-        btns.addWidget(QLabel('Samples:'))
-        self.sample_spin = QSpinBox()
-        self.sample_spin.setRange(0,BUFFER_SIZE)
-        self.sample_spin.setValue(10)
-        btns.addWidget(self.sample_spin)
-
         btns.addWidget(QLabel('Pre-trigger packets:'))
         self.pretrigger_spin = QSpinBox()
         self.pretrigger_spin.setRange(0, PTP_TRIGGER_RING_PACKETS)
         self.pretrigger_spin.setValue(0)
         btns.addWidget(self.pretrigger_spin)
+
+        btns.addWidget(QLabel('Post-trigger packets:'))
+        self.sample_spin = QSpinBox()
+        self.sample_spin.setRange(0,BUFFER_SIZE)
+        self.sample_spin.setValue(10)
+        btns.addWidget(self.sample_spin)
 
         self.start_sampling_btn = QPushButton('Start New Sampling')
         self.start_sampling_btn.clicked.connect(self._start_new_sampling)
