@@ -308,6 +308,7 @@ class Device:
         self.first_data_order = None
         self.last_data_order = None
         self.packet_index = 0
+        self.time_offset = 0
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None):
         pkt = struct.pack('<I', code) + payload
@@ -404,6 +405,7 @@ class Device:
         self.first_data_order = None
         self.last_data_order = None
         self.packet_index = 0
+        self.time_offset = 0
     
     def begin_capture(self, n: int):
         self.capture_active = True
@@ -506,7 +508,7 @@ class Device:
                     self.packet_index += delta
                     self.last_data_order = order
                 rel_order = self.packet_index
-                t = [rel_order*SAMPLES_PER_PACKET + k for k in range(SAMPLES_PER_PACKET)]
+                t = [(rel_order - self.time_offset)*SAMPLES_PER_PACKET + k for k in range(SAMPLES_PER_PACKET)]
                 # The packet PTP timestamp marks the last sample in the window; earlier
                 # samples are NS_PER_SAMPLE older each.
                 ptp_last_ns = ptp_seconds*1_000_000_000 + ptp_nanoseconds
@@ -563,7 +565,7 @@ class Device:
                     self.packet_index += delta
                     self.last_data_order = order
                 rel_order = self.packet_index
-                t = [rel_order]
+                t = [rel_order - self.time_offset]
                 # result_packet_t header: packet_type, packet_num, ptp_seconds,
                 # ptp_nanoseconds, value (the PTP time mirrors the node DATA packet's
                 # first sample of this window).
@@ -692,6 +694,7 @@ class DeviceManager:
     def ptp_trigger(self, trigger_order:int|None = None):
         capture_limit = max(0, ptp_mode.samples_awaited + ptp_mode.pretrigger_packets)
         for dev in self.devices.values():
+            dev.time_offset = ptp_mode.pretrigger_packets
             dev.begin_capture(capture_limit)
             dev.ptp_trigger(trigger_order)
     
