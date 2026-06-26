@@ -87,6 +87,11 @@ SYSTEM_STATUS_POLL_INTERVAL_MS = 1000
 SYSTEM_STATUS_POLL_MAX = 120          # ~2 min, like the FW CLI
 SYSTEM_WATCHDOG_INTERVAL_MS = 1000
 SYSTEM_DATA_STALL_TIMEOUT_S = 2.0     # no data for this long => read state by command
+# System status label colours (matches the green/red device-label scheme)
+SYSTEM_STATUS_COLOR_OK    = 'green'     # RUNNING
+SYSTEM_STATUS_COLOR_ERROR = 'red'       # FAILED / no CCU / no ACK / data stalled / timeout
+SYSTEM_STATUS_COLOR_BUSY  = '#ffb84d'   # startup in progress / starting / no response (transient)
+SYSTEM_STATUS_COLOR_IDLE  = '#cfcfcf'   # IDLE / stopped (neutral)
 
 # Features
 FCN_QT_LOGGING = True  # Enable Qt logging handler
@@ -1426,21 +1431,39 @@ class Plotter(QWidget):
             self._logger.warning('No CCU device available (apply devices first).')
         return dev
 
+    def _set_system_status(self, text, color=''):
+        """Set the system status label text and background colour."""
+        self.system_status_lbl.setText(text)
+        style = 'font-family: monospace'
+        if color:
+            style += f'; background-color: {color}'
+        self.system_status_lbl.setStyleSheet(style)
+
+    def _system_state_color(self, state):
+        """Map a startup-state code to its status-label colour."""
+        if state == SYSTEM_STATE_IDLE:
+            return SYSTEM_STATUS_COLOR_IDLE
+        if state == SYSTEM_STATE_RUNNING:
+            return SYSTEM_STATUS_COLOR_OK
+        if state == SYSTEM_STATE_FAILED:
+            return SYSTEM_STATUS_COLOR_ERROR
+        return SYSTEM_STATUS_COLOR_BUSY
+
     def _system_refresh_state(self):
         """Query the CCU system state once and react to it (used after Apply config)."""
         dev = self._system_ccu()
         if dev is None:
-            self.system_status_lbl.setText('System: no CCU')
+            self._set_system_status('System: no CCU', SYSTEM_STATUS_COLOR_ERROR)
             return
         st = dev.get_system_state()
         if st is None:
             self._logger.warning('Could not read system state (no response from CCU).')
-            self.system_status_lbl.setText('System: state unknown (no response)')
+            self._set_system_status('System: state unknown (no response)', SYSTEM_STATUS_COLOR_BUSY)
             return
         state = st['startup_state']
         name = SYSTEM_STARTUP_STATE_NAMES.get(state, f'UNKNOWN({state})')
         self._logger.info(f'Current system state: {name}.')
-        self.system_status_lbl.setText(f'System: {name}')
+        self._set_system_status(f'System: {name}', self._system_state_color(state))
         if state == SYSTEM_STATE_IDLE:
             # Idle: nothing running, ready to start.
             self._system_status_timer.stop()
@@ -1471,14 +1494,14 @@ class Plotter(QWidget):
     def _system_start(self):
         dev = self._system_ccu()
         if dev is None:
-            self.system_status_lbl.setText('System: no CCU')
+            self._set_system_status('System: no CCU', SYSTEM_STATUS_COLOR_ERROR)
             return
         if not dev.system_startup_start(0):
             self._logger.error(f'Start command not acknowledged by CCU {dev.ip}.')
-            self.system_status_lbl.setText('System: start failed (no ACK)')
+            self._set_system_status('System: start failed (no ACK)', SYSTEM_STATUS_COLOR_ERROR)
             return
         self._logger.info(f'Startup sequence started on CCU {dev.ip}.')
-        self.system_status_lbl.setText('System: starting\u2026')
+        self._set_system_status('System: starting...', SYSTEM_STATUS_COLOR_BUSY)
         self._system_watchdog_timer.stop()
         self._system_stalled = False
         self._system_poll_count = 0
@@ -1490,14 +1513,14 @@ class Plotter(QWidget):
         self._system_stalled = False
         dev = self._system_ccu()
         if dev is None:
-            self.system_status_lbl.setText('System: no CCU')
+            self._set_system_status('System: no CCU', SYSTEM_STATUS_COLOR_ERROR)
             return
         if dev.system_stop():
             self._logger.info(f'Stop command sent to CCU {dev.ip}.')
-            self.system_status_lbl.setText('System: stopped')
+            self._set_system_status('System: stopped', SYSTEM_STATUS_COLOR_IDLE)
         else:
             self._logger.error(f'Stop command not acknowledged by CCU {dev.ip}.')
-            self.system_status_lbl.setText('System: stop failed (no ACK)')
+            self._set_system_status('System: stop failed (no ACK)', SYSTEM_STATUS_COLOR_ERROR)
 
     def _system_poll_status(self):
         """Poll the CCU startup state until RUNNING or FAILED (FW-style)."""
@@ -1505,20 +1528,20 @@ class Plotter(QWidget):
         if self._system_poll_count > SYSTEM_STATUS_POLL_MAX:
             self._system_status_timer.stop()
             self._logger.warning('Timeout waiting for system startup to complete.')
-            self.system_status_lbl.setText('System: start timeout')
+            self._set_system_status('System: start timeout', SYSTEM_STATUS_COLOR_ERROR)
             return
         dev = self._system_ccu()
         if dev is None:
             self._system_status_timer.stop()
-            self.system_status_lbl.setText('System: no CCU')
+            self._set_system_status('System: no CCU', SYSTEM_STATUS_COLOR_ERROR)
             return
         st = dev.get_system_state()
         if st is None:
-            self.system_status_lbl.setText('System: starting\u2026 (no response)')
+            self._set_system_status('System: starting... (no response)', SYSTEM_STATUS_COLOR_BUSY)
             return
         state = st['startup_state']
         name = SYSTEM_STARTUP_STATE_NAMES.get(state, f'UNKNOWN({state})')
-        self.system_status_lbl.setText(f'System: {name}')
+        self._set_system_status(f'System: {name}', self._system_state_color(state))
         if state == SYSTEM_STATE_RUNNING:
             self._system_status_timer.stop()
             self._logger.info('System is RUNNING.')
@@ -1539,11 +1562,11 @@ class Plotter(QWidget):
         err_name = SYSTEM_STARTUP_ERROR_NAMES.get(err, f'UNKNOWN({err})')
         culprit = 'CCU' if st['err_node'] == 0 else f"Node {st['err_node']}"
         self._logger.error(f'System startup FAILED: {err_name} (culprit: {culprit}).')
-        self.system_status_lbl.setText(f'System: FAILED \u2014 {err_name} ({culprit})')
+        self._set_system_status(f'System: FAILED - {err_name} ({culprit})', SYSTEM_STATUS_COLOR_ERROR)
         if err == SYSTEM_ERROR_CLOCK_FREQ:
             val = st['err_value']
             if val == 0:
-                self._logger.error(f'  {culprit}: 0 Hz \u2014 NO CLOCK SIGNAL detected.')
+                self._logger.error(f'  {culprit}: 0 Hz - NO CLOCK SIGNAL detected.')
             else:
                 self._logger.error(f'  {culprit}: measured {val} Hz '
                                    f'(expected {SYSTEM_CLOCK_FREQ_MIN}..{SYSTEM_CLOCK_FREQ_MAX}).')
@@ -1583,22 +1606,22 @@ class Plotter(QWidget):
             if self._system_stalled:
                 self._system_stalled = False
                 self._logger.info('Data flow restored on all devices.')
-                self.system_status_lbl.setText('System: RUNNING')
+                self._set_system_status('System: RUNNING', SYSTEM_STATUS_COLOR_OK)
             return
         if self._system_stalled:
             return  # already reported this stall; wait for recovery
         self._system_stalled = True
         names = ', '.join(f'dev{idx} ({ip})' for idx, ip in stalled)
-        self._logger.warning(f'Data stopped from: {names}. Reading system state\u2026')
+        self._logger.warning(f'Data stopped from: {names}. Reading system state...')
         dev = self._system_ccu()
         st = dev.get_system_state() if dev is not None else None
         if st is None:
             self._logger.error('  System state: no response from CCU.')
-            self.system_status_lbl.setText('System: data stalled (no state response)')
+            self._set_system_status('System: data stalled (no state response)', SYSTEM_STATUS_COLOR_ERROR)
             return
         state = st['startup_state']
         name = SYSTEM_STARTUP_STATE_NAMES.get(state, f'UNKNOWN({state})')
-        self.system_status_lbl.setText(f'System: data stalled \u2014 state {name}')
+        self._set_system_status(f'System: data stalled - state {name}', SYSTEM_STATUS_COLOR_ERROR)
         if state == SYSTEM_STATE_FAILED:
             self._system_report_failure(dev, st)
         else:
