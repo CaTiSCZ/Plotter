@@ -1443,6 +1443,10 @@ class Plotter(QWidget):
             # CCU devices carry per-result-packet metadata; nodes leave these empty.
             has_result_meta = bool(result_crc_error_mask)
 
+            # Node buffers store one sample per row (5 us step); the CCU result buffer
+            # stores one result packet per row (1 ms step).
+            time_scale = PACKET_PERIOD if has_result_meta else SAMPLING_PERIOD
+
             # Align CSV time so the trigger sample is at t = 0 (matches the plot).
             _tsi = dev.trigger_sample_index()
             time_zero_s = _tsi * SAMPLING_PERIOD if _tsi is not None else 0.0
@@ -1477,7 +1481,7 @@ class Plotter(QWidget):
                         row += list(result_fault_state[i])
                         row += list(result_parity_errors[i])
                         row += [result_crc_error_mask[i]]
-                    w.writerow([times[i] * SAMPLING_PERIOD - time_zero_s, ptp[i], *row])
+                    w.writerow([times[i] * time_scale - time_zero_s, ptp[i], *row])
 
                 f.flush()
                 os.fsync(f.fileno())
