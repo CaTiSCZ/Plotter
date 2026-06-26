@@ -267,6 +267,7 @@ class PTPMode:
         self.trigger_sample_num = 0
         self.waiting_for_trigger = False
         self.trigger_mode = False
+        self.immediate_trigger = False
 
     def fire_trigger(self, trigger_order:int|None = None):
         if not self.enabled:
@@ -412,12 +413,13 @@ class Device:
         self.input_packet_ring.clear()
         return self._send_cmd(20)
 
-    def ptp_reset(self):
+    def ptp_reset(self, keep_ring: bool = False):
         self.capture_active = False
         self.capture_counter = 0
         self.capture_limit = 0
         self.ptp_triggered = False
-        self.input_packet_ring.clear()
+        if not keep_ring:
+            self.input_packet_ring.clear()
         self.first_data_order = None
         self.last_data_order = None
         self.packet_index = 0
@@ -501,9 +503,16 @@ class Device:
             case self.PKT_TYPE_DATA:
                 if ptp_mode.enabled:
                     if not self.capture_active:
-                        if ptp_mode.trigger_mode:
+                        if ptp_mode.immediate_trigger and ptp_mode.waiting_for_trigger:
+                            # Software (immediate) trigger: this packet is t = 0; the
+                            # pre-trigger packets come from the continuously buffered ring.
+                            ptp_mode.trigger_sample_num = 0
+                            ptp_mode.immediate_trigger = False
+                            ptp_mode.fire_trigger(order)
+                            # fall through so this packet is captured as the first post-trigger packet
+                        else:
                             self.input_packet_ring.append(bytes(pkt))
-                        return
+                            return
 
                     if self.capture_limit > 0 and self.capture_counter >= self.capture_limit:
                         self.capture_active = False
@@ -574,9 +583,16 @@ class Device:
             case self.PKT_TYPE_RESULT:
                 if ptp_mode.enabled:
                     if not self.capture_active:
-                        if ptp_mode.trigger_mode:
+                        if ptp_mode.immediate_trigger and ptp_mode.waiting_for_trigger:
+                            # Software (immediate) trigger: this packet is t = 0; the
+                            # pre-trigger packets come from the continuously buffered ring.
+                            ptp_mode.trigger_sample_num = 0
+                            ptp_mode.immediate_trigger = False
+                            ptp_mode.fire_trigger(order)
+                            # fall through so this packet is captured as the first post-trigger packet
+                        else:
                             self.input_packet_ring.append(bytes(pkt))
-                        return
+                            return
 
                     if self.capture_limit > 0 and self.capture_counter >= self.capture_limit:
                         self.capture_active = False
@@ -746,8 +762,8 @@ class DeviceManager:
         #for dev in self.devices.values(): dev.ptp_wait_trigger()
         self.devices[next(iter(self.devices))].ptp_wait_trigger()
     
-    def ptp_reset(self):
-        for dev in self.devices.values(): dev.ptp_reset()
+    def ptp_reset(self, keep_ring: bool = False):
+        for dev in self.devices.values(): dev.ptp_reset(keep_ring=keep_ring)
     
     def begin_capture_all(self, n: int):
         for dev in self.devices.values(): dev.begin_capture(n)
@@ -1197,21 +1213,26 @@ class Plotter(QWidget):
 
     def _start_sampling(self):
         n = self.sample_spin.value()
-        if n > MAX_CAPTURE_PACKETS:
-            self._logger.warning(f"Post-trigger packets {n} exceeds buffer capacity {MAX_CAPTURE_PACKETS}, clamping.")
-            n = MAX_CAPTURE_PACKETS
+        pretrigger_packets = self.pretrigger_spin.value()
+        if n + pretrigger_packets > MAX_CAPTURE_PACKETS:
+            self._logger.warning(f"Pre-trigger ({pretrigger_packets}) + post-trigger ({n}) packets exceed buffer capacity {MAX_CAPTURE_PACKETS}, clamping post-trigger.")
+            n = max(0, MAX_CAPTURE_PACKETS - pretrigger_packets)
             self.sample_spin.setValue(n)
-        self.expected_samples = n
+        self.expected_samples = n + pretrigger_packets
 
         if ptp_mode.enabled:
-            ptp_mode.waiting_for_trigger = False
-            ptp_mode.trigger_mode = False
+            # Immediate software trigger: the click instant becomes t = 0. Pre-trigger
+            # packets are replayed from the continuously buffered input ring and post-
+            # trigger packets are captured live, so the record has the same length and
+            # time layout (-pretrigger .. 0 .. +post) as 'Start Sampling on trigger'.
+            self.manager.ptp_reset(keep_ring=True)
             ptp_mode.samples_awaited = n
-            ptp_mode.pretrigger_packets = 0
-            self.manager.ptp_reset()
-            self.manager.clear_data_queue()
-            self.manager.begin_capture_all(n)
-            self._logger.info(f'Started PTP sampling (n={n})')
+            ptp_mode.pretrigger_packets = pretrigger_packets
+            ptp_mode.trigger_sample_num = 0
+            ptp_mode.trigger_mode = True
+            ptp_mode.immediate_trigger = True
+            ptp_mode.waiting_for_trigger = True
+            self._logger.info(f'Started PTP sampling (n={n}, pretrigger_packets={pretrigger_packets})')
         else:
             leader_id=self.leader_buttons.checkedId()
             leader_ip = self.device_edits[leader_id].text().strip().split(':')[0]
@@ -1265,7 +1286,10 @@ class Plotter(QWidget):
 
     def _start_new_sampling(self):
         self._set_sampling_indicator(self.start_sampling_btn)
-        self._reset_counter()
+        # In PTP mode keep the device packet counter running so the pre-trigger ring
+        # stays continuous with the live stream; only the legacy (non-PTP) path resets.
+        if not ptp_mode.enabled:
+            self._reset_counter()
         self.clear_plot()
         QTimer(self).singleShot(100, self._start_sampling)
 
