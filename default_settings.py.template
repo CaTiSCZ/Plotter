@@ -7,3 +7,4 @@ DEFAULT_POSTTRIGGER_PACKETS = 1000   ## default post-trigger packets captured af
 PTP_TRIGGER_RING_PACKETS = 500   ## size of the pre-trigger ring buffer; also the maximum selectable pre-trigger packets
 DEFAULT_PTP_MODE_ENABLED = False
 DEFAULT_SOCKET_BACKEND = 'auto' ## 'auto' tries to use C++ and falls back to Python on fail; 'py' uses Python socket, 'cpp' uses C++ socket and crashes when not available
+FIREWALL_PENETRATION = 'on' ## stall-diagnostic firewall test: 'off' = never test; 'on' = silent ping via data socket; 'verbose' = same but the ping is not silent so it shows up in the device log

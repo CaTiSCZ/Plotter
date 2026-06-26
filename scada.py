@@ -61,12 +61,23 @@ DEFAULT_SOCKET_BACKEND = 'auto'
 DATA_SOCKET_RECV_TIMEOUT_S = 0.02
 DATA_SOCKET_DRAIN_TIMEOUT_S = 0.3
 PTP_TRIGGER_RING_PACKETS = 500  # default pre-trigger ring size; overridable via default_settings.py
+# Firewall penetration mode for the stall diagnostic (overridable via default_settings.py):
+#   'off'     - never attempt firewall penetration; treat the stall as genuine.
+#   'on'      - send a silent ping through the data socket (default).
+#   'verbose' - same, but the ping is not silent so it shows up in the device log.
+FIREWALL_PENETRATION_MODES = ('off', 'on', 'verbose')
+FIREWALL_PENETRATION = 'on'
 
 # System startup control (mirrors FW utils/system_control.py + protocol.py CMD enum)
+CMD_GET_RECEIVERS         = 4
 CMD_GET_ACQUISITION_STATE = 12
 CMD_GET_SYSTEM_STATE      = 23
 CMD_STARTUP_CONTROL       = 24
 CMD_STOP_SYSTEM           = 25
+RECEIVER_TYPE_DATA = 0
+RECEIVER_TYPE_LOG  = 1
+RECEIVER_TYPE_DBG  = 2
+MAX_RECEIVERS = 4
 SYSTEM_STATE_IDLE    = 0
 SYSTEM_STATE_RUNNING = 9
 SYSTEM_STATE_FAILED  = 10
@@ -87,6 +98,7 @@ SYSTEM_STATUS_POLL_INTERVAL_MS = 1000
 SYSTEM_STATUS_POLL_MAX = 120          # ~2 min, like the FW CLI
 SYSTEM_WATCHDOG_INTERVAL_MS = 1000
 SYSTEM_DATA_STALL_TIMEOUT_S = 2.0     # no data for this long => read state by command
+SYSTEM_DIAG_WAIT_MS = 600             # wait after a diagnostic step to see if data resumes
 # System status label colours (matches the green/red device-label scheme)
 SYSTEM_STATUS_COLOR_OK    = 'green'     # RUNNING
 SYSTEM_STATUS_COLOR_ERROR = 'red'       # FAILED / no CCU / no ACK / data stalled / timeout
@@ -339,6 +351,7 @@ class Device:
         self.ptp_triggered = False
         self.received_last = 0
         self.last_data_time = 0.0
+        self.last_ack_time = 0.0
         self.input_packet_ring = deque(maxlen=PTP_TRIGGER_RING_PACKETS)
         self.first_data_order = None
         self.last_data_order = None
@@ -347,12 +360,12 @@ class Device:
         self.trigger_sample_num = 0
         self.pretrigger_packets = 0
 
-    def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None):
+    def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None, port:int|None = None):
         pkt = struct.pack('<I', code) + payload
         if socket_ is None:
             self.cmd_sock.send(pkt)
         else:
-            socket_.sendto(pkt, (self.ip, self.cmd_port))
+            socket_.sendto(pkt, (self.ip, port or self.cmd_port))
         if not expect:
             return None
         try:
@@ -360,9 +373,9 @@ class Device:
         except socket.timeout:
             return None
         
-    def ping(self, socket_=None, silent=False)->bool:
+    def ping(self, socket_=None, silent=False, port:int|None = None)->bool:
         self.silent_ping = silent
-        return bool(self._send_cmd(0, struct.pack('?', silent), expect=socket_ is None, socket_=socket_))
+        return bool(self._send_cmd(0, struct.pack('?', silent), expect=socket_ is None, socket_=socket_, port=port))
 
     def _parse_id(self, pkt:bytes | None):
         try:
@@ -565,6 +578,34 @@ class Device:
             'err_value':       struct.unpack_from('<I', extra, 14)[0] if len(extra) >= 18 else 0,
         }
 
+    def get_receivers(self, receiver_type:int=RECEIVER_TYPE_DATA) -> dict | None:
+        """CMD_GET_RECEIVERS — list registered receivers of the given type.
+
+        Returns {'active': [(ip, port), ...], 'eeprom': (ip, port)|None} or None.
+        Request payload mirrors the register layout: type byte at offset 6.
+        """
+        payload = b'\x00' * 6 + struct.pack('B', receiver_type)
+        res = self._send_cmd_with_ack(CMD_GET_RECEIVERS, payload)
+        if res is None:
+            return None
+        _state, extra = res
+        if len(extra) < 8:
+            return None
+        ram_count = extra[0]
+        eeprom_valid = extra[1]
+        eeprom = None
+        if eeprom_valid:
+            eeprom = (socket.inet_ntoa(extra[2:6]), struct.unpack_from('<H', extra, 6)[0])
+        active = []
+        base = 8
+        for i in range(min(ram_count, MAX_RECEIVERS)):
+            off = base + i * 6
+            if off + 6 > len(extra):
+                break
+            active.append((socket.inet_ntoa(extra[off:off+4]),
+                           struct.unpack_from('<H', extra, off+4)[0]))
+        return {'active': active, 'eeprom': eeprom}
+
     def get_acquisition_state(self) -> dict | None:
         """CMD_GET_ACQUISITION_STATE — per-device clock/PTP/packet state."""
         res = self._send_cmd_with_ack(CMD_GET_ACQUISITION_STATE)
@@ -586,6 +627,7 @@ class Device:
         typ, order = self.header_struct.unpack(pkt[:4])
         match typ:
             case self.PKT_TYPE_ACK:
+                self.last_ack_time = time.monotonic()
                 if not self.silent_ping:
                     self._logger.info(f"Dev {self.ip} received ACK on DATA socket.")
                 return
@@ -1122,6 +1164,10 @@ class Plotter(QWidget):
         # System monitoring state
         self._system_poll_count = 0
         self._system_stalled = False
+        self._system_stall_status_base = 'System: data stalled'
+        self._system_diag_pending = set()
+        self._system_diag_firewall = False
+        self._system_diag_keep_status = False
         self._system_status_timer = QTimer(self)
         self._system_status_timer.setInterval(SYSTEM_STATUS_POLL_INTERVAL_MS)
         self._system_status_timer.timeout.connect(self._system_poll_status)
@@ -1609,25 +1655,116 @@ class Plotter(QWidget):
                 self._set_system_status('System: RUNNING', SYSTEM_STATUS_COLOR_OK)
             return
         if self._system_stalled:
-            return  # already reported this stall; wait for recovery
+            return  # already diagnosing this stall; wait for recovery
         self._system_stalled = True
+        stalled_ips = [ip for _, ip in stalled]
         names = ', '.join(f'dev{idx} ({ip})' for idx, ip in stalled)
-        self._logger.warning(f'Data stopped from: {names}. Reading system state...')
+        self._logger.warning(f'Data stopped from: {names}. Diagnosing...')
+        # FW-side view (informative): read the CCU system state.
         dev = self._system_ccu()
         st = dev.get_system_state() if dev is not None else None
+        self._system_diag_keep_status = False
         if st is None:
             self._logger.error('  System state: no response from CCU.')
-            self._set_system_status('System: data stalled (no state response)', SYSTEM_STATUS_COLOR_ERROR)
-            return
-        state = st['startup_state']
-        name = SYSTEM_STARTUP_STATE_NAMES.get(state, f'UNKNOWN({state})')
-        self._set_system_status(f'System: data stalled - state {name}', SYSTEM_STATUS_COLOR_ERROR)
-        if state == SYSTEM_STATE_FAILED:
-            self._system_report_failure(dev, st)
+            self._system_stall_status_base = 'System: data stalled'
         else:
-            self._logger.warning(f'  System state: {name}, packets={st["packets"]}, '
-                                 f'CCU clock={st["freq_hz"]} Hz.')
-            self._system_log_device_diagnostics()
+            state = st['startup_state']
+            name = SYSTEM_STARTUP_STATE_NAMES.get(state, f'UNKNOWN({state})')
+            self._system_stall_status_base = f'System: data stalled - state {name}'
+            if state == SYSTEM_STATE_FAILED:
+                self._system_report_failure(dev, st)
+                self._system_diag_keep_status = True
+            else:
+                self._logger.warning(f'  System state: {name}, packets={st["packets"]}, '
+                                     f'CCU clock={st["freq_hz"]} Hz.')
+        if not self._system_diag_keep_status:
+            self._set_system_status(f'{self._system_stall_status_base} (diagnosing...)', SYSTEM_STATUS_COLOR_ERROR)
+        # Per-device receiver-registration + firewall diagnostic (async chain).
+        self._system_diag_pending = set(stalled_ips)
+        self._system_diag_firewall = False
+        self._system_diagnose_stalled(stalled_ips)
+
+    def _device_data_fresh(self, dev):
+        """True if the device has produced data within the stall timeout."""
+        return bool(dev.last_data_time) and (time.monotonic() - dev.last_data_time) <= SYSTEM_DATA_STALL_TIMEOUT_S
+
+    def _system_diagnose_stalled(self, stalled_ips):
+        """Diagnose devices that stopped sending data: receiver registration, then firewall."""
+        for ip in stalled_ips:
+            dev = self.manager.devices.get(ip)
+            if dev is not None:
+                self._system_diag_register(dev)
+
+    def _system_diag_complete(self, dev):
+        """Mark one device's diagnosis as done; when all finish, drop the (diagnosing...) tag."""
+        self._system_diag_pending.discard(dev.ip)
+        if self._system_diag_pending:
+            return  # other devices are still being diagnosed
+        if self._system_diag_keep_status:
+            return  # a more specific status (e.g. FAILED) is already shown
+        if self._system_diag_firewall:
+            self._set_system_status('System: data stalled - firewall blocking data socket', SYSTEM_STATUS_COLOR_ERROR)
+        elif any(not self._device_data_fresh(d) for d in self.manager.devices.values()):
+            self._set_system_status(self._system_stall_status_base, SYSTEM_STATUS_COLOR_ERROR)
+        # else: data resumed on all devices; the watchdog will restore RUNNING on its next tick.
+
+    def _system_diag_register(self, dev):
+        # Step 1: check whether SCADA is registered as a data receiver on this device.
+        try:
+            addr, pr = self.receiver_edit.text().split(':')
+            want = (addr, int(pr))
+        except Exception:
+            self._logger.warning(f'[{dev.ip}] Bad receiver address; cannot check registration.')
+            QTimer(self).singleShot(0, lambda d=dev: self._system_diag_after_register(d))
+            return
+        recv = dev.get_receivers(RECEIVER_TYPE_DATA)
+        if recv is None:
+            self._logger.warning(f'[{dev.ip}] GET_RECEIVERS failed; registering as data receiver anyway.')
+            dev.register_receiver(*want)
+        elif want in recv['active']:
+            self._logger.info(f'[{dev.ip}] Already registered as data receiver {want[0]}:{want[1]} '
+                              f'(active={recv["active"]}); skipping re-registration.')
+            self._system_diag_after_register(dev, was_registered=True)
+            return
+        else:
+            self._logger.info(f'[{dev.ip}] Not registered as data receiver (active={recv["active"]}) '
+                              f'-> registering {want[0]}:{want[1]}.')
+            dev.register_receiver(*want)
+        QTimer(self).singleShot(SYSTEM_DIAG_WAIT_MS, lambda d=dev: self._system_diag_after_register(d))
+
+    def _system_diag_after_register(self, dev, was_registered=False):
+        if self._device_data_fresh(dev):
+            if not was_registered:
+                self._logger.info(f'[{dev.ip}] Data resumed after registration -> was not registered as receiver.')
+            else:
+                self._logger.info(f'[{dev.ip}] Data resumed.')
+            self._system_diag_complete(dev)
+            return
+        # Step 2: firewall test - ping out of the data socket (unless disabled).
+        if FIREWALL_PENETRATION == 'off':
+            self._logger.info(f'[{dev.ip}] Still no data; firewall penetration disabled (off) -> '
+                              f'not testing the data socket, treating stall as a genuine/correct state.')
+            self._system_diag_complete(dev)
+            return
+        silent = FIREWALL_PENETRATION != 'verbose'
+        ping_kind = 'silent' if silent else 'verbose'
+        self._logger.info(f'[{dev.ip}] Still no data -> {ping_kind} ping via data socket to data port {dev.data_port} (firewall test).')
+        dev.last_ack_time = 0.0
+        t0 = time.monotonic()
+        dev.ping(self.manager.data_socket, silent=silent, port=dev.data_port)
+        QTimer(self).singleShot(SYSTEM_DIAG_WAIT_MS, lambda d=dev, t=t0: self._system_diag_after_ping(d, t))
+
+    def _system_diag_after_ping(self, dev, t0):
+        if self._device_data_fresh(dev):
+            self._logger.info(f'[{dev.ip}] Data resumed after firewall ping.')
+        elif dev.last_ack_time >= t0:
+            self._logger.info(f'[{dev.ip}] Data socket reachable (ping ACK received) but still no data '
+                              f'-> stall is a genuine/correct state.')
+        else:
+            self._logger.error(f'[{dev.ip}] No ping ACK on data socket -> firewall is likely blocking '
+                               f'incoming packets on the data socket.')
+            self._system_diag_firewall = True
+        self._system_diag_complete(dev)
 
     def _reset_counter(self):
         #self.manager.broadcast('reset_counter')
@@ -2037,6 +2174,7 @@ def main(argv):
             ds = None
 
         global PTP_TRIGGER_RING_PACKETS
+        global FIREWALL_PENETRATION
 
         DEFAULT_FIRST_IP = getattr(ds, 'DEFAULT_FIRST_IP', "192.168.137.100")
         DEFAULT_LEADER = getattr(ds, 'DEFAULT_LEADER', 1)
@@ -2048,6 +2186,11 @@ def main(argv):
         PTP_TRIGGER_RING_PACKETS = getattr(ds, 'PTP_TRIGGER_RING_PACKETS', PTP_TRIGGER_RING_PACKETS)
         ptp_mode.enabled = getattr(ds, 'DEFAULT_PTP_MODE_ENABLED', False)
         SOCKET_BACKEND = getattr(ds, 'SOCKET_BACKEND', DEFAULT_SOCKET_BACKEND)
+        FIREWALL_PENETRATION = str(getattr(ds, 'FIREWALL_PENETRATION', FIREWALL_PENETRATION)).lower()
+        if FIREWALL_PENETRATION not in FIREWALL_PENETRATION_MODES:
+            logging_.logger.warning(f"Invalid FIREWALL_PENETRATION={FIREWALL_PENETRATION!r}; falling back to 'on'. "
+                                    f"Valid options: {FIREWALL_PENETRATION_MODES}.")
+            FIREWALL_PENETRATION = 'on'
 
         if sys.platform.startswith('win'):
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -2062,7 +2205,7 @@ def main(argv):
         gui_log_handler.setLevel(logging.DEBUG)
         logging_.log_printer.add_handler(gui_log_handler)
         logging_.logger.critical(f"Logging to file: {logging_.log_path}") # This has to be in console, so critical
-        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PRETRIGGER_PACKETS={DEFAULT_PRETRIGGER_PACKETS}, DEFAULT_POSTTRIGGER_PACKETS={DEFAULT_POSTTRIGGER_PACKETS}, PTP_TRIGGER_RING_PACKETS={PTP_TRIGGER_RING_PACKETS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}")  
+        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PRETRIGGER_PACKETS={DEFAULT_PRETRIGGER_PACKETS}, DEFAULT_POSTTRIGGER_PACKETS={DEFAULT_POSTTRIGGER_PACKETS}, PTP_TRIGGER_RING_PACKETS={PTP_TRIGGER_RING_PACKETS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}, FIREWALL_PENETRATION={FIREWALL_PENETRATION}")  
         def start_loop():
             loop=asyncio.SelectorEventLoop()
             asyncio.set_event_loop(loop)
