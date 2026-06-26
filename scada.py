@@ -62,6 +62,32 @@ DATA_SOCKET_RECV_TIMEOUT_S = 0.02
 DATA_SOCKET_DRAIN_TIMEOUT_S = 0.3
 PTP_TRIGGER_RING_PACKETS = 500  # default pre-trigger ring size; overridable via default_settings.py
 
+# System startup control (mirrors FW utils/system_control.py + protocol.py CMD enum)
+CMD_GET_ACQUISITION_STATE = 12
+CMD_GET_SYSTEM_STATE      = 23
+CMD_STARTUP_CONTROL       = 24
+CMD_STOP_SYSTEM           = 25
+SYSTEM_STATE_IDLE    = 0
+SYSTEM_STATE_RUNNING = 9
+SYSTEM_STATE_FAILED  = 10
+SYSTEM_STARTUP_STATE_NAMES = {
+    0: 'IDLE', 1: 'PINGING', 2: 'REGISTERING', 3: 'GETTING_IDS', 4: 'VERIFYING_CLOCKS',
+    5: 'WAITING_SYNC', 6: 'RESETTING_COUNTERS', 7: 'STARTING_GATHERING',
+    8: 'STARTING_MEASUREMENT', 9: 'RUNNING', 10: 'FAILED',
+}
+SYSTEM_STARTUP_ERROR_NAMES = {
+    0: 'NONE', 1: 'NO_NODES', 2: 'PING_TIMEOUT', 3: 'REGISTER_FAILED', 4: 'GET_ID_FAILED',
+    5: 'CLOCK_MISMATCH', 6: 'CLOCK_FREQ', 7: 'SYNC_TIMEOUT', 8: 'COUNTER_RESET_FAILED',
+    9: 'GATHERING_FAILED', 10: 'START_MEAS_FAILED', 11: 'ABORTED',
+}
+SYSTEM_ERROR_CLOCK_FREQ = 6
+SYSTEM_CLOCK_FREQ_MIN = 396000
+SYSTEM_CLOCK_FREQ_MAX = 404000
+SYSTEM_STATUS_POLL_INTERVAL_MS = 1000
+SYSTEM_STATUS_POLL_MAX = 120          # ~2 min, like the FW CLI
+SYSTEM_WATCHDOG_INTERVAL_MS = 1000
+SYSTEM_DATA_STALL_TIMEOUT_S = 2.0     # no data for this long => read state by command
+
 # Features
 FCN_QT_LOGGING = True  # Enable Qt logging handler
 
@@ -307,6 +333,7 @@ class Device:
         self.capture_limit = 0
         self.ptp_triggered = False
         self.received_last = 0
+        self.last_data_time = 0.0
         self.input_packet_ring = deque(maxlen=PTP_TRIGGER_RING_PACKETS)
         self.first_data_order = None
         self.last_data_order = None
@@ -493,6 +520,63 @@ class Device:
             self._logger.warning(f"Can not read stored clock config of {self.ip}, error code ({error}).")
         return (active_config, stored_config)
 
+    def _send_cmd_with_ack(self, code:int, payload:bytes=b''):
+        """Send a command and return (state, extra_bytes) from the ACK, or None."""
+        resp = self._send_cmd(code, payload)
+        if not resp or len(resp) < 8:
+            return None
+        packet_type, state, ack_cmd = struct.unpack('<HHI', resp[:8])
+        if packet_type != self.PKT_TYPE_ACK or ack_cmd != code:
+            return None
+        return (state, resp[8:])
+
+    def system_startup_start(self, samples:int=0) -> bool:
+        """CMD_STARTUP_CONTROL start (sub=1). samples=0 => infinite."""
+        return self._send_cmd_with_ack(CMD_STARTUP_CONTROL, struct.pack('<BI', 1, samples)) is not None
+
+    def system_startup_abort(self) -> bool:
+        """CMD_STARTUP_CONTROL abort (sub=0)."""
+        return self._send_cmd_with_ack(CMD_STARTUP_CONTROL, struct.pack('<B', 0)) is not None
+
+    def system_stop(self) -> bool:
+        """CMD_STOP_SYSTEM."""
+        return self._send_cmd_with_ack(CMD_STOP_SYSTEM) is not None
+
+    def get_system_state(self) -> dict | None:
+        """CMD_GET_SYSTEM_STATE — CCU startup/gathering state."""
+        res = self._send_cmd_with_ack(CMD_GET_SYSTEM_STATE)
+        if res is None:
+            return None
+        _state, extra = res
+        if len(extra) < 12:
+            return None
+        return {
+            'gathering_state': struct.unpack_from('<H', extra, 0)[0],
+            'startup_state':   extra[2],
+            'startup_error':   extra[3],
+            'freq_hz':         struct.unpack_from('<I', extra, 4)[0],
+            'packets':         struct.unpack_from('<I', extra, 8)[0],
+            'err_node':        extra[12] if len(extra) >= 13 else 0,
+            'err_value':       struct.unpack_from('<I', extra, 14)[0] if len(extra) >= 18 else 0,
+        }
+
+    def get_acquisition_state(self) -> dict | None:
+        """CMD_GET_ACQUISITION_STATE — per-device clock/PTP/packet state."""
+        res = self._send_cmd_with_ack(CMD_GET_ACQUISITION_STATE)
+        if res is None:
+            return None
+        _state, extra = res
+        if len(extra) < 12:
+            return None
+        state_flags, ptp_locked, _reserved = struct.unpack_from('<HBB', extra, 0)
+        freq_hz, packets = struct.unpack_from('<II', extra, 4)
+        return {
+            'state_flags':     state_flags,
+            'ptp_sync_locked': bool(ptp_locked),
+            'freq_hz':         freq_hz,
+            'packets':         packets,
+        }
+
     def on_raw_packet(self, pkt:bytes):
         typ, order = self.header_struct.unpack(pkt[:4])
         match typ:
@@ -501,6 +585,7 @@ class Device:
                     self._logger.info(f"Dev {self.ip} received ACK on DATA socket.")
                 return
             case self.PKT_TYPE_DATA:
+                self.last_data_time = time.monotonic()
                 if ptp_mode.enabled:
                     if not self.capture_active:
                         if ptp_mode.immediate_trigger and ptp_mode.waiting_for_trigger:
@@ -581,6 +666,7 @@ class Device:
                 self._logger.info(f"Dev {self.ip} log[{order}]: {log_msg}")
                 return
             case self.PKT_TYPE_RESULT:
+                self.last_data_time = time.monotonic()
                 if ptp_mode.enabled:
                     if not self.capture_active:
                         if ptp_mode.immediate_trigger and ptp_mode.waiting_for_trigger:
@@ -767,6 +853,13 @@ class DeviceManager:
     
     def begin_capture_all(self, n: int):
         for dev in self.devices.values(): dev.begin_capture(n)
+
+    def ccu_device(self):
+        """Return the CCU device (CCU_DEVICE_INDEX) or None if not applied yet."""
+        devs = list(self.devices.values())
+        if 0 <= CCU_DEVICE_INDEX < len(devs):
+            return devs[CCU_DEVICE_INDEX]
+        return None
 
     def dispatch_loop(self, signal):
         async def run():
@@ -973,7 +1066,18 @@ class Plotter(QWidget):
             b = QPushButton(label)
             b.clicked.connect(fn)
             btns.addWidget(b)
-        
+
+        # System startup/stop control + state monitoring
+        self.system_start_btn = QPushButton('Start System')
+        self.system_start_btn.clicked.connect(self._system_start)
+        btns.addWidget(self.system_start_btn)
+        self.system_stop_btn = QPushButton('Stop System')
+        self.system_stop_btn.clicked.connect(self._system_stop)
+        btns.addWidget(self.system_stop_btn)
+        self.system_status_lbl = QLabel('System: —')
+        self.system_status_lbl.setStyleSheet('font-family: monospace')
+        btns.addWidget(self.system_status_lbl)
+
         btns.addWidget(QLabel('Pre-trigger packets:'))
         self.pretrigger_spin = QSpinBox()
         self.pretrigger_spin.setRange(0, PTP_TRIGGER_RING_PACKETS)
@@ -1009,6 +1113,16 @@ class Plotter(QWidget):
             b=QPushButton(label)
             b.clicked.connect(fn)
             btns.addWidget(b)
+
+        # System monitoring state
+        self._system_poll_count = 0
+        self._system_stalled = False
+        self._system_status_timer = QTimer(self)
+        self._system_status_timer.setInterval(SYSTEM_STATUS_POLL_INTERVAL_MS)
+        self._system_status_timer.timeout.connect(self._system_poll_status)
+        self._system_watchdog_timer = QTimer(self)
+        self._system_watchdog_timer.setInterval(SYSTEM_WATCHDOG_INTERVAL_MS)
+        self._system_watchdog_timer.timeout.connect(self._system_watchdog)
 
         # Plot area with legend
         self.plot_widget = pg.GraphicsLayoutWidget()
@@ -1303,6 +1417,194 @@ class Plotter(QWidget):
         self.manager.broadcast('stop_sampling')
         self._set_sampling_indicator(None)
         self._logger.info('Stopped all sampling')
+
+    # ----- System startup/stop control + state monitoring ---------------------
+    def _system_ccu(self):
+        """Return the CCU device (CCU_DEVICE_INDEX) or None, logging a warning."""
+        dev = self.manager.ccu_device()
+        if dev is None:
+            self._logger.warning('No CCU device available (apply devices first).')
+        return dev
+
+    def _system_refresh_state(self):
+        """Query the CCU system state once and react to it (used after Apply config)."""
+        dev = self._system_ccu()
+        if dev is None:
+            self.system_status_lbl.setText('System: no CCU')
+            return
+        st = dev.get_system_state()
+        if st is None:
+            self._logger.warning('Could not read system state (no response from CCU).')
+            self.system_status_lbl.setText('System: state unknown (no response)')
+            return
+        state = st['startup_state']
+        name = SYSTEM_STARTUP_STATE_NAMES.get(state, f'UNKNOWN({state})')
+        self._logger.info(f'Current system state: {name}.')
+        self.system_status_lbl.setText(f'System: {name}')
+        if state == SYSTEM_STATE_IDLE:
+            # Idle: nothing running, ready to start.
+            self._system_status_timer.stop()
+            self._system_watchdog_timer.stop()
+            self._system_stalled = False
+        elif state == SYSTEM_STATE_RUNNING:
+            # Already running: data should be flowing -> passive watchdog, no polling.
+            self._logger.info('System already RUNNING; monitoring data flow.')
+            now = time.monotonic()
+            for d in self.manager.devices.values():
+                if d.last_data_time == 0.0:
+                    d.last_data_time = now
+            self._system_status_timer.stop()
+            self._system_stalled = False
+            self._system_watchdog_timer.start()
+        elif state == SYSTEM_STATE_FAILED:
+            self._system_status_timer.stop()
+            self._system_watchdog_timer.stop()
+            self._system_report_failure(dev, st)
+        else:
+            # Startup in progress (PINGING..STARTING_MEASUREMENT): follow until done.
+            self._logger.info('System startup in progress; following until RUNNING/FAILED.')
+            self._system_watchdog_timer.stop()
+            self._system_stalled = False
+            self._system_poll_count = 0
+            self._system_status_timer.start()
+
+    def _system_start(self):
+        dev = self._system_ccu()
+        if dev is None:
+            self.system_status_lbl.setText('System: no CCU')
+            return
+        if not dev.system_startup_start(0):
+            self._logger.error(f'Start command not acknowledged by CCU {dev.ip}.')
+            self.system_status_lbl.setText('System: start failed (no ACK)')
+            return
+        self._logger.info(f'Startup sequence started on CCU {dev.ip}.')
+        self.system_status_lbl.setText('System: starting\u2026')
+        self._system_watchdog_timer.stop()
+        self._system_stalled = False
+        self._system_poll_count = 0
+        self._system_status_timer.start()
+
+    def _system_stop(self):
+        self._system_status_timer.stop()
+        self._system_watchdog_timer.stop()
+        self._system_stalled = False
+        dev = self._system_ccu()
+        if dev is None:
+            self.system_status_lbl.setText('System: no CCU')
+            return
+        if dev.system_stop():
+            self._logger.info(f'Stop command sent to CCU {dev.ip}.')
+            self.system_status_lbl.setText('System: stopped')
+        else:
+            self._logger.error(f'Stop command not acknowledged by CCU {dev.ip}.')
+            self.system_status_lbl.setText('System: stop failed (no ACK)')
+
+    def _system_poll_status(self):
+        """Poll the CCU startup state until RUNNING or FAILED (FW-style)."""
+        self._system_poll_count += 1
+        if self._system_poll_count > SYSTEM_STATUS_POLL_MAX:
+            self._system_status_timer.stop()
+            self._logger.warning('Timeout waiting for system startup to complete.')
+            self.system_status_lbl.setText('System: start timeout')
+            return
+        dev = self._system_ccu()
+        if dev is None:
+            self._system_status_timer.stop()
+            self.system_status_lbl.setText('System: no CCU')
+            return
+        st = dev.get_system_state()
+        if st is None:
+            self.system_status_lbl.setText('System: starting\u2026 (no response)')
+            return
+        state = st['startup_state']
+        name = SYSTEM_STARTUP_STATE_NAMES.get(state, f'UNKNOWN({state})')
+        self.system_status_lbl.setText(f'System: {name}')
+        if state == SYSTEM_STATE_RUNNING:
+            self._system_status_timer.stop()
+            self._logger.info('System is RUNNING.')
+            # Data should flow now; stop polling and switch to a passive data-flow
+            # watchdog that only reads state by command if data stops.
+            now = time.monotonic()
+            for d in self.manager.devices.values():
+                if d.last_data_time == 0.0:
+                    d.last_data_time = now
+            self._system_stalled = False
+            self._system_watchdog_timer.start()
+        elif state == SYSTEM_STATE_FAILED:
+            self._system_status_timer.stop()
+            self._system_report_failure(dev, st)
+
+    def _system_report_failure(self, dev, st):
+        err = st['startup_error']
+        err_name = SYSTEM_STARTUP_ERROR_NAMES.get(err, f'UNKNOWN({err})')
+        culprit = 'CCU' if st['err_node'] == 0 else f"Node {st['err_node']}"
+        self._logger.error(f'System startup FAILED: {err_name} (culprit: {culprit}).')
+        self.system_status_lbl.setText(f'System: FAILED \u2014 {err_name} ({culprit})')
+        if err == SYSTEM_ERROR_CLOCK_FREQ:
+            val = st['err_value']
+            if val == 0:
+                self._logger.error(f'  {culprit}: 0 Hz \u2014 NO CLOCK SIGNAL detected.')
+            else:
+                self._logger.error(f'  {culprit}: measured {val} Hz '
+                                   f'(expected {SYSTEM_CLOCK_FREQ_MIN}..{SYSTEM_CLOCK_FREQ_MAX}).')
+            self._logger.error(f'  CCU local clock: {st["freq_hz"]} Hz.')
+        # Per-device diagnostics: acquisition freq + PTP lock + packet count.
+        self._system_log_device_diagnostics()
+
+    def _system_log_device_diagnostics(self):
+        for idx, (ip, dev) in enumerate(self.manager.devices.items()):
+            acq = dev.get_acquisition_state()
+            if acq is None:
+                self._logger.warning(f'  [dev{idx} {ip}] no acquisition state (no response).')
+                continue
+            freq = acq['freq_hz']
+            if freq == 0:
+                verdict = '0 Hz (NO CLOCK)'
+            elif freq < SYSTEM_CLOCK_FREQ_MIN:
+                verdict = f'{freq} Hz (TOO LOW)'
+            elif freq > SYSTEM_CLOCK_FREQ_MAX:
+                verdict = f'{freq} Hz (TOO HIGH)'
+            else:
+                verdict = f'{freq} Hz (OK)'
+            self._logger.info(f'  [dev{idx} {ip}] freq={verdict}, ptp_locked={acq["ptp_sync_locked"]}, '
+                              f'packets={acq["packets"]}, flags=0x{acq["state_flags"]:04X}')
+
+    def _system_watchdog(self):
+        """After RUNNING: only read system state by command if data stops flowing."""
+        if not self.manager.devices:
+            return
+        now = time.monotonic()
+        stalled = []
+        for idx, (ip, dev) in enumerate(self.manager.devices.items()):
+            age = (now - dev.last_data_time) if dev.last_data_time else None
+            if age is None or age > SYSTEM_DATA_STALL_TIMEOUT_S:
+                stalled.append((idx, ip))
+        if not stalled:
+            if self._system_stalled:
+                self._system_stalled = False
+                self._logger.info('Data flow restored on all devices.')
+                self.system_status_lbl.setText('System: RUNNING')
+            return
+        if self._system_stalled:
+            return  # already reported this stall; wait for recovery
+        self._system_stalled = True
+        names = ', '.join(f'dev{idx} ({ip})' for idx, ip in stalled)
+        self._logger.warning(f'Data stopped from: {names}. Reading system state\u2026')
+        dev = self._system_ccu()
+        st = dev.get_system_state() if dev is not None else None
+        if st is None:
+            self._logger.error('  System state: no response from CCU.')
+            self.system_status_lbl.setText('System: data stalled (no state response)')
+            return
+        state = st['startup_state']
+        name = SYSTEM_STARTUP_STATE_NAMES.get(state, f'UNKNOWN({state})')
+        self.system_status_lbl.setText(f'System: data stalled \u2014 state {name}')
+        if state == SYSTEM_STATE_FAILED:
+            self._system_report_failure(dev, st)
+        else:
+            self._logger.warning(f'  System state: {name}, packets={st["packets"]}, '
+                                 f'CCU clock={st["freq_hz"]} Hz.')
+            self._system_log_device_diagnostics()
 
     def _reset_counter(self):
         #self.manager.broadcast('reset_counter')
@@ -1696,8 +1998,11 @@ class Plotter(QWidget):
         #self._penetrate_firewall()
         #for i, f in enumerate((self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._register_all, self._reset_counter)):
         # TODO: add self._leader_changed
-        for i, f in enumerate((self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._register_all, self._register_ccu, self._reset_counter)):
+        init_fns = (self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._register_all, self._register_ccu, self._reset_counter)
+        for i, f in enumerate(init_fns):
             QTimer(self).singleShot(i * 100, f)
+        # After init, query the current system state, display it and react to it.
+        QTimer(self).singleShot(len(init_fns) * 100, self._system_refresh_state)
 
 def main(argv):
     with ExitStack() as stack:
