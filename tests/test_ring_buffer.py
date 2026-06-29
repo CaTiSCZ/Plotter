@@ -242,7 +242,7 @@ def _csv_old(times, ptp, signals, channels, time_scale, time_zero_s,
             row += list(result_fault_state[i])
             row += list(result_parity_errors[i])
             row += [result_crc_error_mask[i]]
-        w.writerow([t_shift, ptp[i], *row])
+        w.writerow(['%.6f' % t_shift, ptp[i], *row])
     return out.getvalue()
 
 
@@ -274,16 +274,17 @@ def _csv_new(times_a, ptp_a, signals_a, channels, time_scale, time_zero_s,
             row += list(result_fault_state[i])
             row += list(result_parity_errors[i])
             row += [result_crc_error_mask[i]]
-            rows.append([t_shift_list[i], ptp_list[i], *row])
+            rows.append(['%.6f' % t_shift_list[i], ptp_list[i], *row])
         w.writerows(rows)
     else:
         # Mirror the production node path: single % template + '\r\n' join (the
-        # csv default line terminator), which must be byte-identical to csv.writer.
+        # csv default line terminator). The time column is fixed 6-decimal so it
+        # must match the per-row reference (_csv_old) byte for byte.
         t_shift_list = t_shift_a[keep].tolist()
         ptp_list = ptp_a[keep].tolist()
         sig_lists = [s[keep].tolist() for s in signals_a]
         if t_shift_list:
-            tmpl = '%r,' + ','.join(['%d'] * (channels + 1))
+            tmpl = '%.6f,' + ','.join(['%d'] * (channels + 1))
             lines = [tmpl % row for row in zip(t_shift_list, ptp_list, *sig_lists)]
             out.write('\r\n'.join(lines))
             out.write('\r\n')

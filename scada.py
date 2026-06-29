@@ -2340,6 +2340,8 @@ class Plotter(QWidget):
                 if has_result_meta:
                     # Result rows carry per-packet metadata tuples (few rows, 1 ms
                     # grid): expand them in a small python loop over the kept indices.
+                    # The time column uses the same fixed 6-decimal format as the
+                    # node path so all saved CSVs read with an aligned time column.
                     t_shift_list = t_shift_a.tolist()
                     ptp_list = ptp_a.tolist()
                     sig_lists = [s.tolist() for s in signals_a]
@@ -2349,18 +2351,20 @@ class Plotter(QWidget):
                         row += list(result_fault_state[i])
                         row += list(result_parity_errors[i])
                         row += [result_crc_error_mask[i]]
-                        rows.append([t_shift_list[i], ptp_list[i], *row])
+                        rows.append(['%.6f' % t_shift_list[i], ptp_list[i], *row])
                     w.writerows(rows)
                 else:
                     # Node path (the large 2.2M-row case): format each row with a
                     # single % template and bulk-write -- ~1.6x faster than
-                    # csv.writer while byte-identical ('%r' == str() for python
-                    # floats; csv's default line terminator is '\r\n', matched here).
+                    # csv.writer. The time column uses a fixed 6-decimal format
+                    # (microsecond resolution; the sample step is 5 us) so the
+                    # column stays aligned and easy to read by hand. csv's default
+                    # line terminator is '\r\n', matched here.
                     t_shift_list = t_shift_a[keep].tolist()
                     ptp_list = ptp_a[keep].tolist()
                     sig_lists = [s[keep].tolist() for s in signals_a]
                     if t_shift_list:
-                        tmpl = '%r,' + ','.join(['%d'] * (dev.channels + 1))
+                        tmpl = '%.6f,' + ','.join(['%d'] * (dev.channels + 1))
                         lines = [tmpl % row for row in zip(t_shift_list, ptp_list, *sig_lists)]
                         f.write('\r\n'.join(lines))
                         f.write('\r\n')

@@ -107,7 +107,8 @@ def main():
         note = "identical" if d == 0 else f"{d}/{tot} differ e.g. {sample[:2]}"
         print(f"{name:10s}{'':22s}{dt*1e3:8.1f} ms   ({dt_cur/dt:.2f}x)   {note}", flush=True)
 
-    # Real disk write incl. fsync: csv.writer vs the production join path, byte-compare.
+    # Real disk write incl. fsync: per-row csv.writer reference (fixed %.6f time)
+    # vs the production join path, byte-compare to guard the optimisation.
     import tempfile
     tmp = tempfile.gettempdir()
     p_old = os.path.join(tmp, 'bench_old.csv')
@@ -117,14 +118,15 @@ def main():
         with open(path, 'w', newline='') as f:
             w = csv.writer(f)
             w.writerow(['time', 'ptp_ns'] + [f'ch{c}' for c in range(channels)])
-            w.writerows(zip(t_shift.tolist(), ptp.tolist(), *[s.tolist() for s in signals]))
+            w.writerows((['%.6f' % t, p, *s] for t, p, *s
+                         in zip(t_shift.tolist(), ptp.tolist(), *[s.tolist() for s in signals])))
             f.flush(); os.fsync(f.fileno())
 
     def write_new(path):
         with open(path, 'w', newline='') as f:
             w = csv.writer(f)
             w.writerow(['time', 'ptp_ns'] + [f'ch{c}' for c in range(channels)])
-            tmpl = '%r,' + ','.join(['%d'] * (channels + 1))
+            tmpl = '%.6f,' + ','.join(['%d'] * (channels + 1))
             lines = [tmpl % row for row in zip(t_shift.tolist(), ptp.tolist(), *[s.tolist() for s in signals])]
             f.write('\r\n'.join(lines)); f.write('\r\n')
             f.flush(); os.fsync(f.fileno())
@@ -134,8 +136,8 @@ def main():
     with open(p_old, 'rb') as a, open(p_new, 'rb') as b:
         identical = a.read() == b.read()
     print(f"\nDISK incl. fsync ({os.path.getsize(p_old)/1e6:.0f} MB/file):", flush=True)
-    print(f"  csv.writer  {dt_o*1e3:8.1f} ms", flush=True)
-    print(f"  join %r     {dt_n*1e3:8.1f} ms   ({dt_o/dt_n:.2f}x)   bytes {'IDENTICAL' if identical else 'DIFFER'}", flush=True)
+    print(f"  csv.writer %.6f  {dt_o*1e3:8.1f} ms", flush=True)
+    print(f"  join %.6f        {dt_n*1e3:8.1f} ms   ({dt_o/dt_n:.2f}x)   bytes {'IDENTICAL' if identical else 'DIFFER'}", flush=True)
     for p in (p_old, p_new):
         try:
             os.remove(p)
