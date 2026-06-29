@@ -169,12 +169,28 @@ def _resolve_buffered_socket_class(backend: str):
     raise ValueError(f"Unknown socket backend '{backend}'. Expected one of: auto, cpp, py")
 
 # CRC-16/CCITT checksum
-def crc16_ccitt(data: bytes, poly: int=0x1021, crc: int=0xFFFF) -> int:
+def _crc16_ccitt_py(data: bytes, poly: int=0x1021, crc: int=0xFFFF) -> int:
     for b in data:
         crc ^= b<<8
         for _ in range(8):
             crc = ((crc<<1)^poly)&0xFFFF if crc&0x8000 else (crc<<1)&0xFFFF
     return crc
+
+try:
+    import crcmod as _crcmod
+    _crc16_fast = _crcmod.mkCrcFun(0x11021, initCrc=0xFFFF, rev=False)
+
+    def crc16_ccitt(data: bytes, poly: int=0x1021, crc: int=0xFFFF) -> int:
+        # Fast C implementation for the standard FDDS parameters; fall back otherwise.
+        if poly == 0x1021 and crc == 0xFFFF:
+            return _crc16_fast(data)
+        return _crc16_ccitt_py(data, poly, crc)
+except ImportError:
+    logging.getLogger(__name__).warning(
+        "crcmod not installed - using slow pure-Python CRC16 (may drop packets under load). "
+        "Install with: pip install crcmod"
+    )
+    crc16_ccitt = _crc16_ccitt_py
 
 CRC_STRUCT = struct.Struct('<H')
 
