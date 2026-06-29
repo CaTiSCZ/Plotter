@@ -2257,9 +2257,13 @@ class Plotter(QWidget):
             fname = f"{base}_dev{idx}.csv"
 
             with dev.buffer.lock:
-                times = list(dev.buffer.time)
-                ptp = list(dev.buffer.ptp)
-                signals = [list(dev.buffer.signal[c + 1]) for c in range(dev.channels)]
+                # Read the per-sample columns as numpy arrays (one contiguous copy)
+                # instead of materialising python lists up front; the expensive
+                # per-element python conversion is deferred until after the window
+                # trim below, so only the kept rows are ever turned into python ints.
+                times_a = np.asarray(dev.buffer.time)
+                ptp_a = np.asarray(dev.buffer.ptp)
+                signals_a = [np.asarray(dev.buffer.signal[c + 1]) for c in range(dev.channels)]
                 result_fault_state = list(dev.buffer.result_fault_state)
                 result_parity_errors = list(dev.buffer.result_parity_errors)
                 result_crc_error_mask = list(dev.buffer.result_crc_error_mask)
@@ -2289,10 +2293,10 @@ class Plotter(QWidget):
             else:
                 _n_lo, _n_hi = _tsi - _pre * SAMPLES_PER_PACKET, _tsi + _post * SAMPLES_PER_PACKET
 
-            if strict and not times:
+            if strict and len(times_a) == 0:
                 raise RuntimeError(f"Zařízení {ip} nemá žádná data k uložení.")
 
-            lengths = [len(times), len(ptp), *(len(s) for s in signals)]
+            lengths = [len(times_a), len(ptp_a), *(len(s) for s in signals_a)]
             if has_result_meta:
                 lengths += [len(result_fault_state), len(result_parity_errors), len(result_crc_error_mask)]
             row_count = min(lengths)
@@ -2301,6 +2305,17 @@ class Plotter(QWidget):
                 raise RuntimeError(f"Zařízení {ip} má prázdný buffer.")
 
             tmp_name = fname + ".tmp"
+
+            # Truncate every column to the common row count, then apply the same
+            # window trim as the plot in a single vectorised pass over numpy arrays.
+            times_a = times_a[:row_count]
+            ptp_a = ptp_a[:row_count]
+            signals_a = [s[:row_count] for s in signals_a]
+            if _trim_window:
+                keep = (times_a >= _n_lo) & (times_a < _n_hi)
+            else:
+                keep = np.ones(row_count, dtype=bool)
+            t_shift_a = times_a * time_scale - time_zero_s
 
             with open(tmp_name, 'w', newline='') as f:
                 w = csv.writer(f)
@@ -2313,16 +2328,26 @@ class Plotter(QWidget):
                     header += ['crc_error_mask']
                 w.writerow(header)
 
-                for i in range(row_count):
-                    if _trim_window and not (_n_lo <= times[i] < _n_hi):
-                        continue
-                    t_shift = times[i] * time_scale - time_zero_s
-                    row = [signals[ch][i] for ch in range(dev.channels)]
-                    if has_result_meta:
+                if has_result_meta:
+                    # Result rows carry per-packet metadata tuples (few rows, 1 ms
+                    # grid): expand them in a small python loop over the kept indices.
+                    t_shift_list = t_shift_a.tolist()
+                    ptp_list = ptp_a.tolist()
+                    sig_lists = [s.tolist() for s in signals_a]
+                    rows = []
+                    for i in np.nonzero(keep)[0].tolist():
+                        row = [sig_lists[ch][i] for ch in range(dev.channels)]
                         row += list(result_fault_state[i])
                         row += list(result_parity_errors[i])
                         row += [result_crc_error_mask[i]]
-                    w.writerow([t_shift, ptp[i], *row])
+                        rows.append([t_shift_list[i], ptp_list[i], *row])
+                    w.writerows(rows)
+                else:
+                    # Node path: mask + convert only the kept rows, then bulk-write.
+                    t_shift_list = t_shift_a[keep].tolist()
+                    ptp_list = ptp_a[keep].tolist()
+                    sig_lists = [s[keep].tolist() for s in signals_a]
+                    w.writerows(zip(t_shift_list, ptp_list, *sig_lists))
 
                 f.flush()
                 os.fsync(f.fileno())

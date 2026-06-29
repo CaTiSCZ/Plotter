@@ -15,6 +15,8 @@ sample index. Run:  python tests/test_ring_buffer.py
 """
 import os
 import sys
+import csv
+import io
 from collections import deque
 
 import numpy as np
@@ -220,15 +222,139 @@ def test_result_capture():
     check("result error[-1] sum identical", es_r == es_n)
 
 
+# --- 4. save_data CSV: old per-row loop vs new vectorised pass -----------------
+def _csv_old(times, ptp, signals, channels, time_scale, time_zero_s,
+             trim_window, n_lo, n_hi, has_result_meta,
+             result_fault_state, result_parity_errors, result_crc_error_mask):
+    """The pre-optimisation per-row algorithm (python lists)."""
+    lengths = [len(times), len(ptp), *(len(s) for s in signals)]
+    if has_result_meta:
+        lengths += [len(result_fault_state), len(result_parity_errors), len(result_crc_error_mask)]
+    row_count = min(lengths)
+    out = io.StringIO()
+    w = csv.writer(out)
+    for i in range(row_count):
+        if trim_window and not (n_lo <= times[i] < n_hi):
+            continue
+        t_shift = times[i] * time_scale - time_zero_s
+        row = [signals[ch][i] for ch in range(channels)]
+        if has_result_meta:
+            row += list(result_fault_state[i])
+            row += list(result_parity_errors[i])
+            row += [result_crc_error_mask[i]]
+        w.writerow([t_shift, ptp[i], *row])
+    return out.getvalue()
+
+
+def _csv_new(times_a, ptp_a, signals_a, channels, time_scale, time_zero_s,
+             trim_window, n_lo, n_hi, has_result_meta,
+             result_fault_state, result_parity_errors, result_crc_error_mask):
+    """The new vectorised algorithm (numpy arrays, mask, deferred tolist)."""
+    lengths = [len(times_a), len(ptp_a), *(len(s) for s in signals_a)]
+    if has_result_meta:
+        lengths += [len(result_fault_state), len(result_parity_errors), len(result_crc_error_mask)]
+    row_count = min(lengths)
+    times_a = times_a[:row_count]
+    ptp_a = ptp_a[:row_count]
+    signals_a = [s[:row_count] for s in signals_a]
+    if trim_window:
+        keep = (times_a >= n_lo) & (times_a < n_hi)
+    else:
+        keep = np.ones(row_count, dtype=bool)
+    t_shift_a = times_a * time_scale - time_zero_s
+    out = io.StringIO()
+    w = csv.writer(out)
+    if has_result_meta:
+        t_shift_list = t_shift_a.tolist()
+        ptp_list = ptp_a.tolist()
+        sig_lists = [s.tolist() for s in signals_a]
+        rows = []
+        for i in np.nonzero(keep)[0].tolist():
+            row = [sig_lists[ch][i] for ch in range(channels)]
+            row += list(result_fault_state[i])
+            row += list(result_parity_errors[i])
+            row += [result_crc_error_mask[i]]
+            rows.append([t_shift_list[i], ptp_list[i], *row])
+        w.writerows(rows)
+    else:
+        t_shift_list = t_shift_a[keep].tolist()
+        ptp_list = ptp_a[keep].tolist()
+        sig_lists = [s[keep].tolist() for s in signals_a]
+        w.writerows(zip(t_shift_list, ptp_list, *sig_lists))
+    return out.getvalue()
+
+
+def test_csv_node():
+    print("test_csv_node")
+    channels = 2
+    rng = np.random.default_rng(5)
+    ref = RefBuffer(channels, scada.BUFFER_SIZE)
+    new = DeviceBuffer(channels)
+    packets = [make_node_packet(ro, channels, rng)
+               for ro in [0, 1, 3, 2, 4, 5, 6, 7, 8, 9]]  # incl. out-of-order
+    feed(ref, new, packets)
+    pretrigger, post = 3, 5
+    tsi = pretrigger * SAMPLES_PER_PACKET
+    time_zero_s = tsi * scada.SAMPLING_PERIOD
+    n_lo = tsi - pretrigger * SAMPLES_PER_PACKET
+    n_hi = tsi + post * SAMPLES_PER_PACKET
+    for trim in (False, True):
+        old = _csv_old(list(ref.time), list(ref.ptp),
+                       [list(ref.signal[c + 1]) for c in range(channels)],
+                       channels, scada.SAMPLING_PERIOD, time_zero_s,
+                       trim, n_lo, n_hi, False, [], [], [])
+        newv = _csv_new(np.asarray(new.time), np.asarray(new.ptp),
+                        [np.asarray(new.signal[c + 1]) for c in range(channels)],
+                        channels, scada.SAMPLING_PERIOD, time_zero_s,
+                        trim, n_lo, n_hi, False, [], [], [])
+        check(f"node csv identical (trim={trim})", old == newv)
+
+
+def test_csv_result():
+    print("test_csv_result")
+    channels = 2
+    rng = np.random.default_rng(6)
+    ref = RefBuffer(channels, scada.BUFFER_SIZE)
+    new = DeviceBuffer(channels)
+    for rel_order in range(20):
+        t = [rel_order]
+        rc = int(rng.integers(0, 4))
+        samples = [[(rc >> b) & 1] for b in range(channels)]
+        fault_state = tuple(int(v) for v in rng.integers(0, 5, size=scada.GATHERING_DEVICES))
+        parity_errors = tuple(int(v) for v in
+                              rng.integers(0, 3, size=scada.GATHERING_DEVICES * scada.ACQUISITION_CHANNELS))
+        errs = list(parity_errors)
+        crc_error_mask = int(rng.integers(0, 0xFFFF))
+        ptp = [1_000_000_000 + rel_order * 1_000_000]
+        ref.extend_result(t, samples, errs, ptp, fault_state, parity_errors, crc_error_mask)
+        new.extend_result(t, samples, errs, ptp, fault_state, parity_errors, crc_error_mask)
+    trig_n = 8.0
+    time_zero_s = round(trig_n) * scada.PACKET_PERIOD
+    n_lo, n_hi = trig_n - 3, trig_n + 5
+    for trim in (False, True):
+        old = _csv_old(list(ref.time), list(ref.ptp),
+                       [list(ref.signal[c + 1]) for c in range(channels)],
+                       channels, scada.PACKET_PERIOD, time_zero_s, trim, n_lo, n_hi,
+                       True, list(ref.result_fault_state),
+                       list(ref.result_parity_errors), list(ref.result_crc_error_mask))
+        newv = _csv_new(np.asarray(new.time), np.asarray(new.ptp),
+                        [np.asarray(new.signal[c + 1]) for c in range(channels)],
+                        channels, scada.PACKET_PERIOD, time_zero_s, trim, n_lo, n_hi,
+                        True, list(new.result_fault_state),
+                        list(new.result_parity_errors), list(new.result_crc_error_mask))
+        check(f"result csv identical (trim={trim})", old == newv)
+
+
 def main():
     test_numpyring_vs_deque()
-    # In order: pre(0,1,2) trigger(3) post(4..9)
     test_node_capture("in_order", list(range(10)))
     # Out-of-order: a pre-trigger packet replayed late around the trigger boundary.
     test_node_capture("out_of_order", [0, 1, 3, 2, 4, 5, 6, 7, 8, 9])
     # Missing packet: a gap (packet index 5 dropped).
     test_node_capture("missing", [0, 1, 2, 3, 4, 6, 7, 8, 9])
     test_result_capture()
+    test_csv_node()
+    test_csv_result()
     print()
     if _fail:
         print(f"FAILED: {_fail} check(s) failed")

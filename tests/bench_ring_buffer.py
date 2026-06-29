@@ -10,6 +10,8 @@ Run:  python tests/bench_ring_buffer.py
 import os
 import sys
 import time
+import csv
+import io
 from collections import deque
 
 import numpy as np
@@ -67,9 +69,42 @@ def plot_build(buf, channels):
     return idx, ys
 
 
-def csv_build(buf, channels):
-    return (list(buf.time), list(buf.ptp),
-            [list(buf.signal[c + 1]) for c in range(channels)])
+def csv_old(buf, channels, time_scale, time_zero_s, trim, n_lo, n_hi):
+    """The pre-optimisation save_data inner loop: list() the whole buffer, then a
+    per-row python filter + per-row writerow."""
+    times = list(buf.time)
+    ptp = list(buf.ptp)
+    signals = [list(buf.signal[c + 1]) for c in range(channels)]
+    row_count = min(len(times), len(ptp), *(len(s) for s in signals))
+    out = io.StringIO()
+    w = csv.writer(out)
+    for i in range(row_count):
+        if trim and not (n_lo <= times[i] < n_hi):
+            continue
+        t_shift = times[i] * time_scale - time_zero_s
+        w.writerow([t_shift, ptp[i], *(signals[ch][i] for ch in range(channels))])
+    return out.getvalue()
+
+
+def csv_new(buf, channels, time_scale, time_zero_s, trim, n_lo, n_hi):
+    """The new vectorised save_data path: numpy mask + deferred tolist of the kept
+    rows + a single writerows."""
+    times_a = np.asarray(buf.time)
+    ptp_a = np.asarray(buf.ptp)
+    signals_a = [np.asarray(buf.signal[c + 1]) for c in range(channels)]
+    row_count = min(len(times_a), len(ptp_a), *(len(s) for s in signals_a))
+    times_a = times_a[:row_count]
+    ptp_a = ptp_a[:row_count]
+    signals_a = [s[:row_count] for s in signals_a]
+    keep = (times_a >= n_lo) & (times_a < n_hi) if trim else np.ones(row_count, dtype=bool)
+    t_shift_a = times_a * time_scale - time_zero_s
+    out = io.StringIO()
+    w = csv.writer(out)
+    t_shift_list = t_shift_a[keep].tolist()
+    ptp_list = ptp_a[keep].tolist()
+    sig_lists = [s[keep].tolist() for s in signals_a]
+    w.writerows(zip(t_shift_list, ptp_list, *sig_lists))
+    return out.getvalue()
 
 
 def main():
@@ -93,10 +128,28 @@ def main():
     print(f"plot    deque={t_plot_ref*1e3:8.1f} ms   ring={t_plot_new*1e3:8.1f} ms   "
           f"({t_plot_ref/t_plot_new:.2f}x)", flush=True)
 
-    t_csv_ref = timed(lambda: csv_build(ref, channels), repeat=2)
-    t_csv_new = timed(lambda: csv_build(new, channels), repeat=2)
-    print(f"csv     deque={t_csv_ref*1e3:8.1f} ms   ring={t_csv_new*1e3:8.1f} ms   "
-          f"({t_csv_ref/t_csv_new:.2f}x)", flush=True)
+    ts = scada.SAMPLING_PERIOD
+    # Typical trigger-capture export: trim to a 400-packet window (pre+post).
+    pre = post = 200
+    tsi = (n_packets // 2) * SAMPLES_PER_PACKET
+    n_lo = tsi - pre * SAMPLES_PER_PACKET
+    n_hi = tsi + post * SAMPLES_PER_PACKET
+    old_win = csv_old(new, channels, ts, tsi * ts, True, n_lo, n_hi)
+    new_win = csv_new(new, channels, ts, tsi * ts, True, n_lo, n_hi)
+    assert old_win == new_win, "windowed CSV output diverged"
+    t_csv_old_win = timed(lambda: csv_old(new, channels, ts, tsi * ts, True, n_lo, n_hi), repeat=3)
+    t_csv_new_win = timed(lambda: csv_new(new, channels, ts, tsi * ts, True, n_lo, n_hi), repeat=3)
+    print(f"csv window old={t_csv_old_win*1e3:8.1f} ms   new={t_csv_new_win*1e3:8.1f} ms   "
+          f"({t_csv_old_win/t_csv_new_win:.2f}x)   [{pre+post} packets kept]", flush=True)
+
+    # Full export (no window trim): worst case, materialise every row.
+    old_full = csv_old(new, channels, ts, 0.0, False, 0, 0)
+    new_full = csv_new(new, channels, ts, 0.0, False, 0, 0)
+    assert old_full == new_full, "full CSV output diverged"
+    t_csv_old_full = timed(lambda: csv_old(new, channels, ts, 0.0, False, 0, 0), repeat=1)
+    t_csv_new_full = timed(lambda: csv_new(new, channels, ts, 0.0, False, 0, 0), repeat=1)
+    print(f"csv full   old={t_csv_old_full*1e3:8.1f} ms   new={t_csv_new_full*1e3:8.1f} ms   "
+          f"({t_csv_old_full/t_csv_new_full:.2f}x)", flush=True)
 
     reserved = scada.BUFFER_SIZE * (8 + 8 + 2 * channels + 2 * channels + 8)
     print(f"ring backing arrays: ~{reserved / 1e6:.1f} MB reserved per device "
