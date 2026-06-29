@@ -377,6 +377,10 @@ class DeviceBuffer:
         self.result_fault_state    = deque(maxlen=BUFFER_SIZE)  # tuple per row: per-node fault_state[GATHERING_DEVICES]
         self.result_parity_errors  = deque(maxlen=BUFFER_SIZE)  # tuple per row: parity_errors[GATHERING_DEVICES][ACQUISITION_CHANNELS]
         self.result_crc_error_mask = deque(maxlen=BUFFER_SIZE)  # int per row
+        # Monotonic change counter bumped on every append; lets the plot skip a
+        # redraw when nothing new has arrived (e.g. a finished trigger/new-sampling
+        # capture that already holds all the data it wanted).
+        self.revision = 0
 
     def extend(self, t:List[int], samples:List[List[int]], errs:List[int], ptp:List[int]):
         with self.lock:
@@ -386,6 +390,7 @@ class DeviceBuffer:
                 self.error[ch].extend_const(errs[ch], len(sig))
             self.signal[0].extend(t)
             self.ptp.extend(ptp)
+            self.revision += 1
 
     def extend_result(self, t:List[int], samples:List[List[int]], errs:List[int], ptp:List[int],
                       fault_state:Tuple[int, ...], parity_errors:Tuple[int, ...], crc_error_mask:int):
@@ -399,6 +404,7 @@ class DeviceBuffer:
             self.result_fault_state.extend([fault_state]*len(t))
             self.result_parity_errors.extend([parity_errors]*len(t))
             self.result_crc_error_mask.extend([crc_error_mask]*len(t))
+            self.revision += 1
 
 # Async UDP socket
 class AsyncSocket:
@@ -1442,6 +1448,9 @@ class Plotter(QWidget):
         self.ax.setLabel('left','Amplitude')
         self.ax.addLegend()
         self.curves: Dict[Tuple[str,int], pg.PlotDataItem] = {}
+        # Last per-device buffer.revision drawn; used to skip redundant redraws when
+        # no new data has arrived since the previous frame. None forces the first draw.
+        self._plot_revisions = None
 
         # Detection plot
         self.plot_widget.nextRow()  # move to next row in the graphics layout
@@ -2204,7 +2213,7 @@ class Plotter(QWidget):
         self.ax_result.clear()
         self.ax_result_curves.clear()
 
-        self._update_plot()
+        self._update_plot(force=True)
         self._logger.info('Graf cleaned')
     
     def save_measurement(self):
@@ -2379,7 +2388,16 @@ class Plotter(QWidget):
         self._logger.info('Saved data: ' + ', '.join(files))
         return files
         
-    def _update_plot(self):
+    def _update_plot(self, force=False):
+        # Skip the (expensive) full redraw when no device buffer has changed since the
+        # last frame -- e.g. a trigger / "start new sampling" capture is complete and
+        # already holds all the data it asked for, even though the system keeps running
+        # and sending. Every append bumps buffer.revision; a changed set of devices or
+        # force=True (used after clear_plot) also redraws.
+        revisions = {ip: dev.buffer.revision for ip, dev in self.manager.devices.items()}
+        if not force and self._plot_revisions == revisions:
+            return
+        self._plot_revisions = revisions
         lines = []
         received_counts = []
         #for (ip, dev) in self.manager.devices.items():
