@@ -211,6 +211,11 @@ CHANNEL_HEADER_STRUCT = STRUCT.CHANNEL  # <4s ff (unit, offset, gain)
 DATA_HEADER_STRUCT = STRUCT.DATA_HEADER # <HHII (packet_type, packet_num, ptp_seconds, ptp_nanoseconds)
 TRIGGER_PACKET_STRUCT = struct.Struct("<HHB3xII") # packet_type, packet_num, sample_num, ptp_seconds, ptp_nanoseconds
 
+# Precomputed vectors for vectorised DATA-packet parsing (Phase 2 fast path).
+_DATA_SAMPLE_INDEX = np.arange(SAMPLES_PER_PACKET, dtype=np.int64)
+# Per-sample PTP step back from the packet's last-sample timestamp.
+_DATA_PTP_BACK_STEPS = np.arange(SAMPLES_PER_PACKET - 1, -1, -1, dtype=np.int64) * NS_PER_SAMPLE
+
 def parse_id_packet(data):
     if len(data) < ID_HEADER_STRUCT.size:
         raise ValueError("[ERR]: ID packet is short")
@@ -401,7 +406,6 @@ class Device:
         self.buffer = DeviceBuffer(self.channels)
         self.id = int(ip.split('.')[3])
         self.header_struct = struct.Struct('<HH')
-        self.data_struct = struct.Struct('<'+'h'*SAMPLES_PER_PACKET)
         self.silent_ping = False
         self.capture_active = False
         self.capture_counter = 0
@@ -776,18 +780,17 @@ class Device:
                     self.last_data_order = order
                 
                 rel_order = self.packet_index
-                t = [rel_order*SAMPLES_PER_PACKET + k for k in range(SAMPLES_PER_PACKET)]
+                base = rel_order*SAMPLES_PER_PACKET
+                t = (base + _DATA_SAMPLE_INDEX).tolist()
                 # The packet PTP timestamp marks the last sample in the window; earlier
                 # samples are NS_PER_SAMPLE older each.
                 ptp_last_ns = ptp_seconds*1_000_000_000 + ptp_nanoseconds
-                ptp = [ptp_last_ns - (SAMPLES_PER_PACKET-1-k)*NS_PER_SAMPLE for k in range(SAMPLES_PER_PACKET)]
-                samples = []
-                for _ in range(self.channels):
-                    sig = self.data_struct.unpack(data[off:off+2*SAMPLES_PER_PACKET])
-                    samples.append(sig)
-                    off += 2*SAMPLES_PER_PACKET
+                ptp = (ptp_last_ns - _DATA_PTP_BACK_STEPS).tolist()
+                # Vectorised int16 sample extraction for all channels at once.
+                nsamp = self.channels*SAMPLES_PER_PACKET
+                samples = np.frombuffer(data, dtype='<i2', count=nsamp, offset=off).reshape(self.channels, SAMPLES_PER_PACKET).tolist()
+                off += 2*nsamp
                 errs = list(data[off:off+self.channels])
-                off += self.channels
                 self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs, ptp)
                 return order
             case self.PKT_TYPE_TRIGGER:
