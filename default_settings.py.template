@@ -6,6 +6,7 @@ DEFAULT_PRETRIGGER_PACKETS = 0   ## default pre-trigger packets captured before 
 DEFAULT_POSTTRIGGER_PACKETS = 1000   ## default post-trigger packets captured after the trigger (Post-trigger packets spinbox)
 PTP_TRIGGER_RING_PACKETS = 500   ## size of the pre-trigger ring buffer; also the maximum selectable pre-trigger packets
 TRIGGER_CAPTURE_MARGIN_PACKETS = 16   ## extra post-trigger packets captured beyond the requested window to tolerate UDP reordering / duplicate / bad-CRC packets that would otherwise truncate the tail (trimmed away on display/save)
+BUFFER_LENGTH_S = 30   ## per-device sample-buffer length in seconds (max record length); sets the post-trigger spinbox max and the numpy ring size (~32 B/sample/device, allocated lazily)
 DEFAULT_PTP_MODE_ENABLED = False
 DEFAULT_SOCKET_BACKEND = 'auto' ## 'auto' tries to use C++ and falls back to Python on fail; 'py' uses Python socket, 'cpp' uses C++ socket and crashes when not available
 DATA_SOCKET_RCVBUF_BYTES = 16777216 ## OS UDP receive buffer (SO_RCVBUF) for the data socket; large value prevents packet loss during the trigger flush burst (default 16 MiB)

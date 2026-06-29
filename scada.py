@@ -53,7 +53,7 @@ from fdds.protocol import (
 from fdds.crc import crc16_ccitt
 
 APPLICATION_NAME = 'Eaton FDDS SCADA'
-APPLICATION_VERSION = '1.11.2'
+APPLICATION_VERSION = '1.12.0'
 APPLICATION_TITLE = f"{APPLICATION_NAME} v{APPLICATION_VERSION}"
 
 # Constants (protocol-level values sourced from the shared fdds core)
@@ -67,6 +67,10 @@ PACKET_PERIOD      = 1/(PACKET_RATE_HZ)
 NS_PER_SAMPLE      = round(SAMPLING_PERIOD*1e9)  # per-sample PTP step in nanoseconds (5 us)
 GATHERING_DEVICES  = FDDS_GATHERING_DEVICES   # CCU result packet: number of nodes the CCU gathers from
 ACQUISITION_CHANNELS = FDDS_ACQUISITION_CHANNELS # CCU result packet: ADC channels per node
+# Per-device sample-buffer length (max record length). Backed by preallocated numpy
+# ring buffers (np.empty -> OS commits resident pages lazily), so a larger value
+# only raises the worst-case footprint, not the steady-state RAM of short records.
+# Overridable via default_settings.py.
 BUFFER_LENGTH_S    = 30
 BUFFER_SIZE        = int(BUFFER_LENGTH_S*SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 MAX_CAPTURE_PACKETS = BUFFER_SIZE // SAMPLES_PER_PACKET  # max pre+post packets that fit the sample buffer
@@ -250,18 +254,126 @@ def parse_id_packet(data):
     info['channels'] = [dict(zip(channels_info, CHANNEL_HEADER_STRUCT.unpack(data[ID_HEADER_STRUCT.size+i*CHANNEL_HEADER_STRUCT.size:ID_HEADER_STRUCT.size+(i+1)*CHANNEL_HEADER_STRUCT.size]))) for i in range(parsed_channels)]
     return info
 
+class NumpyRing:
+    """Fixed-capacity ring buffer backed by a preallocated numpy array.
+
+    Drop-in replacement for the per-sample ``deque`` columns of ``DeviceBuffer``:
+    supports ``extend(seq)``, ``clear()``, ``len()``/``bool()``, iteration (yields
+    python scalars in arrival order) and ``np.asarray()``/``np.array()`` (returns
+    the ordered contiguous array, optionally cast to a dtype).
+
+    The backing store is allocated once via ``np.empty`` so the OS commits resident
+    pages lazily (memory grows only as data is written) while still guaranteeing a
+    fixed worst-case footprint with no reallocation/copy stalls in the packet hot
+    path. Reading is a single contiguous copy instead of the O(N) python-level
+    iteration that ``np.array(deque)`` performs, which is the main plot/CSV speedup.
+    """
+    __slots__ = ('_buf', '_cap', '_start', '_count', '_dtype')
+
+    def __init__(self, capacity:int, dtype):
+        self._cap = max(1, int(capacity))
+        self._dtype = np.dtype(dtype)
+        self._buf = np.empty(self._cap, dtype=self._dtype)
+        self._start = 0
+        self._count = 0
+
+    def __len__(self):
+        return self._count
+
+    def __bool__(self):
+        return self._count > 0
+
+    def clear(self):
+        self._start = 0
+        self._count = 0
+
+    def extend(self, seq):
+        src = np.asarray(seq, dtype=self._dtype)
+        n = src.size
+        if n == 0:
+            return
+        cap = self._cap
+        if n >= cap:
+            # Only the most recent ``cap`` elements survive (matches deque(maxlen)).
+            self._buf[:] = src[-cap:]
+            self._start = 0
+            self._count = cap
+            return
+        end = (self._start + self._count) % cap   # one past the logical end
+        first = min(n, cap - end)
+        self._buf[end:end + first] = src[:first]
+        if first < n:                              # wrapped around the end
+            self._buf[:n - first] = src[first:]
+        new_count = self._count + n
+        if new_count > cap:                        # overwrote the oldest elements
+            self._start = (self._start + (new_count - cap)) % cap
+            self._count = cap
+        else:
+            self._count = new_count
+
+    def extend_const(self, value, n:int):
+        """Append ``n`` copies of a single ``value`` (equivalent to
+        ``extend([value]*n)`` but without building the intermediate python list).
+        Used for the per-channel error column where one packet contributes the same
+        parity-error count to every sample of the packet."""
+        if n <= 0:
+            return
+        cap = self._cap
+        if n >= cap:
+            self._buf[:] = value
+            self._start = 0
+            self._count = cap
+            return
+        end = (self._start + self._count) % cap
+        first = min(n, cap - end)
+        self._buf[end:end + first] = value
+        if first < n:
+            self._buf[:n - first] = value
+        new_count = self._count + n
+        if new_count > cap:
+            self._start = (self._start + (new_count - cap)) % cap
+            self._count = cap
+        else:
+            self._count = new_count
+
+    def _ordered(self):
+        """Contiguous copy of the valid elements in arrival (oldest-first) order."""
+        if self._count == 0:
+            return np.empty(0, dtype=self._dtype)
+        cap = self._cap
+        end = self._start + self._count
+        if end <= cap:
+            return self._buf[self._start:end].copy()
+        return np.concatenate((self._buf[self._start:], self._buf[:end - cap]))
+
+    def __array__(self, dtype=None, copy=None):
+        arr = self._ordered()
+        if dtype is not None:
+            arr = arr.astype(dtype, copy=False)
+        return arr
+
+    def __iter__(self):
+        # Yield python scalars in arrival order (matches deque iteration so list()
+        # and slicing behave identically to the previous deque-backed columns).
+        return iter(self._ordered().tolist())
+
 # Buffer container
 @dataclass
 class DeviceBuffer:
     def __init__(self, channels:int=3):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.lock = threading.Lock()
-        self.time   = deque(maxlen=BUFFER_SIZE)
-        self.signal = [deque(maxlen=BUFFER_SIZE) for _ in range(channels+1)]
-        self.error  = [deque(maxlen=BUFFER_SIZE) for _ in range(channels)]
+        # Per-sample columns backed by preallocated numpy ring buffers. signal[0] is
+        # the per-sample time index (int64, large range); signal[1..] are the int16
+        # ADC/bit samples; error[*] are the small per-channel parity-error counts.
+        self.time   = NumpyRing(BUFFER_SIZE, np.int64)
+        self.signal = [NumpyRing(BUFFER_SIZE, np.int64)] + [NumpyRing(BUFFER_SIZE, np.int16) for _ in range(channels)]
+        self.error  = [NumpyRing(BUFFER_SIZE, np.int16) for _ in range(channels)]
         # PTP timestamp per row in integer nanoseconds (mirrors the packet PTP time)
-        self.ptp    = deque(maxlen=BUFFER_SIZE)
-        # CCU RESULT-packet metadata (one entry per result packet; empty for nodes)
+        self.ptp    = NumpyRing(BUFFER_SIZE, np.int64)
+        # CCU RESULT-packet metadata (one entry per result packet; empty for nodes).
+        # These hold python tuples/ints (one per packet, not per sample) so they stay
+        # as deques rather than numeric rings.
         self.result_fault_state    = deque(maxlen=BUFFER_SIZE)  # tuple per row: per-node fault_state[GATHERING_DEVICES]
         self.result_parity_errors  = deque(maxlen=BUFFER_SIZE)  # tuple per row: parity_errors[GATHERING_DEVICES][ACQUISITION_CHANNELS]
         self.result_crc_error_mask = deque(maxlen=BUFFER_SIZE)  # int per row
@@ -271,7 +383,7 @@ class DeviceBuffer:
             self.time.extend(t)
             for ch, sig in enumerate(samples):
                 self.signal[ch+1].extend(sig)
-                self.error[ch].extend([errs[ch]]*len(sig))
+                self.error[ch].extend_const(errs[ch], len(sig))
             self.signal[0].extend(t)
             self.ptp.extend(ptp)
 
@@ -281,7 +393,7 @@ class DeviceBuffer:
             self.time.extend(t)
             for ch, sig in enumerate(samples):
                 self.signal[ch+1].extend(sig)
-                self.error[ch].extend([errs[ch]]*len(sig))
+                self.error[ch].extend_const(errs[ch], len(sig))
             self.signal[0].extend(t)
             self.ptp.extend(ptp)
             self.result_fault_state.extend([fault_state]*len(t))
@@ -2466,6 +2578,7 @@ def main(argv):
         global FIREWALL_PENETRATION
         global DATA_SOCKET_RCVBUF_BYTES
         global TRIGGER_CAPTURE_MARGIN_PACKETS
+        global BUFFER_LENGTH_S, BUFFER_SIZE, MAX_CAPTURE_PACKETS
 
         DEFAULT_FIRST_IP = getattr(ds, 'DEFAULT_FIRST_IP', "192.168.137.100")
         DEFAULT_LEADER = getattr(ds, 'DEFAULT_LEADER', 1)
@@ -2476,6 +2589,11 @@ def main(argv):
         DEFAULT_POSTTRIGGER_PACKETS = getattr(ds, 'DEFAULT_POSTTRIGGER_PACKETS', DEFAULT_AVG_LEN_MS)
         PTP_TRIGGER_RING_PACKETS = getattr(ds, 'PTP_TRIGGER_RING_PACKETS', PTP_TRIGGER_RING_PACKETS)
         TRIGGER_CAPTURE_MARGIN_PACKETS = int(getattr(ds, 'TRIGGER_CAPTURE_MARGIN_PACKETS', TRIGGER_CAPTURE_MARGIN_PACKETS))
+        # Sample-buffer length: recompute the derived sizes (used by DeviceBuffer ring
+        # allocation and the post-trigger spinbox) before any device/GUI is created.
+        BUFFER_LENGTH_S = int(getattr(ds, 'BUFFER_LENGTH_S', BUFFER_LENGTH_S))
+        BUFFER_SIZE = int(BUFFER_LENGTH_S * SAMPLES_PER_PACKET * PACKET_RATE_HZ)
+        MAX_CAPTURE_PACKETS = BUFFER_SIZE // SAMPLES_PER_PACKET
         ptp_mode.enabled = getattr(ds, 'DEFAULT_PTP_MODE_ENABLED', False)
         SOCKET_BACKEND = getattr(ds, 'SOCKET_BACKEND', DEFAULT_SOCKET_BACKEND)
         DATA_SOCKET_RCVBUF_BYTES = int(getattr(ds, 'DATA_SOCKET_RCVBUF_BYTES', DATA_SOCKET_RCVBUF_BYTES))
@@ -2498,7 +2616,7 @@ def main(argv):
         gui_log_handler.setLevel(logging.DEBUG)
         logging_.log_printer.add_handler(gui_log_handler)
         logging_.logger.critical(f"Logging to file: {logging_.log_path}") # This has to be in console, so critical
-        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PRETRIGGER_PACKETS={DEFAULT_PRETRIGGER_PACKETS}, DEFAULT_POSTTRIGGER_PACKETS={DEFAULT_POSTTRIGGER_PACKETS}, PTP_TRIGGER_RING_PACKETS={PTP_TRIGGER_RING_PACKETS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}, DATA_SOCKET_RCVBUF_BYTES={DATA_SOCKET_RCVBUF_BYTES}, TRIGGER_CAPTURE_MARGIN_PACKETS={TRIGGER_CAPTURE_MARGIN_PACKETS}, FIREWALL_PENETRATION={FIREWALL_PENETRATION}")  
+        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PRETRIGGER_PACKETS={DEFAULT_PRETRIGGER_PACKETS}, DEFAULT_POSTTRIGGER_PACKETS={DEFAULT_POSTTRIGGER_PACKETS}, PTP_TRIGGER_RING_PACKETS={PTP_TRIGGER_RING_PACKETS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}, DATA_SOCKET_RCVBUF_BYTES={DATA_SOCKET_RCVBUF_BYTES}, TRIGGER_CAPTURE_MARGIN_PACKETS={TRIGGER_CAPTURE_MARGIN_PACKETS}, BUFFER_LENGTH_S={BUFFER_LENGTH_S}, FIREWALL_PENETRATION={FIREWALL_PENETRATION}")
         def start_loop():
             loop=asyncio.SelectorEventLoop()
             asyncio.set_event_loop(loop)
