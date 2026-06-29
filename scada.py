@@ -105,6 +105,10 @@ SYSTEM_STATUS_COLOR_ERROR = 'red'       # FAILED / no CCU / no ACK / data stalle
 SYSTEM_STATUS_COLOR_BUSY  = '#ffb84d'   # startup in progress / starting / no response (transient)
 SYSTEM_STATUS_COLOR_IDLE  = '#cfcfcf'   # IDLE / stopped (neutral)
 
+# Brief blue flash on the device label when a trigger packet arrives from it
+TRIGGER_FLASH_MS = 250
+TRIGGER_FLASH_STYLE = 'background-color: #2196f3; color: white'
+
 # Features
 FCN_QT_LOGGING = True  # Enable Qt logging handler
 
@@ -357,9 +361,10 @@ class Device:
     PKT_TYPE_LOG  = 4
     PKT_TYPE_RESULT  = 5
 
-    def __init__(self, ip:str, cmd_port:int, data_port:int, loop):
+    def __init__(self, ip:str, cmd_port:int, data_port:int, loop, manager=None):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.ip, self.cmd_port, self.data_port, self.loop = ip,cmd_port,data_port,loop
+        self.manager = manager
         self.channels = 2
         self.cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.cmd_sock.settimeout(RECV_TIMEOUT_S)
@@ -753,6 +758,8 @@ class Device:
                 return order
             case self.PKT_TYPE_TRIGGER:
                 _, packet_num, sample_num, ptp_seconds, ptp_nanoseconds = TRIGGER_PACKET_STRUCT.unpack(pkt[:TRIGGER_PACKET_STRUCT.size])
+                if self.manager is not None and self.manager.trigger_signal is not None:
+                    self.manager.trigger_signal.emit(self.ip)
                 ptp_mode.trigger_sample_num = sample_num
                 ptp_mode.fire_trigger(order)
                 self._logger.info(f'PTP trigger received on {self.id} in packet {order} and sample {sample_num}, sent at {ptp_seconds}.{ptp_nanoseconds:09d} s.')
@@ -853,6 +860,7 @@ class DeviceManager:
         self.data_socket = None
         self.dispatch_task = None
         self.loop_thread = None
+        self.trigger_signal = None  # GUI pyqtSignal(str ip), emitted when a trigger packet arrives
         self.cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.cmd_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.cmd_sock.settimeout(RECV_TIMEOUT_S)
@@ -894,10 +902,14 @@ class DeviceManager:
         if self.loop and self.data_socket:
             self.loop.call_soon_threadsafe(self.data_socket.clear_queue)
 
+    def set_trigger_signal(self, signal):
+        """Register the GUI signal (pyqtSignal(str)) emitted with the source IP on trigger."""
+        self.trigger_signal = signal
+
     def add_device(self, ip:str, cmd_port:int = DEFAULT_CMD_PORT):
         if len(self.devices) >= self.MAX_DEVICES or ip in self.devices:
             return
-        self.devices[ip] = Device(ip, cmd_port, self.data_port, self.loop)
+        self.devices[ip] = Device(ip, cmd_port, self.data_port, self.loop, manager=self)
 
     def ping_all(self):
         return {ip: dev.ping() for ip,dev in self.devices.items()}
@@ -1048,6 +1060,8 @@ class Plotter(QWidget):
     # emits (ip, packet_order)
     data_ready = pyqtSignal(str, int)
     log_signal = pyqtSignal(str)
+    # emits (ip) when a trigger packet arrives from the given device
+    trigger_received = pyqtSignal(str)
 
     Colors = [
         pg.mkColor(255,   0,   0), # red
@@ -1307,6 +1321,8 @@ class Plotter(QWidget):
         self.timer.start()
 
         self.data_ready.connect(self._check_order)
+        self.trigger_received.connect(self._flash_device_trigger)
+        self.manager.set_trigger_signal(self.trigger_received)
 
     def closeEvent(self, event):
         self.manager.shutdown()
@@ -1780,6 +1796,23 @@ class Plotter(QWidget):
             if de.text().strip().split(':')[0] == ip:
                 dl.setStyleSheet(f'background-color: {color}' if color else '')
                 break
+
+    def _flash_device_trigger(self, ip):
+        """Briefly flash the matching 'Device n' label blue when a trigger packet arrives."""
+        for de, dl in zip(self.device_edits, self.device_labels):
+            if de.text().strip().split(':')[0] != ip:
+                continue
+            timer = getattr(dl, '_trigger_timer', None)
+            if timer is None:
+                timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(lambda dl=dl: dl.setStyleSheet(getattr(dl, '_trigger_base_style', '')))
+                dl._trigger_timer = timer
+            if not timer.isActive():
+                dl._trigger_base_style = dl.styleSheet()
+            dl.setStyleSheet(TRIGGER_FLASH_STYLE)
+            timer.start(TRIGGER_FLASH_MS)
+            break
 
     def _system_diagnose_stalled(self, stalled_ips):
         """Diagnose devices that stopped sending data: receiver registration, then firewall."""
