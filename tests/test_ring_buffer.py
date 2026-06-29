@@ -277,10 +277,16 @@ def _csv_new(times_a, ptp_a, signals_a, channels, time_scale, time_zero_s,
             rows.append([t_shift_list[i], ptp_list[i], *row])
         w.writerows(rows)
     else:
+        # Mirror the production node path: single % template + '\r\n' join (the
+        # csv default line terminator), which must be byte-identical to csv.writer.
         t_shift_list = t_shift_a[keep].tolist()
         ptp_list = ptp_a[keep].tolist()
         sig_lists = [s[keep].tolist() for s in signals_a]
-        w.writerows(zip(t_shift_list, ptp_list, *sig_lists))
+        if t_shift_list:
+            tmpl = '%r,' + ','.join(['%d'] * (channels + 1))
+            lines = [tmpl % row for row in zip(t_shift_list, ptp_list, *sig_lists)]
+            out.write('\r\n'.join(lines))
+            out.write('\r\n')
     return out.getvalue()
 
 
