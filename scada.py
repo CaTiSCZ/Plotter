@@ -37,21 +37,36 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 
+# Shared FDDS protocol core (vendored copy of the firmware repo's utils/fdds).
+# Single source of truth for packet/command enums, struct layouts and CRC so the
+# protocol stays in sync with the firmware. Re-copy fdds/ from the FW repo when
+# the wire protocol changes.
+from fdds.protocol import (
+    PACKET, CMD, STRUCT,
+    SAMPLES_PER_PACKET as FDDS_SAMPLES_PER_PACKET,
+    GATHERING_DEVICES as FDDS_GATHERING_DEVICES,
+    ACQUISITION_CHANNELS as FDDS_ACQUISITION_CHANNELS,
+    MAX_RECEIVERS as FDDS_MAX_RECEIVERS,
+    RECEIVER_TYPE_DATA, RECEIVER_TYPE_LOG, RECEIVER_TYPE_DBG,
+    UDP_CMD_PORT, UDP_DATA_PORT,
+)
+from fdds.crc import crc16_ccitt
+
 APPLICATION_NAME = 'Eaton FDDS SCADA'
 APPLICATION_VERSION = '1.11.2'
 APPLICATION_TITLE = f"{APPLICATION_NAME} v{APPLICATION_VERSION}"
 
-# Constants
-DEFAULT_CMD_PORT   = 10578
-DEFAULT_DATA_PORT  = 10580
+# Constants (protocol-level values sourced from the shared fdds core)
+DEFAULT_CMD_PORT   = UDP_CMD_PORT
+DEFAULT_DATA_PORT  = UDP_DATA_PORT
 RECV_TIMEOUT_S     = 0.3
-SAMPLES_PER_PACKET = 200
+SAMPLES_PER_PACKET = FDDS_SAMPLES_PER_PACKET
 PACKET_RATE_HZ     = 1000
 SAMPLING_PERIOD    = 1/(SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 PACKET_PERIOD      = 1/(PACKET_RATE_HZ)
 NS_PER_SAMPLE      = round(SAMPLING_PERIOD*1e9)  # per-sample PTP step in nanoseconds (5 us)
-GATHERING_DEVICES  = 4   # CCU result packet: number of nodes the CCU gathers from (FW GATHERING_DEVICES)
-ACQUISITION_CHANNELS = 2 # CCU result packet: ADC channels per node (FW ACQUISITION_CHANNELS)
+GATHERING_DEVICES  = FDDS_GATHERING_DEVICES   # CCU result packet: number of nodes the CCU gathers from
+ACQUISITION_CHANNELS = FDDS_ACQUISITION_CHANNELS # CCU result packet: ADC channels per node
 BUFFER_LENGTH_S    = 30
 BUFFER_SIZE        = int(BUFFER_LENGTH_S*SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 MAX_CAPTURE_PACKETS = BUFFER_SIZE // SAMPLES_PER_PACKET  # max pre+post packets that fit the sample buffer
@@ -80,16 +95,13 @@ TRIGGER_CAPTURE_MARGIN_PACKETS = 16
 FIREWALL_PENETRATION_MODES = ('off', 'on', 'verbose')
 FIREWALL_PENETRATION = 'on'
 
-# System startup control (mirrors FW utils/system_control.py + protocol.py CMD enum)
-CMD_GET_RECEIVERS         = 4
-CMD_GET_ACQUISITION_STATE = 12
-CMD_GET_SYSTEM_STATE      = 23
-CMD_STARTUP_CONTROL       = 24
-CMD_STOP_SYSTEM           = 25
-RECEIVER_TYPE_DATA = 0
-RECEIVER_TYPE_LOG  = 1
-RECEIVER_TYPE_DBG  = 2
-MAX_RECEIVERS = 4
+# System startup control (command codes sourced from the shared fdds CMD enum)
+CMD_GET_RECEIVERS         = int(CMD.GET_RECEIVERS)
+CMD_GET_ACQUISITION_STATE = int(CMD.GET_ACQUISITION_STATE)
+CMD_GET_SYSTEM_STATE      = int(CMD.GET_SYSTEM_STATE)
+CMD_STARTUP_CONTROL       = int(CMD.STARTUP_CONTROL)
+CMD_STOP_SYSTEM           = int(CMD.STOP_SYSTEM)
+MAX_RECEIVERS = FDDS_MAX_RECEIVERS
 SYSTEM_STATE_IDLE    = 0
 SYSTEM_STATE_RUNNING = 9
 SYSTEM_STATE_FAILED  = 10
@@ -180,31 +192,9 @@ def _resolve_buffered_socket_class(backend: str):
 
     raise ValueError(f"Unknown socket backend '{backend}'. Expected one of: auto, cpp, py")
 
-# CRC-16/CCITT checksum
-def _crc16_ccitt_py(data: bytes, poly: int=0x1021, crc: int=0xFFFF) -> int:
-    for b in data:
-        crc ^= b<<8
-        for _ in range(8):
-            crc = ((crc<<1)^poly)&0xFFFF if crc&0x8000 else (crc<<1)&0xFFFF
-    return crc
-
-try:
-    import crcmod as _crcmod
-    _crc16_fast = _crcmod.mkCrcFun(0x11021, initCrc=0xFFFF, rev=False)
-
-    def crc16_ccitt(data: bytes, poly: int=0x1021, crc: int=0xFFFF) -> int:
-        # Fast C implementation for the standard FDDS parameters; fall back otherwise.
-        if poly == 0x1021 and crc == 0xFFFF:
-            return _crc16_fast(data)
-        return _crc16_ccitt_py(data, poly, crc)
-except ImportError:
-    logging.getLogger(__name__).warning(
-        "crcmod not installed - using slow pure-Python CRC16 (may drop packets under load). "
-        "Install with: pip install crcmod"
-    )
-    crc16_ccitt = _crc16_ccitt_py
-
-CRC_STRUCT = struct.Struct('<H')
+# CRC-16/CCITT checksum and packet struct layouts are provided by the shared fdds
+# core (fdds.crc.crc16_ccitt imported above, fdds.protocol.STRUCT below).
+CRC_STRUCT = STRUCT.CRC
 
 def _verify_crc(pkt: bytes) -> bytes|None:
     if not pkt or len(pkt)<2:
@@ -215,10 +205,10 @@ def _verify_crc(pkt: bytes) -> bytes|None:
 def _signed_u16_delta(new: int, old: int) -> int:
         return ((new - old + 0x8000) & 0xFFFF) - 0x8000
 
-# ID packet parsing from GrafTest
-ID_HEADER_STRUCT = struct.Struct("<HH HBB HBBI3I HBBI HH") # last HH = channels_count + _reserved
-CHANNEL_HEADER_STRUCT = struct.Struct("<4s ff")       # unit(4 bytes), offset, gain
-DATA_HEADER_STRUCT = struct.Struct("<HHII") # packet_type, packet_num, ptp_seconds, ptp_nanoseconds
+# Packet struct layouts (shared fdds core; TRIGGER has no shared layout yet so stays local)
+ID_HEADER_STRUCT = STRUCT.ID            # <HH HBB HBBI3I HBBI HH (last HH = channels_count + _reserved)
+CHANNEL_HEADER_STRUCT = STRUCT.CHANNEL  # <4s ff (unit, offset, gain)
+DATA_HEADER_STRUCT = STRUCT.DATA_HEADER # <HHII (packet_type, packet_num, ptp_seconds, ptp_nanoseconds)
 TRIGGER_PACKET_STRUCT = struct.Struct("<HHB3xII") # packet_type, packet_num, sample_num, ptp_seconds, ptp_nanoseconds
 
 def parse_id_packet(data):
@@ -392,12 +382,13 @@ ptp_mode = PTPMode()
 
 # Single device client
 class Device:
-    PKT_TYPE_ACK = 0
-    PKT_TYPE_ID = 1
-    PKT_TYPE_DATA = 2
-    PKT_TYPE_TRIGGER = 3
-    PKT_TYPE_LOG  = 4
-    PKT_TYPE_RESULT  = 5
+    # Packet type ids sourced from the shared fdds PACKET enum
+    PKT_TYPE_ACK = int(PACKET.ACK)
+    PKT_TYPE_ID = int(PACKET.ID)
+    PKT_TYPE_DATA = int(PACKET.DATA)
+    PKT_TYPE_TRIGGER = int(PACKET.TRIGGER)
+    PKT_TYPE_LOG  = int(PACKET.LOG)
+    PKT_TYPE_RESULT  = int(PACKET.RESULT)
 
     def __init__(self, ip:str, cmd_port:int, data_port:int, loop, manager=None):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
