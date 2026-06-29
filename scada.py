@@ -936,11 +936,17 @@ class DeviceManager:
     def ptp_trigger(self, trigger_order:int|None = None):
         # The trigger packet (order == trigger_order) is the first post-trigger
         # packet; it is replayed from the input ring or arrives live and counts
-        # against samples_awaited, so the limit stays pretrigger + post.
-        capture_limit = max(0, ptp_mode.samples_awaited + ptp_mode.pretrigger_packets)
-        for dev in self.devices.values():
+        # against samples_awaited, so the limit stays pretrigger + post. When the
+        # trigger fires mid-packet, that first packet only contributes its tail to
+        # the post window, so always capture one extra packet for margin (the
+        # plot/CSV trim back to exactly samples_awaited).
+        extra = 1
+        capture_limit = max(0, ptp_mode.samples_awaited + ptp_mode.pretrigger_packets + extra)
+        for idx, dev in enumerate(self.devices.values()):
             dev.trigger_order = trigger_order
-            dev.begin_capture(capture_limit)
+            # The CCU emits its result one packet behind the nodes' data, so grant
+            # it one more packet to fill the same post window (the plot/CSV trim it).
+            dev.begin_capture(capture_limit + (1 if idx == CCU_DEVICE_INDEX else 0))
             dev.ptp_trigger(trigger_order)
     
     def ptp_wait_trigger(self):
@@ -2067,6 +2073,20 @@ class Plotter(QWidget):
             # Align CSV time so the trigger sample is at t = 0 (matches the plot).
             _tsi = dev.trigger_sample_index()
             time_zero_s = _tsi * SAMPLING_PERIOD if _tsi is not None else 0.0
+            # Same window trim as the plot: keep exactly pre+post packets. Trim by
+            # integer sample/packet number relative to the trigger so every device
+            # yields the same count regardless of PTP float rounding.
+            _pre = dev.pretrigger_packets
+            _post = ptp_mode.samples_awaited
+            _trim_window = _tsi is not None and _post > 0
+            if has_result_meta:
+                _trig_n = _tsi / SAMPLES_PER_PACKET
+                _n_lo, _n_hi = _trig_n - _pre, _trig_n + _post
+                # Result rows sit on the 1 ms packet grid; zero on the trigger packet
+                # so times stay whole ms (the trigger's intra-packet offset is dropped).
+                time_zero_s = round(_trig_n) * PACKET_PERIOD
+            else:
+                _n_lo, _n_hi = _tsi - _pre * SAMPLES_PER_PACKET, _tsi + _post * SAMPLES_PER_PACKET
 
             if strict and not times:
                 raise RuntimeError(f"Zařízení {ip} nemá žádná data k uložení.")
@@ -2093,12 +2113,15 @@ class Plotter(QWidget):
                 w.writerow(header)
 
                 for i in range(row_count):
+                    if _trim_window and not (_n_lo <= times[i] < _n_hi):
+                        continue
+                    t_shift = times[i] * time_scale - time_zero_s
                     row = [signals[ch][i] for ch in range(dev.channels)]
                     if has_result_meta:
                         row += list(result_fault_state[i])
                         row += list(result_parity_errors[i])
                         row += [result_crc_error_mask[i]]
-                    w.writerow([times[i] * time_scale - time_zero_s, ptp[i], *row])
+                    w.writerow([t_shift, ptp[i], *row])
 
                 f.flush()
                 os.fsync(f.fileno())
@@ -2156,8 +2179,14 @@ class Plotter(QWidget):
                         trim = int(np.searchsorted(idx, -dev.pretrigger_packets * SAMPLES_PER_PACKET, side='left'))
                     else:
                         trim = 0
+                    # Cut the tail of the extra packet so exactly the requested
+                    # post-trigger window is shown (samples_awaited packets).
+                    if tsi is not None and ptp_mode.samples_awaited > 0:
+                        trim_end = int(np.searchsorted(idx, ptp_mode.samples_awaited * SAMPLES_PER_PACKET, side='left'))
+                    else:
+                        trim_end = len(idx)
                     received_full = int(len(idx) // SAMPLES_PER_PACKET)
-                    x = (idx * SAMPLING_PERIOD)[trim:]
+                    x = (idx * SAMPLING_PERIOD)[trim:trim_end]
                     avgs = [0] * dev.channels
                     for ch in range(dev.channels):
                         key = (ip, ch)
@@ -2165,7 +2194,7 @@ class Plotter(QWidget):
                             self.curves[key] = self.ax.plot(pen=Plotter.Colors[len(self.curves)], name=f'{ip}[{ch}]')
 
                         #y = np.array(buf.signal[ch + 1])[-len(x):]
-                        raw = np.array(buf.signal[ch + 1], dtype=float)[order_perm][trim:]
+                        raw = np.array(buf.signal[ch + 1], dtype=float)[order_perm][trim:trim_end]
                         # Kalibrace z ID paketu
                         gain = 1.0
                         offset = 0.0
@@ -2227,12 +2256,21 @@ class Plotter(QWidget):
                     tsi = dev.trigger_sample_index()
                     if tsi is not None:
                         # Same per-sample time-zero shift + pre-trigger window trim
-                        # as the node path (tsi is in sample units).
-                        x = x - tsi * SAMPLING_PERIOD
+                        # as the node path (tsi is in sample units). Packet-align the
+                        # zero (drop trigger's intra-packet offset) so result rows stay
+                        # on the whole-ms grid, matching the saved CSV.
+                        x = x - round(tsi / SAMPLES_PER_PACKET) * PACKET_PERIOD
                         trim = int(np.searchsorted(x, -dev.pretrigger_packets * PACKET_PERIOD, side='left'))
+                        # Cut the tail of the extra packet to exactly post packets;
+                        # include the sample that lands exactly on the window edge.
+                        if ptp_mode.samples_awaited > 0:
+                            trim_end = int(np.searchsorted(x, ptp_mode.samples_awaited * PACKET_PERIOD, side='right'))
+                        else:
+                            trim_end = x.size
                     else:
                         trim = 0
-                    x = x[trim:]
+                        trim_end = x.size
+                    x = x[trim:trim_end]
 
                     avgs = [0]  # Dummy for uniform output
 
@@ -2253,7 +2291,7 @@ class Plotter(QWidget):
                         y = np.repeat(y, SAMPLES_PER_PACKET) # Y interpolation - steps
                         # Slight offset so bits with same logical value are still visible
                         offset = (bit_idx - center) * offset_step
-                        y_bits = (y + offset)[trim:]
+                        y_bits = (y + offset)[trim:trim_end]
 
                         self.ax_result_curves[bit_idx].setData(x[-len(y_bits):], y_bits)
                         #self.ax_result.step(x[-len(y_bits):], y_bits, where='post', linewidth=2)
