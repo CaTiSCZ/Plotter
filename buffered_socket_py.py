@@ -24,6 +24,7 @@ class BufferedSocket:
         self._sender_thread = None
         self._timeout = 1
         self._received_count = 0
+        self._recv_buffer_bytes = 16 * 1024 * 1024
         self.name = name
 
     def bind(self, port: int, use_my_ip: bool = False, device_ip: str = "192.168.1.100", device_port: int = 9999): 
@@ -45,6 +46,8 @@ class BufferedSocket:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._sock.bind(self._addr)
             self._sock.settimeout(5.0)
+            if self._recv_buffer_bytes > 0:
+                self._apply_recv_buffer()
             self._start()
             #print(f"[INFO] Bound to {self.addr[0]}:{self.addr[1]}")     
         return self._addr 
@@ -116,6 +119,23 @@ class BufferedSocket:
     
     def settimeout(self, timeout):
         self._timeout = timeout
+
+    def _apply_recv_buffer(self):
+        """Set SO_RCVBUF on the bound socket and return the value the OS reports."""
+        if not self._sock or self._recv_buffer_bytes <= 0:
+            return 0
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(self._recv_buffer_bytes))
+        except OSError as e:
+            self._logger.warning(f"Failed to set SO_RCVBUF={self._recv_buffer_bytes}: {e}")
+        return self._sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+
+    def set_recv_buffer(self, n):
+        """Request an OS UDP receive buffer of n bytes. Returns the applied size."""
+        self._recv_buffer_bytes = int(n)
+        if self._sock:
+            return self._apply_recv_buffer()
+        return self._recv_buffer_bytes
         
     def recvfrom(self, bufsize):
         try:

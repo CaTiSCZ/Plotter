@@ -60,7 +60,19 @@ CCU_DEVICE_INDEX   = 0
 DEFAULT_SOCKET_BACKEND = 'auto'
 DATA_SOCKET_RECV_TIMEOUT_S = 0.02
 DATA_SOCKET_DRAIN_TIMEOUT_S = 0.3
+# OS UDP receive buffer (SO_RCVBUF) for the data socket. The default Windows value
+# (~64 KB, ~80 packets) overflows during the synchronous trigger flush burst
+# (pretrigger+post packets x devices re-parsed in one go), dropping the odd packet
+# on a single device. A large buffer absorbs the burst. Overridable via default_settings.py.
+DATA_SOCKET_RCVBUF_BYTES = 16 * 1024 * 1024
 PTP_TRIGGER_RING_PACKETS = 500  # default pre-trigger ring size; overridable via default_settings.py
+# Extra post-trigger packets captured beyond the requested window. The capture is
+# bounded by a packet COUNT, but UDP reordering (a pre-trigger packet arriving after
+# the trigger), duplicates or bad-CRC packets each consume a capture slot without
+# landing in the window, which would otherwise truncate the tail (last window packet
+# never stored -> 199/200). This margin absorbs such strays; the plot/CSV trim back
+# to exactly samples_awaited so the extra packets are harmless. Overridable via default_settings.py.
+TRIGGER_CAPTURE_MARGIN_PACKETS = 16
 # Firewall penetration mode for the stall diagnostic (overridable via default_settings.py):
 #   'off'     - never attempt firewall penetration; treat the stall as genuine.
 #   'on'      - send a silent ping through the data socket (default).
@@ -283,7 +295,8 @@ class DeviceBuffer:
 
 # Async UDP socket
 class AsyncSocket:
-    def __init__(self, loop, local_port:int, label:str, backend: str = DEFAULT_SOCKET_BACKEND):
+    def __init__(self, loop, local_port:int, label:str, backend: str = DEFAULT_SOCKET_BACKEND,
+                 rcvbuf: int = DATA_SOCKET_RCVBUF_BYTES):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.loop = loop
         self.queue = asyncio.Queue()
@@ -295,6 +308,15 @@ class AsyncSocket:
         self.sock = socket_cls(max_size=4096, name=label)
         self.sock.bind(port=local_port)
         self.sock.settimeout(DATA_SOCKET_RECV_TIMEOUT_S)
+
+        # Grow the OS UDP receive buffer so a synchronous processing burst (the
+        # trigger flush) cannot overflow it and drop packets.
+        if rcvbuf and hasattr(self.sock, 'set_recv_buffer'):
+            try:
+                applied = self.sock.set_recv_buffer(rcvbuf)
+                self._logger.info(f'AsyncSocket SO_RCVBUF requested={rcvbuf} applied={applied}')
+            except Exception as e:
+                self._logger.warning(f'Failed to set SO_RCVBUF={rcvbuf}: {e}')
 
         self._recv_task = loop.create_task(self._recv_loop())
         self._logger.info(f'AsyncSocket backend={self.backend_name}')
@@ -717,6 +739,11 @@ class Device:
                             return
 
                     if self.capture_limit > 0 and self.capture_counter >= self.capture_limit:
+                        if self.capture_active:
+                            self._logger.info(
+                                f"PTP capture done dev {self.id} (DATA): trigger_order={self.trigger_order}, "
+                                f"first={self.first_data_order}, last={self.last_data_order}, "
+                                f"count={self.capture_counter}/{self.capture_limit}")
                         self.capture_active = False
                         return
 
@@ -800,6 +827,11 @@ class Device:
                             return
 
                     if self.capture_limit > 0 and self.capture_counter >= self.capture_limit:
+                        if self.capture_active:
+                            self._logger.info(
+                                f"PTP capture done dev {self.id} (RESULT): trigger_order={self.trigger_order}, "
+                                f"first={self.first_data_order}, last={self.last_data_order}, "
+                                f"count={self.capture_counter}/{self.capture_limit}")
                         self.capture_active = False
                         return
 
@@ -867,10 +899,12 @@ class Device:
 # Manager of multiple devices
 class DeviceManager:
     MAX_DEVICES = 5
-    def __init__(self, data_port:int = DEFAULT_DATA_PORT, socket_backend: str = DEFAULT_SOCKET_BACKEND):
+    def __init__(self, data_port:int = DEFAULT_DATA_PORT, socket_backend: str = DEFAULT_SOCKET_BACKEND,
+                 data_rcvbuf: int = DATA_SOCKET_RCVBUF_BYTES):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.data_port = data_port
         self.socket_backend = socket_backend
+        self.data_rcvbuf = data_rcvbuf
         self.devices: Dict[str,Device] = {}
         self.loop = None
         self.data_socket = None
@@ -888,7 +922,8 @@ class DeviceManager:
 
     def attach_loop(self, loop):
         self.loop = loop
-        self.data_socket = AsyncSocket(loop, self.data_port, 'data', backend=self.socket_backend)
+        self.data_socket = AsyncSocket(loop, self.data_port, 'data', backend=self.socket_backend,
+                                       rcvbuf=self.data_rcvbuf)
 
     def set_loop_thread(self, loop_thread):
         self.loop_thread = loop_thread
@@ -964,11 +999,13 @@ class DeviceManager:
     def ptp_trigger(self, trigger_order:int|None = None):
         # The trigger packet (order == trigger_order) is the first post-trigger
         # packet; it is replayed from the input ring or arrives live and counts
-        # against samples_awaited, so the limit stays pretrigger + post. When the
-        # trigger fires mid-packet, that first packet only contributes its tail to
-        # the post window, so always capture one extra packet for margin (the
-        # plot/CSV trim back to exactly samples_awaited).
-        extra = 1
+        # against samples_awaited. The capture is bounded by a packet COUNT, so any
+        # stray packet that consumes a slot without landing in the window (a UDP-
+        # reordered pre-trigger packet arriving after the trigger, a duplicate, or a
+        # bad-CRC packet) would truncate the tail. Capture a margin of extra packets
+        # so the full window (incl. the last packet trigger_order+samples_awaited) is
+        # always stored; the plot/CSV trim back to exactly samples_awaited.
+        extra = TRIGGER_CAPTURE_MARGIN_PACKETS
         capture_limit = max(0, ptp_mode.samples_awaited + ptp_mode.pretrigger_packets + extra)
         for idx, dev in enumerate(self.devices.values()):
             dev.trigger_order = trigger_order
@@ -2424,6 +2461,8 @@ def main(argv):
 
         global PTP_TRIGGER_RING_PACKETS
         global FIREWALL_PENETRATION
+        global DATA_SOCKET_RCVBUF_BYTES
+        global TRIGGER_CAPTURE_MARGIN_PACKETS
 
         DEFAULT_FIRST_IP = getattr(ds, 'DEFAULT_FIRST_IP', "192.168.137.100")
         DEFAULT_LEADER = getattr(ds, 'DEFAULT_LEADER', 1)
@@ -2433,8 +2472,10 @@ def main(argv):
         # Fall back to DEFAULT_AVG_LEN_MS so behaviour is unchanged when the setting/file is absent.
         DEFAULT_POSTTRIGGER_PACKETS = getattr(ds, 'DEFAULT_POSTTRIGGER_PACKETS', DEFAULT_AVG_LEN_MS)
         PTP_TRIGGER_RING_PACKETS = getattr(ds, 'PTP_TRIGGER_RING_PACKETS', PTP_TRIGGER_RING_PACKETS)
+        TRIGGER_CAPTURE_MARGIN_PACKETS = int(getattr(ds, 'TRIGGER_CAPTURE_MARGIN_PACKETS', TRIGGER_CAPTURE_MARGIN_PACKETS))
         ptp_mode.enabled = getattr(ds, 'DEFAULT_PTP_MODE_ENABLED', False)
         SOCKET_BACKEND = getattr(ds, 'SOCKET_BACKEND', DEFAULT_SOCKET_BACKEND)
+        DATA_SOCKET_RCVBUF_BYTES = int(getattr(ds, 'DATA_SOCKET_RCVBUF_BYTES', DATA_SOCKET_RCVBUF_BYTES))
         FIREWALL_PENETRATION = str(getattr(ds, 'FIREWALL_PENETRATION', FIREWALL_PENETRATION)).lower()
         if FIREWALL_PENETRATION not in FIREWALL_PENETRATION_MODES:
             logging_.logger.warning(f"Invalid FIREWALL_PENETRATION={FIREWALL_PENETRATION!r}; falling back to 'on'. "
@@ -2446,7 +2487,7 @@ def main(argv):
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling,True)
         QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps,True)
         app=QApplication(argv)
-        manager=DeviceManager(socket_backend=SOCKET_BACKEND)
+        manager=DeviceManager(socket_backend=SOCKET_BACKEND, data_rcvbuf=DATA_SOCKET_RCVBUF_BYTES)
         gui=Plotter(manager)
         gui_log_handler = logger.CallbackHandler(sink_text=gui.log_signal.emit)
         gui_log_handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d\t%(levelname)-8s\t%(name)-10s\t%(message)s"))
@@ -2454,7 +2495,7 @@ def main(argv):
         gui_log_handler.setLevel(logging.DEBUG)
         logging_.log_printer.add_handler(gui_log_handler)
         logging_.logger.critical(f"Logging to file: {logging_.log_path}") # This has to be in console, so critical
-        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PRETRIGGER_PACKETS={DEFAULT_PRETRIGGER_PACKETS}, DEFAULT_POSTTRIGGER_PACKETS={DEFAULT_POSTTRIGGER_PACKETS}, PTP_TRIGGER_RING_PACKETS={PTP_TRIGGER_RING_PACKETS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}, FIREWALL_PENETRATION={FIREWALL_PENETRATION}")  
+        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PRETRIGGER_PACKETS={DEFAULT_PRETRIGGER_PACKETS}, DEFAULT_POSTTRIGGER_PACKETS={DEFAULT_POSTTRIGGER_PACKETS}, PTP_TRIGGER_RING_PACKETS={PTP_TRIGGER_RING_PACKETS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}, DATA_SOCKET_RCVBUF_BYTES={DATA_SOCKET_RCVBUF_BYTES}, TRIGGER_CAPTURE_MARGIN_PACKETS={TRIGGER_CAPTURE_MARGIN_PACKETS}, FIREWALL_PENETRATION={FIREWALL_PENETRATION}")  
         def start_loop():
             loop=asyncio.SelectorEventLoop()
             asyncio.set_event_loop(loop)

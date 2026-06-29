@@ -29,9 +29,13 @@ public:
 template<typename Container>
 class BufferedSocket {
 public:
+    // Default OS UDP receive buffer (16 MiB) - large enough to absorb a burst of
+    // packets while the consumer is briefly blocked (e.g. the trigger flush).
+    static constexpr int kDefaultRecvBufferBytes = 16 * 1024 * 1024;
     BufferedSocket(int max_size = 4096, const std::string& name = "BufferedSocket")
         : max_size_(max_size), running_(false), sock_(INVALID_SOCKET),
-          timeout_(1.0), received_count_(0), name_(name)
+          timeout_(1.0), received_count_(0), name_(name),
+          recv_buffer_bytes_(kDefaultRecvBufferBytes)
     {}
 
     ~BufferedSocket() {
@@ -79,6 +83,7 @@ public:
 
         DWORD tv = (DWORD)(timeout_ * 1000);
         setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+        apply_recv_buffer();
 
         start();
 
@@ -91,6 +96,7 @@ public:
         sock_ = sock;
         DWORD tv = (DWORD)(timeout_ * 1000);
         setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+        apply_recv_buffer();
         start();
     }
 
@@ -168,10 +174,32 @@ public:
         return (int)receive_buffer_.size();
     }
 
+    // Request an OS UDP receive buffer of `bytes` and return the value the OS reports.
+    // A large buffer prevents packet loss when the consumer briefly stalls (e.g. the
+    // synchronous trigger flush re-parses many buffered packets in one burst).
+    int set_recv_buffer(int bytes) {
+        recv_buffer_bytes_ = bytes;
+        std::lock_guard<std::mutex> lock(sock_mutex_);
+        apply_recv_buffer();
+        if (sock_ == INVALID_SOCKET) return recv_buffer_bytes_;
+        int actual = 0;
+        int len = sizeof(actual);
+        getsockopt(sock_, SOL_SOCKET, SO_RCVBUF, (char*)&actual, &len);
+        return actual;
+    }
+
     SOCKET sock_;
     std::atomic<bool> running_;
 
 private:
+    // Apply recv_buffer_bytes_ as SO_RCVBUF. Caller must hold sock_mutex_.
+    void apply_recv_buffer() {
+        if (sock_ != INVALID_SOCKET && recv_buffer_bytes_ > 0) {
+            int n = recv_buffer_bytes_;
+            setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, (const char*)&n, sizeof(n));
+        }
+    }
+
     void listen_loop() {
         while (running_) {
             SOCKET sock_local = INVALID_SOCKET;
@@ -253,6 +281,7 @@ private:
 
     int received_count_;
     std::string name_;
+    int recv_buffer_bytes_;
 };
 
 } // namespace bufferred_socket

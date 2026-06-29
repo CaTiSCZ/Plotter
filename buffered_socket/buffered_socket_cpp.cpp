@@ -61,6 +61,7 @@ PYBIND11_MODULE(buffered_socket_cpp, m) {
                                   py::make_tuple(result.second.first, result.second.second));
         })
         .def("settimeout", &BufferedSocket::settimeout)
+        .def("set_recv_buffer", &BufferedSocket::set_recv_buffer, py::arg("bytes"))
         .def("get_received_count", &BufferedSocket::get_received_count)
         .def("get_buffered_items_count", &BufferedSocket::get_buffered_items_count)
         .def("__bool__", [](const BufferedSocket& self) {
