@@ -8,4 +8,5 @@ PyInstaller.__main__.run([
     '--name', f"scada_v{APPLICATION_VERSION}",
     '--specpath', 'build',
     '--collect-submodules', 'crcmod',  # bundle crcmod incl. its C ext (fast CRC); else exe falls back to slow pure-Python CRC
+    '--collect-submodules', 'fdds',    # bundle the whole vendored fdds protocol core
 ])
