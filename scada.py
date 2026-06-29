@@ -1167,6 +1167,7 @@ class Plotter(QWidget):
         self._system_stall_status_base = 'System: data stalled'
         self._system_diag_pending = set()
         self._system_diag_firewall = False
+        self._system_diag_unresponsive = False
         self._system_diag_keep_status = False
         self._system_status_timer = QTimer(self)
         self._system_status_timer.setInterval(SYSTEM_STATUS_POLL_INTERVAL_MS)
@@ -1682,6 +1683,7 @@ class Plotter(QWidget):
         # Per-device receiver-registration + firewall diagnostic (async chain).
         self._system_diag_pending = set(stalled_ips)
         self._system_diag_firewall = False
+        self._system_diag_unresponsive = False
         self._system_diagnose_stalled(stalled_ips)
 
     def _device_data_fresh(self, dev):
@@ -1702,7 +1704,9 @@ class Plotter(QWidget):
             return  # other devices are still being diagnosed
         if self._system_diag_keep_status:
             return  # a more specific status (e.g. FAILED) is already shown
-        if self._system_diag_firewall:
+        if self._system_diag_unresponsive:
+            self._set_system_status('System: data stalled - device unresponsive', SYSTEM_STATUS_COLOR_ERROR)
+        elif self._system_diag_firewall:
             self._set_system_status('System: data stalled - firewall blocking data socket', SYSTEM_STATUS_COLOR_ERROR)
         elif any(not self._device_data_fresh(d) for d in self.manager.devices.values()):
             self._set_system_status(self._system_stall_status_base, SYSTEM_STATUS_COLOR_ERROR)
@@ -1719,8 +1723,13 @@ class Plotter(QWidget):
             return
         recv = dev.get_receivers(RECEIVER_TYPE_DATA)
         if recv is None:
-            self._logger.warning(f'[{dev.ip}] GET_RECEIVERS failed; registering as data receiver anyway.')
-            dev.register_receiver(*want)
+            # No reply to GET_RECEIVERS -> device is in an incorrect/unresponsive state.
+            # Stop here: a data-socket firewall test makes no sense and firewall is not the main issue.
+            self._logger.error(f'[{dev.ip}] GET_RECEIVERS failed -> device unresponsive/incorrect state; '
+                               f'skipping firewall test (firewall not the likely cause).')
+            self._system_diag_unresponsive = True
+            self._system_diag_complete(dev)
+            return
         elif want in recv['active']:
             self._logger.info(f'[{dev.ip}] Already registered as data receiver {want[0]}:{want[1]} '
                               f'(active={recv["active"]}); skipping re-registration.')
