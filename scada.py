@@ -1654,11 +1654,15 @@ class Plotter(QWidget):
                 self._system_stalled = False
                 self._logger.info('Data flow restored on all devices.')
                 self._set_system_status('System: RUNNING', SYSTEM_STATUS_COLOR_OK)
+                for ip in self.manager.devices:
+                    self._set_device_status_color(ip, SYSTEM_STATUS_COLOR_OK)
             return
         if self._system_stalled:
             return  # already diagnosing this stall; wait for recovery
         self._system_stalled = True
         stalled_ips = [ip for _, ip in stalled]
+        for ip in stalled_ips:
+            self._set_device_status_color(ip, SYSTEM_STATUS_COLOR_BUSY)
         names = ', '.join(f'dev{idx} ({ip})' for idx, ip in stalled)
         self._logger.warning(f'Data stopped from: {names}. Diagnosing...')
         # FW-side view (informative): read the CCU system state.
@@ -1689,6 +1693,13 @@ class Plotter(QWidget):
     def _device_data_fresh(self, dev):
         """True if the device has produced data within the stall timeout."""
         return bool(dev.last_data_time) and (time.monotonic() - dev.last_data_time) <= SYSTEM_DATA_STALL_TIMEOUT_S
+
+    def _set_device_status_color(self, ip, color):
+        """Colour the top-left 'Device n' label whose IP matches, to signal its state."""
+        for de, dl in zip(self.device_edits, self.device_labels):
+            if de.text().strip().split(':')[0] == ip:
+                dl.setStyleSheet(f'background-color: {color}' if color else '')
+                break
 
     def _system_diagnose_stalled(self, stalled_ips):
         """Diagnose devices that stopped sending data: receiver registration, then firewall."""
@@ -1728,6 +1739,7 @@ class Plotter(QWidget):
             self._logger.error(f'[{dev.ip}] GET_RECEIVERS failed -> device unresponsive/incorrect state; '
                                f'skipping firewall test (firewall not the likely cause).')
             self._system_diag_unresponsive = True
+            self._set_device_status_color(dev.ip, SYSTEM_STATUS_COLOR_ERROR)
             self._system_diag_complete(dev)
             return
         elif want in recv['active']:
@@ -1747,12 +1759,14 @@ class Plotter(QWidget):
                 self._logger.info(f'[{dev.ip}] Data resumed after registration -> was not registered as receiver.')
             else:
                 self._logger.info(f'[{dev.ip}] Data resumed.')
+            self._set_device_status_color(dev.ip, SYSTEM_STATUS_COLOR_OK)
             self._system_diag_complete(dev)
             return
         # Step 2: firewall test - ping out of the data socket (unless disabled).
         if FIREWALL_PENETRATION == 'off':
             self._logger.info(f'[{dev.ip}] Still no data; firewall penetration disabled (off) -> '
                               f'not testing the data socket, treating stall as a genuine/correct state.')
+            self._set_device_status_color(dev.ip, SYSTEM_STATUS_COLOR_ERROR)
             self._system_diag_complete(dev)
             return
         silent = FIREWALL_PENETRATION != 'verbose'
@@ -1766,13 +1780,16 @@ class Plotter(QWidget):
     def _system_diag_after_ping(self, dev, t0):
         if self._device_data_fresh(dev):
             self._logger.info(f'[{dev.ip}] Data resumed after firewall ping.')
+            self._set_device_status_color(dev.ip, SYSTEM_STATUS_COLOR_OK)
         elif dev.last_ack_time >= t0:
             self._logger.info(f'[{dev.ip}] Data socket reachable (ping ACK received) but still no data '
                               f'-> stall is a genuine/correct state.')
+            self._set_device_status_color(dev.ip, SYSTEM_STATUS_COLOR_ERROR)
         else:
             self._logger.error(f'[{dev.ip}] No ping ACK on data socket -> firewall is likely blocking '
                                f'incoming packets on the data socket.')
             self._system_diag_firewall = True
+            self._set_device_status_color(dev.ip, SYSTEM_STATUS_COLOR_ERROR)
         self._system_diag_complete(dev)
 
     def _reset_counter(self):
