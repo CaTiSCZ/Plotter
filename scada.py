@@ -2227,6 +2227,10 @@ class Plotter(QWidget):
 
                     # Statistics part
                     received = received_full
+                    # Count only packets inside the requested window so a missing
+                    # packet anywhere (start, middle, end) shows up as a shortfall.
+                    if tsi is not None and ptp_mode.samples_awaited > 0:
+                        received = int((trim_end - trim) // SAMPLES_PER_PACKET)
 
                 # Result processing
                 else:
@@ -2271,9 +2275,12 @@ class Plotter(QWidget):
                         trim = 0
                         trim_end = x.size
                     x = x[trim:trim_end]
+                    # Count only result packets inside the window so a missing one
+                    # shows up as a shortfall (matches the node statistics).
+                    if tsi is not None and ptp_mode.samples_awaited > 0:
+                        received = int((trim_end - trim) // SAMPLES_PER_PACKET)
 
                     avgs = [0]  # Dummy for uniform output
-
                     center = (dev.channels - 1) / 2.0
                     offset_step = 0.05  # vertical spacing between bit lines
                     # Use first data channel (signal[1]) as byte source
@@ -2312,7 +2319,7 @@ class Plotter(QWidget):
             stat_line = f'{ip}: packets = {received}/{sent}/{self.expected_samples}; errs = {errs}; avg = {avgs}'
 
             if (received == dev.received_last):
-                if received != self.expected_samples:
+                if received < self.expected_samples:
                     stat_line = f'<span style="color:red;">{stat_line}</span>'
             lines.append(stat_line)
             dev.received_last = received
