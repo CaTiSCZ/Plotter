@@ -517,7 +517,11 @@ class Device:
         return _signed_u16_delta(self.trigger_order, self.first_data_order) * SAMPLES_PER_PACKET + self.trigger_sample_num
 
     def ptp_wait_trigger(self):
-        self.input_packet_ring.clear()
+        # Do NOT clear the input ring here: arming only enables the hardware
+        # trigger (cmd 20). The ring is a continuously rolling history of the last
+        # PTP_TRIGGER_RING_PACKETS packets and must stay intact so the pre-trigger
+        # window is filled from packets that arrived *before* arming, not only from
+        # the (variable) interval between arming and the trigger event.
         return self._send_cmd(20)
 
     def ptp_reset(self, keep_ring: bool = False):
@@ -1568,9 +1572,11 @@ class Plotter(QWidget):
         self.expected_samples = n + pretrigger_packets
 
         if ptp_mode.enabled:
-            self.manager.ptp_reset()
-            self.manager.clear_data_queue()
-            
+            # Keep the rolling pre-trigger ring (and the device packet counter, see
+            # _start_new_sampling_on_trigger) so the pre-trigger window is filled
+            # from the continuous stream that preceded arming.
+            self.manager.ptp_reset(keep_ring=True)
+
             ptp_mode.waiting_for_trigger = True
             ptp_mode.trigger_mode = True
             ptp_mode.samples_awaited = n
@@ -1604,7 +1610,10 @@ class Plotter(QWidget):
 
     def _start_new_sampling_on_trigger(self):
         self._set_sampling_indicator(self.start_sampling_trigger_btn)
-        self._reset_counter()
+        # In PTP mode keep the device packet counter running so the pre-trigger ring
+        # stays continuous with the live stream; only the legacy (non-PTP) path resets.
+        if not ptp_mode.enabled:
+            self._reset_counter()
         self.clear_plot()
         QTimer(self).singleShot(100, self._start_sampling_on_trigger)
 
