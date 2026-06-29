@@ -117,6 +117,30 @@ for f in CLOCK_FORCED:
         for o in CLOKC_OUTPUTS:
             CLOCK_SETTINGS.append(f"{f}{s}{o}")
 
+# Trigger config byte: bit0 enable, bits2:1 edge, bits4:3 pull (FW trigger.h)
+TRIGGER_EDGES = ['Rising', 'Falling', 'Both']
+TRIGGER_PULLS = ['No-Pull', 'Pull-Up', 'Pull-Down']
+TRIGGER_SETTINGS = ['Disabled']  # index 0 = trigger disabled
+for e in TRIGGER_EDGES:
+    for p in TRIGGER_PULLS:
+        TRIGGER_SETTINGS.append(f"{e} {p}")
+
+def trigger_index_to_byte(index: int) -> int:
+    """TRIGGER_SETTINGS list index -> FW config byte."""
+    if index <= 0:
+        return 0  # disabled
+    edge = (index - 1) // len(TRIGGER_PULLS)
+    pull = (index - 1) % len(TRIGGER_PULLS)
+    return 0x01 | ((edge & 0x03) << 1) | ((pull & 0x03) << 3)
+
+def trigger_byte_to_index(b: int) -> int:
+    """FW config byte -> TRIGGER_SETTINGS list index."""
+    if not (b & 0x01):
+        return 0
+    edge = (b >> 1) & 0x03
+    pull = (b >> 3) & 0x03
+    return 1 + edge * len(TRIGGER_PULLS) + pull
+
 def _resolve_buffered_socket_class(backend: str):
     backend = (backend or DEFAULT_SOCKET_BACKEND).strip().lower()
 
@@ -538,6 +562,31 @@ class Device:
             self._logger.warning(f"Can not read stored clock config of {self.ip}, error code ({error}).")
         return (active_config, stored_config)
 
+    def set_trigger_config(self, config_byte:int, holdoff_ns:int = 0, save: bool = False):
+        """CMD_SET_TRIGGER_CONFIG: config byte + holdoff (ns). Optional 0xAC to persist."""
+        payload = struct.pack('<BQ', config_byte & 0xFF, holdoff_ns & 0xFFFFFFFFFFFFFFFF)
+        if save:
+            payload += struct.pack('<B', 0xAC)
+        return self._send_cmd(36, payload)
+
+    def get_trigger_config(self):
+        """CMD_GET_TRIGGER_CONFIG -> (config_byte, holdoff_ns) or None."""
+        pkt = self._send_cmd(37)
+        if not pkt:
+            self._logger.warning(f"Dev {self.ip} failed to get trigger config.")
+            return None
+        if (l:=len(pkt)) < 17:
+            self._logger.warning(f"Dev {self.ip} failed to get trigger config - too short packet ({l}).")
+            return None
+        packet_type, state, cmd, config_byte, holdoff_ns = struct.unpack('<HHIBQ', pkt[:17])
+        if packet_type != self.PKT_TYPE_ACK:
+            self._logger.warning(f"Dev {self.ip} failed to get trigger config - unexpected packet type ({packet_type}).")
+            return None
+        if cmd != 37:
+            self._logger.warning(f"Dev {self.ip} failed to get trigger config - unexpected command ({cmd}).")
+            return None
+        return (config_byte, holdoff_ns)
+
     def _send_cmd_with_ack(self, code:int, payload:bytes=b''):
         """Send a command and return (state, extra_bytes) from the ACK, or None."""
         resp = self._send_cmd(code, payload)
@@ -874,6 +923,9 @@ class DeviceManager:
     def get_clock_config_all(self):
         return {ip: dev.get_clock_config() for ip, dev in self.devices.items()}
 
+    def get_trigger_config_all(self):
+        return {ip: dev.get_trigger_config() for ip, dev in self.devices.items()}
+
     def reset_counter(self):
         return self._send_cmd_broadcast(10)      
 
@@ -1050,6 +1102,8 @@ class Plotter(QWidget):
         self.leader_buttons = QButtonGroup(self)
         self.leader_buttons.setExclusive(True)
         self.device_clock_settings: List[QComboBox] = []
+        self.device_trigger_settings: List[QComboBox] = []
+        self.device_trigger_holdoff: List[QSpinBox] = []
 
         for i in range(DeviceManager.MAX_DEVICES):
             lb = QLabel(f'Device {i}')
@@ -1077,6 +1131,22 @@ class Plotter(QWidget):
             cfg.addWidget(cb_clock_settings, i, 4)
             self.device_clock_settings.append(cb_clock_settings)
 
+            trig_box = QHBoxLayout()
+            cb_trigger = QComboBox()
+            cb_trigger.addItems(TRIGGER_SETTINGS)
+            cb_trigger.setCurrentIndex(0)
+            cb_trigger.currentIndexChanged.connect(lambda _idx, row=i: self._update_trigger_settings(row))
+            trig_box.addWidget(cb_trigger)
+            self.device_trigger_settings.append(cb_trigger)
+            sb_holdoff = QSpinBox()
+            sb_holdoff.setRange(0, 1_000_000_000)
+            sb_holdoff.setSuffix(' us')
+            sb_holdoff.setValue(0)
+            sb_holdoff.editingFinished.connect(lambda row=i: self._update_trigger_settings(row))
+            trig_box.addWidget(sb_holdoff)
+            self.device_trigger_holdoff.append(sb_holdoff)
+            cfg.addLayout(trig_box, i, 5)
+
         self.leader_buttons.buttonClicked[int].connect(self._leader_changed)
 
         cfg.addWidget(QLabel('Receiver addr:port'), 0, 6)
@@ -1098,6 +1168,10 @@ class Plotter(QWidget):
         self.save_clock_config_btn = QPushButton('Save clock config')
         cfg.addWidget(self.save_clock_config_btn, DeviceManager.MAX_DEVICES, 4)
         self.save_clock_config_btn.clicked.connect(self._save_clock_config)
+
+        self.save_trigger_config_btn = QPushButton('Save trigger config')
+        cfg.addWidget(self.save_trigger_config_btn, DeviceManager.MAX_DEVICES, 5)
+        self.save_trigger_config_btn.clicked.connect(self._save_trigger_config)
 
         btns = QHBoxLayout()
         root.addLayout(btns)
@@ -1851,6 +1925,61 @@ class Plotter(QWidget):
             if dev is not None:
                 dev.set_clock_ctrl(clock_ctrl=self.device_clock_settings[row].currentIndex(), save=True)
 
+    def _get_trigger_config(self):
+        cfgs = self.manager.get_trigger_config_all()
+        widgets = self.device_trigger_settings + self.device_trigger_holdoff
+        for k in widgets:
+            k.blockSignals(True)
+        for ip, cfg in cfgs.items():
+            if cfg is None:
+                self._logger.warning(f"Trigger config for {ip}: not available")
+                continue
+            config_byte, holdoff_ns = cfg
+            for i, edit in enumerate(self.device_edits):
+                line_ip = edit.text().strip().split(':')[0]
+                if line_ip == ip:
+                    self.device_trigger_settings[i].setCurrentIndex(trigger_byte_to_index(config_byte))
+                    self.device_trigger_holdoff[i].setValue(int(holdoff_ns // 1000))
+                    break
+            self._logger.info(f"Trigger config for {ip}: byte={config_byte:02X}, holdoff={holdoff_ns} ns")
+        for k in widgets:
+            k.blockSignals(False)
+
+    def _update_trigger_settings(self, row: int):
+        """Compose trigger config from combo+holdoff and apply (RAM only)."""
+        txt = self.device_edits[row].text().strip()
+        if not txt:
+            self._logger.warning(f'[TriggerCtrl] Row {row}: no IP set')
+            return
+        ip = txt.split(':')[0]
+        dev = self.manager.devices.get(ip)
+        if not dev:
+            self._logger.warning(f'[TriggerCtrl] {ip}: device not applied yet')
+            return
+        index = self.device_trigger_settings[row].currentIndex()
+        config_byte = trigger_index_to_byte(index)
+        holdoff_ns = self.device_trigger_holdoff[row].value() * 1000
+        dev.set_trigger_config(config_byte=config_byte, holdoff_ns=holdoff_ns, save=False)
+        self._logger.info(
+            f'[TriggerCtrl] {ip}: {TRIGGER_SETTINGS[index]} ({config_byte:02X}), holdoff={holdoff_ns} ns command sent'
+        )
+
+    def _save_trigger_config(self):
+        reply = QMessageBox.question(self, "Save?",
+                                    "Do you really want to save trigger configuration to EEPROM?",
+                                    QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        for row in range(DeviceManager.MAX_DEVICES):
+            if not self.device_checks[row].isChecked():
+                continue
+            ip = self.device_edits[row].text().strip().split(':')[0]
+            dev = self.manager.devices.get(ip)
+            if dev is not None:
+                config_byte = trigger_index_to_byte(self.device_trigger_settings[row].currentIndex())
+                holdoff_ns = self.device_trigger_holdoff[row].value() * 1000
+                dev.set_trigger_config(config_byte=config_byte, holdoff_ns=holdoff_ns, save=True)
+
     def clear_plot(self):
         for dev in self.manager.devices.values():
             with dev.buffer.lock:
@@ -2184,7 +2313,7 @@ class Plotter(QWidget):
         #self._penetrate_firewall()
         #for i, f in enumerate((self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._register_all, self._reset_counter)):
         # TODO: add self._leader_changed
-        init_fns = (self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._register_all, self._register_ccu, self._reset_counter)
+        init_fns = (self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._get_trigger_config, self._register_all, self._register_ccu, self._reset_counter)
         for i, f in enumerate(init_fns):
             QTimer(self).singleShot(i * 100, f)
         # After init, query the current system state, display it and react to it.
