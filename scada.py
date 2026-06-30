@@ -106,6 +106,11 @@ TRIGGER_CAPTURE_MARGIN_PACKETS = 16
 FIREWALL_PENETRATION_MODES = ('off', 'on', 'verbose')
 FIREWALL_PENETRATION = 'on'
 
+# Render plot curves with OpenGL (GPU). Off by default (CPU painter); can be much
+# faster for very large traces but needs a working OpenGL driver. Overridable via
+# default_settings.py (USE_OPENGL).
+USE_OPENGL = False
+
 # System startup control (command codes sourced from the shared fdds CMD enum)
 CMD_GET_RECEIVERS         = int(CMD.GET_RECEIVERS)
 CMD_GET_ACQUISITION_STATE = int(CMD.GET_ACQUISITION_STATE)
@@ -1509,6 +1514,29 @@ class Plotter(QWidget):
             b.clicked.connect(fn)
             btns.addWidget(b)
 
+        # Plot downsampling / rendering controls. setDownsampling(ds, auto, mode)
+        # reduces how many points pyqtgraph actually draws each frame, the dominant
+        # cost for multi-million-sample traces. 'mode' picks the algorithm; the
+        # factor spinbox is the fixed decimation factor, or 0 to let pyqtgraph pick
+        # it automatically from the visible pixel width (auto=True).
+        btns.addWidget(QLabel('Downsample:'))
+        self.downsample_mode_combo = QComboBox()
+        self.downsample_mode_combo.addItems(['Off', 'Subsample', 'Mean', 'Peak'])
+        self.downsample_mode_combo.setCurrentText('Peak')
+        self.downsample_mode_combo.setToolTip(
+            'Off: draw every point. Subsample: every Nth point (fast, can miss spikes). '
+            'Mean: average each group. Peak: min/max envelope (preserves spikes).')
+        btns.addWidget(self.downsample_mode_combo)
+        self.downsample_factor_spin = QSpinBox()
+        self.downsample_factor_spin.setRange(0, 100000)
+        self.downsample_factor_spin.setValue(0)
+        self.downsample_factor_spin.setToolTip('Decimation factor; 0 = auto (chosen from the visible pixel width).')
+        btns.addWidget(self.downsample_factor_spin)
+        self.clip_to_view_chk = QCheckBox('Clip to view')
+        self.clip_to_view_chk.setChecked(True)
+        self.clip_to_view_chk.setToolTip('Only draw the part of each curve inside the visible x-range (huge win when zoomed in).')
+        btns.addWidget(self.clip_to_view_chk)
+
         # System monitoring state
         self._system_poll_count = 0
         self._system_stalled = False
@@ -1526,6 +1554,11 @@ class Plotter(QWidget):
 
         # Plot area with legend
         self.plot_widget = pg.GraphicsLayoutWidget()
+        # When OpenGL curve painting is enabled (pg.setConfigOptions(useOpenGL=True)),
+        # the curves use paintGL, which only draws if the view's viewport is an OpenGL
+        # widget. Without this the GL calls go nowhere and the curves are invisible.
+        if USE_OPENGL:
+            self.plot_widget.useOpenGL(True)
         root.addWidget(self.plot_widget)
         self.ax = self.plot_widget.addPlot(title='Signals – device×channel')
         self.ax.showGrid(x=True,y=True,alpha=0.3)
@@ -1552,6 +1585,12 @@ class Plotter(QWidget):
         # curves for individual bits (bit index -> PlotDataItem)
         self.ax_result_curves: Dict[int, pg.PlotDataItem] = {}
         self.ax_result.setYRange(0, 1)
+
+        # Now that both plots exist, wire the downsampling controls and apply once.
+        self.downsample_mode_combo.currentIndexChanged.connect(self._apply_downsampling)
+        self.downsample_factor_spin.valueChanged.connect(self._apply_downsampling)
+        self.clip_to_view_chk.toggled.connect(self._apply_downsampling)
+        self._apply_downsampling()
 
         self.error_lbl = QLabel()
         self.error_lbl.setStyleSheet('font-family: monospace')
@@ -1732,6 +1771,27 @@ class Plotter(QWidget):
         """Cap post-trigger packets so pre-trigger + post-trigger fit the sample buffer."""
         pre = self.pretrigger_spin.value()
         self.sample_spin.setMaximum(max(0, MAX_CAPTURE_PACKETS - pre))
+
+    def _apply_downsampling(self, *_):
+        """Apply the GUI downsampling / clip-to-view settings to both plots.
+
+        mode 'Off'        -> draw every point (no decimation).
+        otherwise         -> setDownsampling(mode=<algo>) with either a fixed factor
+                             (spinbox >= 1) or auto-decimation (spinbox == 0, auto=True).
+        """
+        mode = self.downsample_mode_combo.currentText().lower()
+        factor = self.downsample_factor_spin.value()
+        clip = self.clip_to_view_chk.isChecked()
+        # The factor spinbox only makes sense for a fixed factor; grey it out for 'auto'
+        # is handled by the user (0 == auto), so just translate the settings here.
+        for plot in (self.ax, self.ax_result):
+            if mode == 'off':
+                plot.setDownsampling(ds=1, auto=False)
+            elif factor <= 0:
+                plot.setDownsampling(auto=True, mode=mode)
+            else:
+                plot.setDownsampling(ds=factor, auto=False, mode=mode)
+            plot.setClipToView(clip)
 
     def _start_sampling(self):
         n = self.sample_spin.value()
@@ -2737,6 +2797,7 @@ def main(argv):
         global DATA_SOCKET_RCVBUF_BYTES
         global TRIGGER_CAPTURE_MARGIN_PACKETS
         global BUFFER_LENGTH_S, BUFFER_SIZE, MAX_CAPTURE_PACKETS
+        global USE_OPENGL
 
         DEFAULT_FIRST_IP = getattr(ds, 'DEFAULT_FIRST_IP', "192.168.137.100")
         DEFAULT_LEADER = getattr(ds, 'DEFAULT_LEADER', 1)
@@ -2761,6 +2822,19 @@ def main(argv):
                                     f"Valid options: {FIREWALL_PENETRATION_MODES}.")
             FIREWALL_PENETRATION = 'on'
 
+        USE_OPENGL = bool(getattr(ds, 'USE_OPENGL', USE_OPENGL))
+        if USE_OPENGL:
+            # pyqtgraph's GL curve painting (paintGL) needs PyOpenGL; without it the
+            # curves silently fail to draw. Fall back to the CPU painter so the plot
+            # stays visible instead of going blank.
+            try:
+                import OpenGL  # noqa: F401  (PyOpenGL)
+            except ImportError:
+                logging_.logger.warning("USE_OPENGL=True but PyOpenGL is not installed "
+                                        "(pip install PyOpenGL); falling back to the CPU painter.")
+                USE_OPENGL = False
+        pg.setConfigOptions(useOpenGL=USE_OPENGL, enableExperimental=USE_OPENGL)
+
         if sys.platform.startswith('win'):
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling,True)
@@ -2774,7 +2848,7 @@ def main(argv):
         gui_log_handler.setLevel(logging.DEBUG)
         logging_.log_printer.add_handler(gui_log_handler)
         logging_.logger.critical(f"Logging to file: {logging_.log_path}") # This has to be in console, so critical
-        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PRETRIGGER_PACKETS={DEFAULT_PRETRIGGER_PACKETS}, DEFAULT_POSTTRIGGER_PACKETS={DEFAULT_POSTTRIGGER_PACKETS}, PTP_TRIGGER_RING_PACKETS={PTP_TRIGGER_RING_PACKETS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}, DATA_SOCKET_RCVBUF_BYTES={DATA_SOCKET_RCVBUF_BYTES}, TRIGGER_CAPTURE_MARGIN_PACKETS={TRIGGER_CAPTURE_MARGIN_PACKETS}, BUFFER_LENGTH_S={BUFFER_LENGTH_S}, FIREWALL_PENETRATION={FIREWALL_PENETRATION}")
+        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PRETRIGGER_PACKETS={DEFAULT_PRETRIGGER_PACKETS}, DEFAULT_POSTTRIGGER_PACKETS={DEFAULT_POSTTRIGGER_PACKETS}, PTP_TRIGGER_RING_PACKETS={PTP_TRIGGER_RING_PACKETS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}, DATA_SOCKET_RCVBUF_BYTES={DATA_SOCKET_RCVBUF_BYTES}, TRIGGER_CAPTURE_MARGIN_PACKETS={TRIGGER_CAPTURE_MARGIN_PACKETS}, BUFFER_LENGTH_S={BUFFER_LENGTH_S}, FIREWALL_PENETRATION={FIREWALL_PENETRATION}, USE_OPENGL={USE_OPENGL}")
         def start_loop():
             loop=asyncio.SelectorEventLoop()
             asyncio.set_event_loop(loop)
