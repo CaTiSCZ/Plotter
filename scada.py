@@ -353,6 +353,19 @@ class NumpyRing:
             return self._buf[self._start:end].copy()
         return np.concatenate((self._buf[self._start:], self._buf[:end - cap]))
 
+    def tail(self, k:int):
+        """Last ``k`` elements in arrival order (fewer if the ring holds < k), as a
+        contiguous array. O(k) -- avoids materialising the whole buffer the way
+        ``np.asarray(ring)`` / ``list(ring)`` do, for cheap 'recent samples' stats."""
+        if k <= 0 or self._count == 0:
+            return np.empty(0, dtype=self._dtype)
+        k = min(int(k), self._count)
+        start = (self._start + self._count - k) % self._cap
+        end = start + k
+        if end <= self._cap:
+            return self._buf[start:end].copy()
+        return np.concatenate((self._buf[start:], self._buf[:end - self._cap]))
+
     def __array__(self, dtype=None, copy=None):
         arr = self._ordered()
         if dtype is not None:
@@ -2522,7 +2535,7 @@ class Plotter(QWidget):
                     else:
                         trim_end = len(idx)
                     received_full = int(len(idx) // SAMPLES_PER_PACKET)
-                    x = (idx * SAMPLING_PERIOD)[trim:trim_end]
+                    x = idx[trim:trim_end] * SAMPLING_PERIOD
                     avgs = [0] * dev.channels
                     for ch in range(dev.channels):
                         key = (ip, ch)
@@ -2550,7 +2563,11 @@ class Plotter(QWidget):
                             except Exception:
                                 pass
                         # Přepočet pouze pro zobrazení
-                        y = raw * gain + offset
+                        if gain == 1.0 and offset == 0.0:
+                            y = raw
+                        else:
+                            y = raw * gain
+                            y += offset
                         if key not in self.curves:
                             pen = pg.mkPen(Plotter.Colors[len(self.curves)], width=2)
                             curve_name = f'{ip}[{ch}]'
@@ -2561,8 +2578,11 @@ class Plotter(QWidget):
                         avgs[ch] = np.mean(y[-min(len(y), SAMPLES_PER_PACKET * DEFAULT_AVG_LEN_MS):])
                         self.curves[key].setData(x[-len(y):], y)
                 
-                    # Error calculation
-                    errs = ','.join(str(sum(list(buf.error[c])[-SAMPLES_PER_PACKET:])) for c in range(dev.channels))
+                    # Error calculation: only the most recent packet's worth of
+                    # per-sample parity counts is shown, so read just that tail
+                    # instead of materialising the whole (multi-million) ring.
+                    errs = ','.join(str(int(buf.error[c].tail(SAMPLES_PER_PACKET).sum(dtype=np.int64)))
+                                    for c in range(dev.channels))
 
                     # Statistics part
                     received = received_full
@@ -2643,7 +2663,7 @@ class Plotter(QWidget):
                         #self.ax_result.step(x[-len(y_bits):], y_bits, where='post', linewidth=2)
                     
                     # Error calculation
-                    errs = ','.join(str(sum(list(buf.error[c])[-1:])) for c in range(dev.channels))
+                    errs = ','.join(str(int(buf.error[c].tail(1).sum(dtype=np.int64))) for c in range(dev.channels))
 
             # Statistics
             received_counts.append(received)

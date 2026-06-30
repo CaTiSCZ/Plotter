@@ -110,6 +110,19 @@ def test_numpyring_vs_deque():
     ring.clear()
     check("clear() empties", len(ring) == 0 and not ring and list(ring) == [])
 
+    # tail(k): last k in arrival order, equal to np.asarray(ring)[-k:], incl. wrap.
+    tail_ok = True
+    for cap in (7, 64):
+        ring = NumpyRing(cap, np.int16)
+        rng = np.random.default_rng(3)
+        for _ in range(20):
+            ring.extend(rng.integers(-100, 100, size=int(rng.integers(0, cap + 3))).tolist())
+        full = np.asarray(ring)
+        for k in (0, 1, 3, cap, cap + 5):
+            if not arr_eq(ring.tail(k), full[len(full) - min(k, len(full)):] if k > 0 else full[:0]):
+                tail_ok = False
+    check("tail(k) == asarray[-k:] (incl. wrap)", tail_ok)
+
 
 # --- shared plot/CSV consumer pipeline replicas --------------------------------
 def node_plot_pipeline(buf, channels, pretrigger_packets, samples_awaited, tsi):
