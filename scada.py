@@ -1476,15 +1476,23 @@ class Plotter(QWidget):
         btns.addWidget(self.system_stop_btn)
         self.system_status_lbl = QLabel('System: —')
         self.system_status_lbl.setStyleSheet('font-family: monospace')
+        # Fixed width so the buttons after it don't shift as the status text changes
+        # length. Sized to a representative long status string.
+        self.system_status_lbl.setFixedWidth(
+            self.system_status_lbl.fontMetrics().horizontalAdvance('System: state unknown (no response)') + 8)
         btns.addWidget(self.system_status_lbl)
 
-        btns.addWidget(QLabel('Pre-trigger packets:'))
+        pretrigger_lbl = QLabel('Pre-trigger packets:')
+        pretrigger_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        btns.addWidget(pretrigger_lbl)
         self.pretrigger_spin = QSpinBox()
         self.pretrigger_spin.setRange(0, PTP_TRIGGER_RING_PACKETS)
         self.pretrigger_spin.setValue(0)
         btns.addWidget(self.pretrigger_spin)
 
-        btns.addWidget(QLabel('Post-trigger packets:'))
+        posttrigger_lbl = QLabel('Post-trigger packets:')
+        posttrigger_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        btns.addWidget(posttrigger_lbl)
         self.sample_spin = QSpinBox()
         self.sample_spin.setRange(0, MAX_CAPTURE_PACKETS)
         self.sample_spin.setValue(10)
@@ -1519,7 +1527,9 @@ class Plotter(QWidget):
         # cost for multi-million-sample traces. 'mode' picks the algorithm; the
         # factor spinbox is the fixed decimation factor, or 0 to let pyqtgraph pick
         # it automatically from the visible pixel width (auto=True).
-        btns.addWidget(QLabel('Downsample:'))
+        downsample_lbl = QLabel('Downsample:')
+        downsample_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        btns.addWidget(downsample_lbl)
         self.downsample_mode_combo = QComboBox()
         self.downsample_mode_combo.addItems(['Off', 'Subsample', 'Mean', 'Peak'])
         self.downsample_mode_combo.setCurrentText('Peak')
