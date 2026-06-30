@@ -53,7 +53,7 @@ from fdds.protocol import (
 from fdds.crc import crc16_ccitt
 
 APPLICATION_NAME = 'Eaton FDDS SCADA'
-APPLICATION_VERSION = '1.12.0'
+APPLICATION_VERSION = '1.13.0'
 APPLICATION_TITLE = f"{APPLICATION_NAME} v{APPLICATION_VERSION}"
 
 # Constants (protocol-level values sourced from the shared fdds core)
