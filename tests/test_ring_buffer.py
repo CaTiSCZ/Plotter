@@ -352,6 +352,63 @@ def test_csv_result():
         check(f"result csv identical (trim={trim})", old == newv)
 
 
+# --- 5. incremental plot ordering vs full stable argsort -----------------------
+def test_plot_sort_order():
+    print("test_plot_sort_order")
+    rng = np.random.default_rng(11)
+    SP = 5                      # samples per synthetic "packet"
+    margin = 2 * SP             # re-sort window overlap (>= max reorder distance)
+
+    # Build an arrival-order packet stream; each packet = SP consecutive indices.
+    # Occasionally swap two adjacent packets (a single local UDP reorder, <= SP).
+    bases, i = list(range(40)), 0
+    arrival = []
+    while i < len(bases):
+        if i + 1 < len(bases) and rng.random() < 0.25:
+            arrival += [bases[i + 1], bases[i]]; i += 2
+        else:
+            arrival.append(bases[i]); i += 1
+
+    # Stream in growing chunks (append-only), recomputing the order incrementally.
+    state, idx0, eff, ok = None, np.empty(0, np.int64), np.empty(0, np.int64), True
+    pkt = 0
+    while pkt < len(arrival):
+        take = int(rng.integers(1, 4))
+        for b in arrival[pkt:pkt + take]:
+            idx0 = np.concatenate((idx0, np.arange(b * SP, b * SP + SP, dtype=np.int64)))
+        pkt += take
+        order, state = scada.plot_sort_order(idx0, state, margin=margin)
+        eff = np.arange(idx0.size) if order is None else order
+        if not np.array_equal(eff, np.argsort(idx0, kind='stable')):
+            ok = False
+    check("incremental order == full stable argsort", ok)
+    check("final reordered idx is fully sorted",
+          np.array_equal(idx0[eff], np.sort(idx0, kind='stable')))
+
+    # In-order stream must stay on the identity (None) fast path the whole way.
+    state, idx0, all_none = None, np.empty(0, np.int64), True
+    for b in range(20):
+        idx0 = np.concatenate((idx0, np.arange(b * SP, b * SP + SP, dtype=np.int64)))
+        order, state = scada.plot_sort_order(idx0, state, margin=margin)
+        all_none = all_none and order is None
+    check("in-order stream stays identity (None)", all_none)
+
+    # Reset / shrink must transparently fall back to a full sort.
+    a = np.array([50, 10, 30, 20, 40], dtype=np.int64)
+    order, st = scada.plot_sort_order(a, None, margin=margin)
+    check("reset full sort matches argsort",
+          np.array_equal(order, np.argsort(a, kind='stable')))
+    short = np.array([2, 0, 1], dtype=np.int64)
+    order2, _ = scada.plot_sort_order(short, st, margin=margin)
+    check("shrink triggers full sort",
+          np.array_equal(order2, np.argsort(short, kind='stable')))
+
+    # Duplicate indices: an ascending run with repeats is identity (stable).
+    dup = np.array([0, 0, 1, 1, 1, 2], dtype=np.int64)
+    o, _ = scada.plot_sort_order(dup, None, margin=margin)
+    check("ascending duplicates -> identity (None)", o is None)
+
+
 def main():
     test_numpyring_vs_deque()
     test_node_capture("in_order", list(range(10)))
@@ -362,6 +419,7 @@ def main():
     test_result_capture()
     test_csv_node()
     test_csv_result()
+    test_plot_sort_order()
     print()
     if _fail:
         print(f"FAILED: {_fail} check(s) failed")

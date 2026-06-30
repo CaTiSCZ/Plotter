@@ -74,6 +74,13 @@ ACQUISITION_CHANNELS = FDDS_ACQUISITION_CHANNELS # CCU result packet: ADC channe
 BUFFER_LENGTH_S    = 30
 BUFFER_SIZE        = int(BUFFER_LENGTH_S*SAMPLES_PER_PACKET*PACKET_RATE_HZ)
 MAX_CAPTURE_PACKETS = BUFFER_SIZE // SAMPLES_PER_PACKET  # max pre+post packets that fit the sample buffer
+# Plot re-sorting overlap. The per-sample time-index column is appended in packet
+# ARRIVAL order, so UDP reordering leaves only LOCAL inversions near where packets
+# joined. The buffer is append-only within a capture, so each frame we only re-check
+# (and, if needed, re-sort) the newly arrived tail plus this much overlap before it,
+# instead of argsort-ing the whole multi-million-sample buffer every frame. Must be
+# >= the worst-case packet reordering distance; 100 ms (=100 packets) is generous.
+PLOT_SORT_MARGIN_SAMPLES = max(SAMPLES_PER_PACKET, int(round(0.1 / SAMPLING_PERIOD)))
 DEFAULT_AVG_LEN_MS = 1000 # could be overwritten by default_settings.py
 CCU_DEVICE_INDEX   = 0
 DEFAULT_SOCKET_BACKEND = 'auto'
@@ -405,6 +412,71 @@ class DeviceBuffer:
             self.result_parity_errors.extend([parity_errors]*len(t))
             self.result_crc_error_mask.extend([crc_error_mask]*len(t))
             self.revision += 1
+
+
+def _is_sorted(a) -> bool:
+    """True if the 1-D array is non-decreasing (a[i] <= a[i+1] for all i)."""
+    return a.size < 2 or bool(np.all(a[1:] >= a[:-1]))
+
+
+def plot_sort_order(idx0, state, margin=PLOT_SORT_MARGIN_SAMPLES):
+    """Stable argsort of an append-only, locally-reordered index column, computed
+    incrementally so each call only sorts the newly appended tail plus ``margin``
+    samples of overlap (the junction) instead of the whole buffer.
+
+    ``idx0`` is the current arrival-order index array (1-D, integer). ``state`` is
+    the dict returned by the previous call for the same device (or ``None`` on the
+    first call / after a reset). Returns ``(order, new_state)`` where ``order`` is
+    either:
+      * ``None`` -- ``idx0`` is already ascending, so the identity order applies and
+        the caller can skip reordering entirely (the common case), or
+      * an int ``ndarray`` permutation mapping sorted position -> raw arrival index,
+        byte-for-byte equal to ``np.argsort(idx0, kind='stable')`` as long as no
+        packet was reordered by more than ``margin`` samples.
+
+    Correctness relies on the column being append-only (detected via endpoint
+    sentinels); any non-append change (clear, ring wrap, shrink) transparently
+    falls back to a full sort.
+    """
+    n = int(idx0.size)
+    if n == 0:
+        return None, {'n': 0, 'first': 0, 'last': 0, 'order': None}
+
+    append_ok = (state is not None and state['n'] > 0 and n >= state['n']
+                 and idx0[0] == state['first'] and idx0[state['n'] - 1] == state['last'])
+
+    def _state(order):
+        return {'n': n, 'first': int(idx0[0]), 'last': int(idx0[n - 1]), 'order': order}
+
+    if not append_ok:
+        order = None if _is_sorted(idx0) else np.argsort(idx0, kind='stable')
+        return order, _state(order)
+
+    prev_n = state['n']
+    if n == prev_n:                      # nothing appended since last frame
+        return state['order'], state
+    prev_order = state['order']
+    lo = max(0, prev_n - margin)         # start of the region that may still move
+
+    if prev_order is None:
+        # The whole previous buffer was already sorted (identity). If appending the
+        # new tail keeps it sorted across the junction, it stays identity.
+        window = idx0[lo:]
+        joins = (lo == 0) or (window[0] >= idx0[lo - 1])
+        if joins and _is_sorted(window):
+            return None, _state(None)
+        keep_head = np.arange(lo)
+        tail_old = np.arange(lo, prev_n)
+    else:
+        keep_head = prev_order[:max(0, prev_n - margin)]
+        tail_old = prev_order[max(0, prev_n - margin):]
+
+    new_raw = np.arange(prev_n, n)
+    combine = np.concatenate((tail_old, new_raw))
+    w = np.argsort(idx0[combine], kind='stable')
+    order = np.concatenate((keep_head, combine[w]))
+    return order, _state(order)
+
 
 # Async UDP socket
 class AsyncSocket:
@@ -1451,6 +1523,9 @@ class Plotter(QWidget):
         # Last per-device buffer.revision drawn; used to skip redundant redraws when
         # no new data has arrived since the previous frame. None forces the first draw.
         self._plot_revisions = None
+        # Per-device incremental sort state for plot_sort_order(): each frame only the
+        # newly appended tail (+ overlap) is re-sorted instead of the whole buffer.
+        self._sort_state: Dict[str, dict] = {}
 
         # Detection plot
         self.plot_widget.nextRow()  # move to next row in the graphics layout
@@ -2213,6 +2288,7 @@ class Plotter(QWidget):
         self.ax_result.clear()
         self.ax_result_curves.clear()
 
+        self._sort_state.clear()
         self._update_plot(force=True)
         self._logger.info('Graf cleaned')
     
@@ -2419,17 +2495,22 @@ class Plotter(QWidget):
             with buf.lock:
                 # Data processing
                 if (dev_index != CCU_DEVICE_INDEX):
-                    idx = np.array(buf.signal[0], dtype=float)
+                    idx0 = np.asarray(buf.signal[0])
+                    # Sort the per-sample buffer by time so a late/replayed packet
+                    # around the trigger cannot draw a zig-zag at the pre/post
+                    # boundary. The column is append-only and only locally reordered,
+                    # so this is done incrementally (new tail + overlap) and returns
+                    # None whenever the data is already ordered (the common case).
+                    order_perm, self._sort_state[ip] = plot_sort_order(
+                        idx0, self._sort_state.get(ip))
+                    idx = idx0.astype(float)
                     tsi = dev.trigger_sample_index()
                     if tsi is not None:
                         # Shift so the trigger sample sits at t = 0 (per-sample, on
                         # the unified buffer rather than per packet).
                         idx -= tsi
-                    # Stable-sort the per-sample buffer by time so a late/replayed
-                    # packet around the trigger cannot draw a zig-zag at the pre/post
-                    # boundary; then drop samples before the pre-trigger window.
-                    order_perm = np.argsort(idx, kind='stable')
-                    idx = idx[order_perm]
+                    if order_perm is not None:
+                        idx = idx[order_perm]
                     if tsi is not None:
                         trim = int(np.searchsorted(idx, -dev.pretrigger_packets * SAMPLES_PER_PACKET, side='left'))
                     else:
@@ -2449,7 +2530,10 @@ class Plotter(QWidget):
                             self.curves[key] = self.ax.plot(pen=Plotter.Colors[len(self.curves)], name=f'{ip}[{ch}]')
 
                         #y = np.array(buf.signal[ch + 1])[-len(x):]
-                        raw = np.array(buf.signal[ch + 1], dtype=float)[order_perm][trim:trim_end]
+                        raw = np.array(buf.signal[ch + 1], dtype=float)
+                        if order_perm is not None:
+                            raw = raw[order_perm]
+                        raw = raw[trim:trim_end]
                         # Kalibrace z ID paketu
                         gain = 1.0
                         offset = 0.0
