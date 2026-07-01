@@ -5,6 +5,46 @@ import time
 import traceback
 import logging
 import logger
+import sys
+
+# Windows thread priority constants (mirror of the C++ backend). Exposed at module
+# level so callers can use the same names regardless of which backend is active.
+THREAD_PRIORITY_IDLE = -15
+THREAD_PRIORITY_LOWEST = -2
+THREAD_PRIORITY_BELOW_NORMAL = -1
+THREAD_PRIORITY_NORMAL = 0
+THREAD_PRIORITY_ABOVE_NORMAL = 1
+THREAD_PRIORITY_HIGHEST = 2
+THREAD_PRIORITY_TIME_CRITICAL = 15
+
+_THREAD_PRIORITY_ERROR_RETURN = 0x7FFFFFFF
+
+
+def _set_win_thread_priority(handle, priority):
+    """Set priority on a Windows thread HANDLE. Returns the OS-reported priority,
+    or the requested value on non-Windows / on failure."""
+    if sys.platform != "win32":
+        return priority
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    kernel32.GetThreadPriority.argtypes = [ctypes.c_void_p]
+    if not kernel32.SetThreadPriority(ctypes.c_void_p(handle), priority):
+        return priority
+    actual = kernel32.GetThreadPriority(ctypes.c_void_p(handle))
+    return priority if actual == _THREAD_PRIORITY_ERROR_RETURN else actual
+
+
+def _set_current_thread_priority(priority):
+    """Raise the calling thread's scheduling priority (Windows only, else no-op)."""
+    if sys.platform != "win32":
+        return priority
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetCurrentThread.restype = ctypes.c_void_p
+    # GetCurrentThread() returns a pseudo-handle usable without closing.
+    handle = kernel32.GetCurrentThread()
+    return _set_win_thread_priority(handle, priority)
 
 
 class BufferedSocket:
@@ -25,6 +65,9 @@ class BufferedSocket:
         self._timeout = 1
         self._received_count = 0
         self._recv_buffer_bytes = 16 * 1024 * 1024
+        # Scheduling priority applied to the listener thread. Raising it above
+        # normal keeps the OS UDP receive buffer drained promptly under load.
+        self._listener_priority = THREAD_PRIORITY_ABOVE_NORMAL
         self.name = name
 
     def bind(self, port: int, use_my_ip: bool = False, device_ip: str = "192.168.1.100", device_port: int = 9999): 
@@ -80,6 +123,9 @@ class BufferedSocket:
         self._addr = None
 
     def _listen_loop(self):
+        # Raise this thread's scheduling priority so it is serviced promptly under
+        # load, keeping the kernel UDP receive buffer drained and reducing loss.
+        _set_current_thread_priority(self._listener_priority)
         while self._running:
             try:
                 data, addr = self._sock.recvfrom(self.max_size)
@@ -136,6 +182,30 @@ class BufferedSocket:
         if self._sock:
             return self._apply_recv_buffer()
         return self._recv_buffer_bytes
+
+    def set_listener_priority(self, priority):
+        """Set the scheduling priority of the listener thread (one of the
+        THREAD_PRIORITY_* values). Applies immediately if the thread is running and
+        is re-applied whenever the listener starts. Returns the priority the OS
+        reports (or the requested value on non-Windows / if the thread isn't running)."""
+        self._listener_priority = int(priority)
+        t = self._listener_thread
+        if sys.platform == "win32" and t is not None and t.is_alive() and t.native_id:
+            import ctypes
+            THREAD_SET_INFORMATION = 0x0020
+            THREAD_QUERY_INFORMATION = 0x0040
+            kernel32 = ctypes.windll.kernel32
+            kernel32.OpenThread.restype = ctypes.c_void_p
+            kernel32.OpenThread.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            handle = kernel32.OpenThread(
+                THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, False, t.native_id)
+            if handle:
+                try:
+                    return _set_win_thread_priority(handle, self._listener_priority)
+                finally:
+                    kernel32.CloseHandle(handle)
+        return self._listener_priority
         
     def recvfrom(self, bufsize):
         try:

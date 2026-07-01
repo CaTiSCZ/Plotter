@@ -62,11 +62,21 @@ PYBIND11_MODULE(buffered_socket_cpp, m) {
         })
         .def("settimeout", &BufferedSocket::settimeout)
         .def("set_recv_buffer", &BufferedSocket::set_recv_buffer, py::arg("bytes"))
+        .def("set_listener_priority", &BufferedSocket::set_listener_priority, py::arg("priority"))
         .def("get_received_count", &BufferedSocket::get_received_count)
         .def("get_buffered_items_count", &BufferedSocket::get_buffered_items_count)
         .def("__bool__", [](const BufferedSocket& self) {
             return self.sock_ != INVALID_SOCKET && self.running_;
         });
+
+    // Windows thread priority constants for use with set_listener_priority().
+    m.attr("THREAD_PRIORITY_IDLE") = (int)THREAD_PRIORITY_IDLE;
+    m.attr("THREAD_PRIORITY_LOWEST") = (int)THREAD_PRIORITY_LOWEST;
+    m.attr("THREAD_PRIORITY_BELOW_NORMAL") = (int)THREAD_PRIORITY_BELOW_NORMAL;
+    m.attr("THREAD_PRIORITY_NORMAL") = (int)THREAD_PRIORITY_NORMAL;
+    m.attr("THREAD_PRIORITY_ABOVE_NORMAL") = (int)THREAD_PRIORITY_ABOVE_NORMAL;
+    m.attr("THREAD_PRIORITY_HIGHEST") = (int)THREAD_PRIORITY_HIGHEST;
+    m.attr("THREAD_PRIORITY_TIME_CRITICAL") = (int)THREAD_PRIORITY_TIME_CRITICAL;
 }
 
 /*

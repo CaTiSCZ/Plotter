@@ -32,10 +32,15 @@ public:
     // Default OS UDP receive buffer (16 MiB) - large enough to absorb a burst of
     // packets while the consumer is briefly blocked (e.g. the trigger flush).
     static constexpr int kDefaultRecvBufferBytes = 16 * 1024 * 1024;
+    // Default scheduling priority for the receive thread. Raising it above normal
+    // makes the OS service the recv thread promptly under load, so the kernel UDP
+    // buffer is drained quickly and fewer datagrams are dropped.
+    static constexpr int kDefaultListenerPriority = THREAD_PRIORITY_ABOVE_NORMAL;
     BufferedSocket(int max_size = 4096, const std::string& name = "BufferedSocket")
         : max_size_(max_size), running_(false), sock_(INVALID_SOCKET),
           timeout_(1.0), received_count_(0), name_(name),
-          recv_buffer_bytes_(kDefaultRecvBufferBytes)
+          recv_buffer_bytes_(kDefaultRecvBufferBytes),
+          listener_priority_(kDefaultListenerPriority)
     {}
 
     ~BufferedSocket() {
@@ -188,6 +193,21 @@ public:
         return actual;
     }
 
+    // Set the Windows scheduling priority of the receive thread (one of the
+    // THREAD_PRIORITY_* values). Applies immediately if the thread is running and
+    // is re-applied whenever the listener starts. Returns the priority the OS
+    // reports for the thread (or the requested value if the thread is not running).
+    int set_listener_priority(int priority) {
+        listener_priority_ = priority;
+        if (listener_thread_.joinable()) {
+            SetThreadPriority(listener_thread_.native_handle(), priority);
+            int actual = GetThreadPriority(listener_thread_.native_handle());
+            if (actual != THREAD_PRIORITY_ERROR_RETURN)
+                return actual;
+        }
+        return priority;
+    }
+
     SOCKET sock_;
     std::atomic<bool> running_;
 
@@ -201,6 +221,10 @@ private:
     }
 
     void listen_loop() {
+        // Raise this thread's scheduling priority so it is serviced promptly under
+        // load, keeping the kernel UDP receive buffer drained and reducing loss.
+        SetThreadPriority(GetCurrentThread(), listener_priority_.load());
+
         while (running_) {
             SOCKET sock_local = INVALID_SOCKET;
             {
@@ -282,6 +306,7 @@ private:
     int received_count_;
     std::string name_;
     int recv_buffer_bytes_;
+    std::atomic<int> listener_priority_;
 };
 
 } // namespace bufferred_socket
