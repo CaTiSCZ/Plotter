@@ -1606,17 +1606,30 @@ class Plotter(QWidget):
         self.error_lbl.setStyleSheet('font-family: monospace')
         root.addWidget(self.error_lbl)
 
+        # Collapsible log pane: a toggle button lets the user hide the log so it
+        # doesn't take up graph area during normal operation.
+        self.log_toggle_btn = QPushButton()
+        self.log_toggle_btn.setCheckable(True)
+        self.log_toggle_btn.setFlat(True)
+        self.log_toggle_btn.setStyleSheet('text-align:left; padding:2px')
+        self.log_toggle_btn.toggled.connect(self._toggle_log)
+        root.addWidget(self.log_toggle_btn)
+
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setLineWrapMode(QTextEdit.NoWrap)
         self.log_output.setStyleSheet('font-family: monospace; background:#f0f0f0')
-        
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.log_output)
-        root.addWidget(scroll)
+
+        self.log_scroll = QScrollArea()
+        self.log_scroll.setWidgetResizable(True)
+        self.log_scroll.setWidget(self.log_output)
+        root.addWidget(self.log_scroll)
 
         self.log_signal.connect(self.log_output.append)
+
+        # Start collapsed so the graph gets the full area during normal operation.
+        self.log_toggle_btn.setChecked(False)
+        self._toggle_log(False)
 
         # Not needed
         #penetrator = QTimer(self)
@@ -1636,6 +1649,11 @@ class Plotter(QWidget):
     def closeEvent(self, event):
         self.manager.shutdown()
         super().closeEvent(event)
+
+    def _toggle_log(self, checked: bool):
+        """Show or hide the log pane. When hidden the graph reclaims the space."""
+        self.log_scroll.setVisible(checked)
+        self.log_toggle_btn.setText(('▼' if checked else '▶') + ' Log')
 
     def _check_order(self, ip:str, order:int):
         last = self.last_order.get(ip)
