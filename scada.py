@@ -622,10 +622,11 @@ class Device:
         self.ip, self.cmd_port, self.data_port, self.loop = ip,cmd_port,data_port,loop
         self.manager = manager
         self.channels = 2
+        self.result_channels = 2
         self.cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.cmd_sock.settimeout(RECV_TIMEOUT_S)
         self.cmd_sock.connect((ip, cmd_port))
-        self.buffer = DeviceBuffer(self.channels)
+        self.buffer = DeviceBuffer(max(self.channels, self.result_channels))
         self.id = int(ip.split('.')[3])
         self.header_struct = struct.Struct('<HH')
         self.silent_ping = False
@@ -674,8 +675,9 @@ class Device:
                 self._logger.warning(f"Dev {self.ip} returned ID packet with incorrect CRC.")
                 return None
             info = parse_id_packet(pkt)
-            self.channels = info['channels_count']
-            self.buffer = DeviceBuffer(self.channels)
+            self.channels = int(info['channels_count'])
+            self.result_channels = int(info.get('fault_state_count', self.channels))
+            self.buffer = DeviceBuffer(max(self.channels, self.result_channels))
             self.info = info
             return info
         except Exception as e:
@@ -1092,7 +1094,7 @@ class Device:
                 result_code = struct.unpack('<H', data[val_off:val_off+2])[0]
                 samples = []
 
-                for bit_idx in range(self.channels):
+                for bit_idx in range(self.result_channels):
                     bit_vals = (result_code >> bit_idx) & 1
                     samples.append([bit_vals])
 
@@ -1111,8 +1113,10 @@ class Device:
                 fault_state = struct.unpack(f'<{GATHERING_DEVICES}H', data[fs_off:fl_off])
                 parity_errors = tuple(data[pe_off:cem_off])
                 crc_error_mask = data[cem_off] if cem_off < len(data) else 0
-                # errs feeds the per-channel GUI error label (first self.channels values used).
-                errs = list(parity_errors)
+                # Map packet parity counters to displayed result channels.
+                errs = list(parity_errors[:self.result_channels])
+                if len(errs) < self.result_channels:
+                    errs.extend([0] * (self.result_channels - len(errs)))
 
                 self.loop.call_soon_threadsafe(self.buffer.extend_result, t, samples, errs,
                                                ptp, fault_state, fault_latched, parity_errors, crc_error_mask)
@@ -1618,8 +1622,9 @@ class Plotter(QWidget):
         self.ax_result.addLegend()
         # Link x-axis so both plots share the same time base and zoom/pan together
         self.ax_result.setXLink(self.ax)
-        # curves for individual bits (bit index -> PlotDataItem)
-        self.ax_result_curves: Dict[int, pg.PlotDataItem] = {}
+        # Curves for detection-result bits keyed by (source, bit index), e.g.
+        # ('ccu', 0) or ('node2', 1).
+        self.ax_result_curves: Dict[Tuple[str, int], pg.PlotDataItem] = {}
         self.ax_result.setYRange(0, 1)
 
         # Now that both plots exist, wire the downsampling controls and apply once.
@@ -2485,7 +2490,6 @@ class Plotter(QWidget):
                 # trim below, so only the kept rows are ever turned into python ints.
                 times_a = np.asarray(dev.buffer.time)
                 ptp_a = np.asarray(dev.buffer.ptp)
-                signals_a = [np.asarray(dev.buffer.signal[c + 1]) for c in range(dev.channels)]
                 result_fault_state = list(dev.buffer.result_fault_state)
                 result_fault_latched = list(dev.buffer.result_fault_latched)
                 result_parity_errors = list(dev.buffer.result_parity_errors)
@@ -2493,6 +2497,8 @@ class Plotter(QWidget):
 
             # CCU devices carry per-result-packet metadata; nodes leave these empty.
             has_result_meta = bool(result_crc_error_mask)
+            csv_channels = dev.result_channels if has_result_meta else dev.channels
+            signals_a = [np.asarray(dev.buffer.signal[c + 1]) for c in range(csv_channels)]
 
             # Node buffers store one sample per row (5 us step); the CCU result buffer
             # stores one result packet per row (1 ms step).
@@ -2542,7 +2548,7 @@ class Plotter(QWidget):
 
             with open(tmp_name, 'w', newline='') as f:
                 w = csv.writer(f)
-                header = ['time', 'ptp_ns'] + [f'ch{c}' for c in range(dev.channels)]
+                header = ['time', 'ptp_ns'] + [f'ch{c}' for c in range(csv_channels)]
                 if has_result_meta:
                     n_fault = GATHERING_DEVICES
                     n_parity = GATHERING_DEVICES * ACQUISITION_CHANNELS
@@ -2562,7 +2568,7 @@ class Plotter(QWidget):
                     sig_lists = [s.tolist() for s in signals_a]
                     rows = []
                     for i in np.nonzero(keep)[0].tolist():
-                        row = [sig_lists[ch][i] for ch in range(dev.channels)]
+                        row = [sig_lists[ch][i] for ch in range(csv_channels)]
                         row += list(result_fault_state[i])
                         row += list(result_fault_latched[i])
                         row += list(result_parity_errors[i])
@@ -2580,7 +2586,7 @@ class Plotter(QWidget):
                     ptp_list = ptp_a[keep].tolist()
                     sig_lists = [s[keep].tolist() for s in signals_a]
                     if t_shift_list:
-                        tmpl = '%.6f,' + ','.join(['%d'] * (dev.channels + 1))
+                        tmpl = '%.6f,' + ','.join(['%d'] * (csv_channels + 1))
                         lines = [tmpl % row for row in zip(t_shift_list, ptp_list, *sig_lists)]
                         f.write('\r\n'.join(lines))
                         f.write('\r\n')
@@ -2767,30 +2773,49 @@ class Plotter(QWidget):
                         received = int((trim_end - trim) // SAMPLES_PER_PACKET)
 
                     avgs = [0]  # Dummy for uniform output
-                    center = (dev.channels - 1) / 2.0
                     offset_step = 0.05  # vertical spacing between bit lines
-                    # Use first data channel (signal[1]) as byte source
-                    #y_src = np.array(buf.signal[1])[-len(x):]
-                    # Convert to unsigned bytes; mask to 16 bits
-                    #byte_values = y_src.astype(np.int32) & 0xFFFF
-                    for bit_idx in range(dev.channels):
-                        if bit_idx not in self.ax_result_curves:
+
+                    # Build all displayed digital series: CCU output bits from
+                    # result_code (stored in signal[]) + per-node fault_state bits
+                    # carried in RESULT metadata.
+                    series: List[Tuple[Tuple[str, int], str, np.ndarray]] = []
+
+                    # CCU digital outputs (legacy plotting path).
+                    for bit_idx in range(dev.result_channels):
+                        y_pkt = np.array(buf.signal[bit_idx + 1], dtype=float)
+                        series.append((("ccu", bit_idx), f'ccu_bit{bit_idx}', y_pkt))
+
+                    # Node digital outputs from fault_state[node_idx] bitfields.
+                    node_devices = [(i, ip_n, dev_n) for i, (ip_n, dev_n) in enumerate(self.manager.devices.items())
+                                    if i != CCU_DEVICE_INDEX]
+                    fault_state_rows = list(buf.result_fault_state)
+                    if fault_state_rows:
+                        fault_state_arr = np.asarray(fault_state_rows, dtype=np.uint16)
+                        if fault_state_arr.ndim == 1:
+                            fault_state_arr = fault_state_arr.reshape(-1, 1)
+                        node_slots = min(fault_state_arr.shape[1], len(node_devices))
+                        for node_idx in range(node_slots):
+                            node_ip = node_devices[node_idx][1]
+                            node_dev = node_devices[node_idx][2]
+                            node_bits = int(getattr(node_dev, 'result_channels', 0))
+                            node_word = fault_state_arr[:, node_idx]
+                            for bit_idx in range(node_bits):
+                                y_pkt = ((node_word >> bit_idx) & 1).astype(float)
+                                series.append(((f"node{node_idx}", bit_idx), f'{node_ip}_bit{bit_idx}', y_pkt))
+
+                    center = (len(series) - 1) / 2.0 if series else 0.0
+                    for series_idx, (curve_key, curve_name, y_pkt) in enumerate(series):
+                        if curve_key not in self.ax_result_curves:
                             color = Plotter.Colors[len(self.ax_result_curves) % len(Plotter.Colors)]
-                            self.ax_result_curves[bit_idx] = self.ax_result.plot(pen=color, name=f'bit{bit_idx}')
-                            #self.ax_result_curves[bit_idx] = self.ax_result.step(pen=color, where='post', name=f'bit{bit_idx}')
+                            self.ax_result_curves[curve_key] = self.ax_result.plot(pen=color, name=curve_name)
 
-                        #bit_vals = ((byte_values >> bit_idx) & 1).astype(float)
-                        y = np.array(buf.signal[bit_idx + 1], dtype=float)
-                        y = np.repeat(y, SAMPLES_PER_PACKET) # Y interpolation - steps
-                        # Slight offset so bits with same logical value are still visible
-                        offset = (bit_idx - center) * offset_step
+                        y = np.repeat(y_pkt, SAMPLES_PER_PACKET)  # Y interpolation - steps
+                        offset = (series_idx - center) * offset_step
                         y_bits = (y + offset)[trim:trim_end]
-
-                        self.ax_result_curves[bit_idx].setData(x[-len(y_bits):], y_bits)
-                        #self.ax_result.step(x[-len(y_bits):], y_bits, where='post', linewidth=2)
+                        self.ax_result_curves[curve_key].setData(x[-len(y_bits):], y_bits)
                     
                     # Error calculation
-                    errs = ','.join(str(int(buf.error[c].tail(1).sum(dtype=np.int64))) for c in range(dev.channels))
+                    errs = ','.join(str(int(buf.error[c].tail(1).sum(dtype=np.int64))) for c in range(dev.result_channels))
 
             # Statistics
             received_counts.append(received)
