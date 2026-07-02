@@ -2605,10 +2605,20 @@ class Plotter(QWidget):
         #exporter_data.export(png_data)
 
         png_name = f"{base}.png"
-        # Export celé GUI části s oběma grafy pod sebou
+        # Export celé GUI části s oběma grafy pod sebou.
+        # On some systems grab() can leave the viewport visually stale until
+        # the next input event, so flush paints before grabbing and force a
+        # repaint right after saving.
+        self.plot_widget.viewport().repaint()
+        QApplication.processEvents()
         pixmap = self.plot_widget.grab()
         if not pixmap.save(png_name, "PNG"):
             raise RuntimeError(f"Nepodařilo se uložit obrázek {png_name}.")
+
+        self.plot_widget.viewport().update()
+        self.plot_widget.update()
+        self._update_plot(force=True)
+        QApplication.processEvents()
 
         if strict:
             if not os.path.exists(png_name):
