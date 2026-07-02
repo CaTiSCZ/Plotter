@@ -161,7 +161,9 @@ class STRUCT:
     """Binary struct formats for FDDS protocol packets."""
     CMD = struct.Struct("<I")
     ACK = struct.Struct("<HHI")             # packet_type, state, cmd
-    ID = struct.Struct("<HH HBB HBBI3I HBBI HH") # last HH = channels_count + _reserved
+    ID_V4 = struct.Struct("<HH HBB HBBI3I HBBI HH") # last HH = channels_count + _reserved
+    ID_V5 = struct.Struct("<HH HBB HBBI3I HBBI HBB") # channels_count + fault counts
+    ID = ID_V4
     CHANNEL = struct.Struct("<4s ff")       # unit(4 bytes), offset, gain
     CRC = struct.Struct("<H")
     FW_INFO = struct.Struct("<HBB I 8s 30s 48s BB H 2x I I")  # fw_info_t (108 bytes)
@@ -188,7 +190,8 @@ ACK_PACKET_HEADER_SIZE = 8  # packet_type(2) + state(2) + cmd(4)
 LOG_PACKET_HEADER_SIZE = 4  # packet_type(2) + msg_counter(2)
 
 
-def data_packet_size(channels: int, samples: int = SAMPLES_PER_PACKET) -> int:
+def data_packet_size(channels: int, samples: int = SAMPLES_PER_PACKET,
+                     new_format: bool = False) -> int:
     """Calculate data_packet_t wire size for given channel/sample count."""
     padding = channels % 2
     return (
@@ -200,12 +203,14 @@ def data_packet_size(channels: int, samples: int = SAMPLES_PER_PACKET) -> int:
         + channels                  # parity_errors[channels]
         + padding                   # padding for alignment
         + 2                         # fault_state
+        + (2 if new_format else 0)  # fault_latched (FW v5+)
         + 2                         # crc
     )
 
 
 def result_packet_size(gathering_devices: int = GATHERING_DEVICES,
-                       channels: int = ACQUISITION_CHANNELS) -> int:
+                       channels: int = ACQUISITION_CHANNELS,
+                       new_format: bool = False) -> int:
     """Calculate result_packet_t wire size."""
     return (
         2                                   # packet_type
@@ -214,6 +219,7 @@ def result_packet_size(gathering_devices: int = GATHERING_DEVICES,
         + 4                                 # ptp_nanoseconds
         + 2                                 # value
         + gathering_devices * 2             # fault_state[GATHERING_DEVICES] (uint16 per node)
+        + (gathering_devices * 2 if new_format else 0)  # fault_latched[GATHERING_DEVICES] (FW v5+)
         + gathering_devices * channels      # parity_errors[GATHERING_DEVICES][ACQUISITION_CHANNELS]
         + 1                                 # crc_error_mask (bit per node)
         + 1                                 # missing_mask (bit per node)

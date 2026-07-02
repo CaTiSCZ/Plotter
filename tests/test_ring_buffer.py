@@ -35,6 +35,7 @@ class RefBuffer:
         self.error = [deque(maxlen=cap) for _ in range(channels)]
         self.ptp = deque(maxlen=cap)
         self.result_fault_state = deque(maxlen=cap)
+        self.result_fault_latched = deque(maxlen=cap)
         self.result_parity_errors = deque(maxlen=cap)
         self.result_crc_error_mask = deque(maxlen=cap)
 
@@ -46,7 +47,7 @@ class RefBuffer:
         self.signal[0].extend(t)
         self.ptp.extend(ptp)
 
-    def extend_result(self, t, samples, errs, ptp, fault_state, parity_errors, crc_error_mask):
+    def extend_result(self, t, samples, errs, ptp, fault_state, fault_latched, parity_errors, crc_error_mask):
         self.time.extend(t)
         for ch, sig in enumerate(samples):
             self.signal[ch + 1].extend(sig)
@@ -54,6 +55,7 @@ class RefBuffer:
         self.signal[0].extend(t)
         self.ptp.extend(ptp)
         self.result_fault_state.extend([fault_state] * len(t))
+        self.result_fault_latched.extend([fault_latched] * len(t))
         self.result_parity_errors.extend([parity_errors] * len(t))
         self.result_crc_error_mask.extend([crc_error_mask] * len(t))
 
@@ -209,13 +211,14 @@ def test_result_capture():
         result_code = int(rng.integers(0, 4))
         samples = [[(result_code >> b) & 1] for b in range(channels)]
         fault_state = tuple(int(v) for v in rng.integers(0, 5, size=scada.GATHERING_DEVICES))
+        fault_latched = tuple(int(v) for v in rng.integers(0, 5, size=scada.GATHERING_DEVICES))
         parity_errors = tuple(int(v) for v in
                               rng.integers(0, 3, size=scada.GATHERING_DEVICES * scada.ACQUISITION_CHANNELS))
         errs = list(parity_errors)
         crc_error_mask = int(rng.integers(0, 0xFFFF))
         ptp = [1_000_000_000 + rel_order * 1_000_000]
-        ref.extend_result(t, samples, errs, ptp, fault_state, parity_errors, crc_error_mask)
-        new.extend_result(t, samples, errs, ptp, fault_state, parity_errors, crc_error_mask)
+        ref.extend_result(t, samples, errs, ptp, fault_state, fault_latched, parity_errors, crc_error_mask)
+        new.extend_result(t, samples, errs, ptp, fault_state, fault_latched, parity_errors, crc_error_mask)
     check("result time identical", list(ref.time) == list(new.time))
     check("result signal0 identical", arr_eq(np.array(ref.signal[0]), np.array(new.signal[0])))
     for ch in range(channels):
@@ -225,6 +228,8 @@ def test_result_capture():
     check("result ptp identical", list(ref.ptp) == list(new.ptp))
     check("result fault_state identical",
           list(ref.result_fault_state) == list(new.result_fault_state))
+    check("result fault_latched identical",
+          list(ref.result_fault_latched) == list(new.result_fault_latched))
     check("result parity_errors identical",
           list(ref.result_parity_errors) == list(new.result_parity_errors))
     check("result crc_error_mask identical",
@@ -238,11 +243,11 @@ def test_result_capture():
 # --- 4. save_data CSV: old per-row loop vs new vectorised pass -----------------
 def _csv_old(times, ptp, signals, channels, time_scale, time_zero_s,
              trim_window, n_lo, n_hi, has_result_meta,
-             result_fault_state, result_parity_errors, result_crc_error_mask):
+             result_fault_state, result_fault_latched, result_parity_errors, result_crc_error_mask):
     """The pre-optimisation per-row algorithm (python lists)."""
     lengths = [len(times), len(ptp), *(len(s) for s in signals)]
     if has_result_meta:
-        lengths += [len(result_fault_state), len(result_parity_errors), len(result_crc_error_mask)]
+        lengths += [len(result_fault_state), len(result_fault_latched), len(result_parity_errors), len(result_crc_error_mask)]
     row_count = min(lengths)
     out = io.StringIO()
     w = csv.writer(out)
@@ -253,6 +258,7 @@ def _csv_old(times, ptp, signals, channels, time_scale, time_zero_s,
         row = [signals[ch][i] for ch in range(channels)]
         if has_result_meta:
             row += list(result_fault_state[i])
+            row += list(result_fault_latched[i])
             row += list(result_parity_errors[i])
             row += [result_crc_error_mask[i]]
         w.writerow(['%.6f' % t_shift, ptp[i], *row])
@@ -261,11 +267,11 @@ def _csv_old(times, ptp, signals, channels, time_scale, time_zero_s,
 
 def _csv_new(times_a, ptp_a, signals_a, channels, time_scale, time_zero_s,
              trim_window, n_lo, n_hi, has_result_meta,
-             result_fault_state, result_parity_errors, result_crc_error_mask):
+             result_fault_state, result_fault_latched, result_parity_errors, result_crc_error_mask):
     """The new vectorised algorithm (numpy arrays, mask, deferred tolist)."""
     lengths = [len(times_a), len(ptp_a), *(len(s) for s in signals_a)]
     if has_result_meta:
-        lengths += [len(result_fault_state), len(result_parity_errors), len(result_crc_error_mask)]
+        lengths += [len(result_fault_state), len(result_fault_latched), len(result_parity_errors), len(result_crc_error_mask)]
     row_count = min(lengths)
     times_a = times_a[:row_count]
     ptp_a = ptp_a[:row_count]
@@ -285,6 +291,7 @@ def _csv_new(times_a, ptp_a, signals_a, channels, time_scale, time_zero_s,
         for i in np.nonzero(keep)[0].tolist():
             row = [sig_lists[ch][i] for ch in range(channels)]
             row += list(result_fault_state[i])
+            row += list(result_fault_latched[i])
             row += list(result_parity_errors[i])
             row += [result_crc_error_mask[i]]
             rows.append(['%.6f' % t_shift_list[i], ptp_list[i], *row])
@@ -322,11 +329,11 @@ def test_csv_node():
         old = _csv_old(list(ref.time), list(ref.ptp),
                        [list(ref.signal[c + 1]) for c in range(channels)],
                        channels, scada.SAMPLING_PERIOD, time_zero_s,
-                       trim, n_lo, n_hi, False, [], [], [])
+                       trim, n_lo, n_hi, False, [], [], [], [])
         newv = _csv_new(np.asarray(new.time), np.asarray(new.ptp),
                         [np.asarray(new.signal[c + 1]) for c in range(channels)],
                         channels, scada.SAMPLING_PERIOD, time_zero_s,
-                        trim, n_lo, n_hi, False, [], [], [])
+                        trim, n_lo, n_hi, False, [], [], [], [])
         check(f"node csv identical (trim={trim})", old == newv)
 
 
@@ -341,13 +348,14 @@ def test_csv_result():
         rc = int(rng.integers(0, 4))
         samples = [[(rc >> b) & 1] for b in range(channels)]
         fault_state = tuple(int(v) for v in rng.integers(0, 5, size=scada.GATHERING_DEVICES))
+        fault_latched = tuple(int(v) for v in rng.integers(0, 5, size=scada.GATHERING_DEVICES))
         parity_errors = tuple(int(v) for v in
                               rng.integers(0, 3, size=scada.GATHERING_DEVICES * scada.ACQUISITION_CHANNELS))
         errs = list(parity_errors)
         crc_error_mask = int(rng.integers(0, 0xFFFF))
         ptp = [1_000_000_000 + rel_order * 1_000_000]
-        ref.extend_result(t, samples, errs, ptp, fault_state, parity_errors, crc_error_mask)
-        new.extend_result(t, samples, errs, ptp, fault_state, parity_errors, crc_error_mask)
+        ref.extend_result(t, samples, errs, ptp, fault_state, fault_latched, parity_errors, crc_error_mask)
+        new.extend_result(t, samples, errs, ptp, fault_state, fault_latched, parity_errors, crc_error_mask)
     trig_n = 8.0
     time_zero_s = round(trig_n) * scada.PACKET_PERIOD
     n_lo, n_hi = trig_n - 3, trig_n + 5
@@ -356,11 +364,13 @@ def test_csv_result():
                        [list(ref.signal[c + 1]) for c in range(channels)],
                        channels, scada.PACKET_PERIOD, time_zero_s, trim, n_lo, n_hi,
                        True, list(ref.result_fault_state),
+                       list(ref.result_fault_latched),
                        list(ref.result_parity_errors), list(ref.result_crc_error_mask))
         newv = _csv_new(np.asarray(new.time), np.asarray(new.ptp),
                         [np.asarray(new.signal[c + 1]) for c in range(channels)],
                         channels, scada.PACKET_PERIOD, time_zero_s, trim, n_lo, n_hi,
                         True, list(new.result_fault_state),
+                        list(new.result_fault_latched),
                         list(new.result_parity_errors), list(new.result_crc_error_mask))
         check(f"result csv identical (trim={trim})", old == newv)
 

@@ -53,7 +53,7 @@ from fdds.protocol import (
 from fdds.crc import crc16_ccitt
 
 APPLICATION_NAME = 'Eaton FDDS SCADA'
-APPLICATION_VERSION = '1.13.2'
+APPLICATION_VERSION = '1.13.3'
 APPLICATION_TITLE = f"{APPLICATION_NAME} v{APPLICATION_VERSION}"
 
 # Constants (protocol-level values sourced from the shared fdds core)
@@ -222,7 +222,8 @@ def _signed_u16_delta(new: int, old: int) -> int:
         return ((new - old + 0x8000) & 0xFFFF) - 0x8000
 
 # Packet struct layouts (shared fdds core; TRIGGER has no shared layout yet so stays local)
-ID_HEADER_STRUCT = STRUCT.ID            # <HH HBB HBBI3I HBBI HH (last HH = channels_count + _reserved)
+ID_HEADER_STRUCT = STRUCT.ID_V4         # <HH HBB HBBI3I HBBI HH (last HH = channels_count + _reserved)
+ID_HEADER_STRUCT_V5 = STRUCT.ID_V5      # <HH HBB HBBI3I HBBI HBB (channels_count + fault counts)
 CHANNEL_HEADER_STRUCT = STRUCT.CHANNEL  # <4s ff (unit, offset, gain)
 DATA_HEADER_STRUCT = STRUCT.DATA_HEADER # <HHII (packet_type, packet_num, ptp_seconds, ptp_nanoseconds)
 TRIGGER_PACKET_STRUCT = struct.Struct("<HHB3xII") # packet_type, packet_num, sample_num, ptp_seconds, ptp_nanoseconds
@@ -232,30 +233,40 @@ _DATA_SAMPLE_INDEX = np.arange(SAMPLES_PER_PACKET, dtype=np.int64)
 # Per-sample PTP step back from the packet's last-sample timestamp.
 _DATA_PTP_BACK_STEPS = np.arange(SAMPLES_PER_PACKET - 1, -1, -1, dtype=np.int64) * NS_PER_SAMPLE
 
+def _uses_v5_packet_format(info: dict | None) -> bool:
+    return bool(info and info.get('fw_ver_major', 0) >= 5)
+
 def parse_id_packet(data):
     if len(data) < ID_HEADER_STRUCT.size:
         raise ValueError("[ERR]: ID packet is short")
+    old_fields = ('packet_type',
+                  'state',
+                  'fw_id',
+                  'fw_ver_major',
+                  'fw_ver_minor',
+                  'hw_id',
+                  'hw_ver_major',
+                  'hw_ver_minor',
+                  'mcu_serial',
+                  'cpu_uid0',
+                  'cpu_uid1',
+                  'cpu_uid2',
+                  'adc_hw_id',
+                  'adc_ver_major',
+                  'adc_ver_minor',
+                  'adc_serial',
+                  'channels_count',
+                  'reserved')
     unpacked = ID_HEADER_STRUCT.unpack(data[:ID_HEADER_STRUCT.size])
-    fields = ('packet_type',
-              'state',
-              'fw_id',
-              'fw_ver_major',
-              'fw_ver_minor',
-              'hw_id',
-              'hw_ver_major',
-              'hw_ver_minor',
-              'mcu_serial',
-              'cpu_uid0',
-              'cpu_uid1',
-              'cpu_uid2',
-              'adc_hw_id',
-              'adc_ver_major',
-              'adc_ver_minor',
-              'adc_serial',
-              'channels_count',
-              'reserved')
+    info = dict(zip(old_fields, unpacked))
+    if _uses_v5_packet_format(info):
+        v5_fields = old_fields[:-1] + ('fault_state_count', 'fault_latched_count')
+        unpacked = ID_HEADER_STRUCT_V5.unpack(data[:ID_HEADER_STRUCT_V5.size])
+        info = dict(zip(v5_fields, unpacked))
+    else:
+        info['fault_state_count'] = info['channels_count']
+        info['fault_latched_count'] = 0
     channels_info = ('unit', 'offset', 'gain')
-    info = dict(zip(fields, unpacked))
     info['cpu_uid'] = (info.pop('cpu_uid0'), info.pop('cpu_uid1'), info.pop('cpu_uid2'))
     # channels_count may exceed the number of channel_info entries the device
     # actually ships (e.g. the CCU reports fault_output_get_count() but only
@@ -400,6 +411,7 @@ class DeviceBuffer:
         # These hold python tuples/ints (one per packet, not per sample) so they stay
         # as deques rather than numeric rings.
         self.result_fault_state    = deque(maxlen=BUFFER_SIZE)  # tuple per row: per-node fault_state[GATHERING_DEVICES]
+        self.result_fault_latched  = deque(maxlen=BUFFER_SIZE)  # tuple per row: per-node fault_latched[GATHERING_DEVICES]
         self.result_parity_errors  = deque(maxlen=BUFFER_SIZE)  # tuple per row: parity_errors[GATHERING_DEVICES][ACQUISITION_CHANNELS]
         self.result_crc_error_mask = deque(maxlen=BUFFER_SIZE)  # int per row
         # Monotonic change counter bumped on every append; lets the plot skip a
@@ -418,7 +430,8 @@ class DeviceBuffer:
             self.revision += 1
 
     def extend_result(self, t:List[int], samples:List[List[int]], errs:List[int], ptp:List[int],
-                      fault_state:Tuple[int, ...], parity_errors:Tuple[int, ...], crc_error_mask:int):
+                      fault_state:Tuple[int, ...], fault_latched:Tuple[int, ...],
+                      parity_errors:Tuple[int, ...], crc_error_mask:int):
         with self.lock:
             self.time.extend(t)
             for ch, sig in enumerate(samples):
@@ -427,6 +440,7 @@ class DeviceBuffer:
             self.signal[0].extend(t)
             self.ptp.extend(ptp)
             self.result_fault_state.extend([fault_state]*len(t))
+            self.result_fault_latched.extend([fault_latched]*len(t))
             self.result_parity_errors.extend([parity_errors]*len(t))
             self.result_crc_error_mask.extend([crc_error_mask]*len(t))
             self.revision += 1
@@ -701,6 +715,9 @@ class Device:
     
     def reset_counter(self):
         return self._send_cmd(10)
+
+    def reset_fault_state(self):
+        return self._send_cmd(int(CMD.RESET_FAULT_STATE))
     
     def reset_device(self):
         return self._send_cmd(14, struct.pack('<B', 0xFE))
@@ -1080,21 +1097,25 @@ class Device:
                     samples.append([bit_vals])
 
                 # result_packet_t layout after value, derived from the shared
-                # constants GATHERING_DEVICES and ACQUISITION_CHANNELS:
-                #   fault_state[GATHERING_DEVICES]                   GATHERING_DEVICES x uint16
-                #   parity_errors[GATHERING_DEVICES][ACQ_CHANNELS]   GATHERING_DEVICES*ACQ_CHANNELS x uint8
-                #   crc_error_mask                                   uint16
+                # constants GATHERING_DEVICES and ACQUISITION_CHANNELS. FW v5+
+                # inserts fault_latched[GATHERING_DEVICES] after fault_state.
                 fs_off = val_off + 2
-                pe_off = fs_off + GATHERING_DEVICES * 2
+                fl_off = fs_off + GATHERING_DEVICES * 2
+                if _uses_v5_packet_format(getattr(self, 'info', None)):
+                    pe_off = fl_off + GATHERING_DEVICES * 2
+                    fault_latched = struct.unpack(f'<{GATHERING_DEVICES}H', data[fl_off:pe_off])
+                else:
+                    pe_off = fl_off
+                    fault_latched = (0,) * GATHERING_DEVICES
                 cem_off = pe_off + GATHERING_DEVICES * ACQUISITION_CHANNELS
-                fault_state = struct.unpack(f'<{GATHERING_DEVICES}H', data[fs_off:pe_off])
+                fault_state = struct.unpack(f'<{GATHERING_DEVICES}H', data[fs_off:fl_off])
                 parity_errors = tuple(data[pe_off:cem_off])
-                crc_error_mask = struct.unpack('<H', data[cem_off:cem_off+2])[0]
+                crc_error_mask = data[cem_off] if cem_off < len(data) else 0
                 # errs feeds the per-channel GUI error label (first self.channels values used).
                 errs = list(parity_errors)
 
                 self.loop.call_soon_threadsafe(self.buffer.extend_result, t, samples, errs,
-                                               ptp, fault_state, parity_errors, crc_error_mask)
+                                               ptp, fault_state, fault_latched, parity_errors, crc_error_mask)
                 #self._logger.info(f"Dev {self.ip} packetNumber[{order}]: result {result_code}")
                 return order
             case self.PKT_TYPE_ID:
@@ -1197,6 +1218,10 @@ class DeviceManager:
 
     def reset_counter(self):
         return self._send_cmd_broadcast(10)      
+
+    def reset_fault_state(self):
+        dev = self.ccu_device()
+        return dev.reset_fault_state() if dev is not None else None
 
     def force_trigger(self):
         #for dev in self.devices.values(): dev.force_trigger()
@@ -1513,6 +1538,7 @@ class Plotter(QWidget):
                           ('Force trigger'                  , self._force_trigger                   ),
                           #('Stop Sampling'                  , self._stop_sampling                   ),
                           ('Reset Counter'                  , self._reset_counter                   ),
+                          ('Reset Latched Faults'           , self._reset_fault_state               ),
                           #('Clean Graf'                     , self.clear_plot                       ),
                           #('Penetrate Firewall'             , self._penetrate_firewall              ),
                           #('Save Data'                      , self.save_data                        ),
@@ -1738,7 +1764,10 @@ class Plotter(QWidget):
 
     def _get_ids(self):
         for ip,info in self.manager.get_all_ids().items():
-            self._logger.info(f'ID {ip}: ' + (f"FW {info['fw_id']} v{info['fw_ver_major']}.{info['fw_ver_minor']}; channels={info['channels_count']}" if info else 'FAIL'))
+            self._logger.info(f'ID {ip}: ' + (
+                f"FW {info['fw_id']} v{info['fw_ver_major']}.{info['fw_ver_minor']}; "
+                f"channels={info['channels_count']}; faults={info.get('fault_state_count', 0)}; "
+                f"latched={info.get('fault_latched_count', 0)}" if info else 'FAIL'))
 
     def _register_all(self):
         try:
@@ -2264,6 +2293,12 @@ class Plotter(QWidget):
         self._logger.info('Reset counter on all devices')
         self.last_order.clear()
 
+    def _reset_fault_state(self):
+        if self.manager.reset_fault_state():
+            self._logger.info('Reset latched faults on CCU')
+        else:
+            self._logger.error('Reset latched faults command not acknowledged by CCU')
+
     def _force_trigger(self):
         #self.manager.broadcast('force_trigger')
         #self._logger.info('Force trigger on all devices')
@@ -2380,6 +2415,7 @@ class Plotter(QWidget):
                 for dq in dev.buffer.error: dq.clear()
                 dev.buffer.ptp.clear()
                 dev.buffer.result_fault_state.clear()
+                dev.buffer.result_fault_latched.clear()
                 dev.buffer.result_parity_errors.clear()
                 dev.buffer.result_crc_error_mask.clear()
         self.ax.clear()
@@ -2451,6 +2487,7 @@ class Plotter(QWidget):
                 ptp_a = np.asarray(dev.buffer.ptp)
                 signals_a = [np.asarray(dev.buffer.signal[c + 1]) for c in range(dev.channels)]
                 result_fault_state = list(dev.buffer.result_fault_state)
+                result_fault_latched = list(dev.buffer.result_fault_latched)
                 result_parity_errors = list(dev.buffer.result_parity_errors)
                 result_crc_error_mask = list(dev.buffer.result_crc_error_mask)
 
@@ -2484,7 +2521,7 @@ class Plotter(QWidget):
 
             lengths = [len(times_a), len(ptp_a), *(len(s) for s in signals_a)]
             if has_result_meta:
-                lengths += [len(result_fault_state), len(result_parity_errors), len(result_crc_error_mask)]
+                lengths += [len(result_fault_state), len(result_fault_latched), len(result_parity_errors), len(result_crc_error_mask)]
             row_count = min(lengths)
 
             if strict and row_count == 0:
@@ -2510,6 +2547,7 @@ class Plotter(QWidget):
                     n_fault = GATHERING_DEVICES
                     n_parity = GATHERING_DEVICES * ACQUISITION_CHANNELS
                     header += [f'fault_state{d}' for d in range(n_fault)]
+                    header += [f'fault_latched{d}' for d in range(n_fault)]
                     header += [f'parity_n{p // ACQUISITION_CHANNELS}c{p % ACQUISITION_CHANNELS}' for p in range(n_parity)]
                     header += ['crc_error_mask']
                 w.writerow(header)
@@ -2526,6 +2564,7 @@ class Plotter(QWidget):
                     for i in np.nonzero(keep)[0].tolist():
                         row = [sig_lists[ch][i] for ch in range(dev.channels)]
                         row += list(result_fault_state[i])
+                        row += list(result_fault_latched[i])
                         row += list(result_parity_errors[i])
                         row += [result_crc_error_mask[i]]
                         rows.append(['%.6f' % t_shift_list[i], ptp_list[i], *row])
