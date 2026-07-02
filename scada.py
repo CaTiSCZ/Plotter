@@ -149,6 +149,15 @@ SYSTEM_STATUS_COLOR_IDLE  = '#cfcfcf'   # IDLE / stopped (neutral)
 TRIGGER_FLASH_MS = 250
 TRIGGER_FLASH_STYLE = 'background-color: #2196f3; color: white'
 
+FAULT_INDICATOR_SIZE = 20
+FAULT_INDICATOR_COLORS = {
+    (0, 0): '#2e7d32',
+    (0, 1): '#f4d03f',
+    (1, 0): '#e67e22',
+    (1, 1): '#c0392b',
+}
+FAULT_INDICATOR_UNKNOWN = '#bdbdbd'
+
 # Features
 FCN_QT_LOGGING = True  # Enable Qt logging handler
 
@@ -644,6 +653,9 @@ class Device:
         self.trigger_order = None
         self.trigger_sample_num = 0
         self.pretrigger_packets = 0
+        self.last_fault_state = 0
+        self.last_fault_latched = 0
+        self.last_fault_valid = False
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None, port:int|None = None):
         pkt = struct.pack('<I', code) + payload
@@ -718,8 +730,23 @@ class Device:
     def reset_counter(self):
         return self._send_cmd(10)
 
-    def reset_fault_state(self):
-        return self._send_cmd(int(CMD.RESET_FAULT_STATE))
+    def reset_fault_state(self, mask:int|None = None):
+        payload = b'' if mask is None else struct.pack('<H', mask & 0xFFFF)
+        return self._send_cmd(int(CMD.RESET_FAULT_STATE), payload)
+
+    def _update_fault_words_from_data_packet(self, data: bytes):
+        off = 12 + 2 * self.channels * SAMPLES_PER_PACKET + self.channels
+        off += self.channels % 2
+        if off + 2 <= len(data):
+            self.last_fault_state = struct.unpack('<H', data[off:off+2])[0]
+            off += 2
+        else:
+            self.last_fault_state = 0
+        if _uses_v5_packet_format(getattr(self, 'info', None)) and off + 2 <= len(data):
+            self.last_fault_latched = struct.unpack('<H', data[off:off+2])[0]
+        else:
+            self.last_fault_latched = 0
+        self.last_fault_valid = True
     
     def reset_device(self):
         return self._send_cmd(14, struct.pack('<B', 0xFE))
@@ -962,6 +989,9 @@ class Device:
                             # fall through so this packet is captured as the first post-trigger packet
                         else:
                             self.input_packet_ring.append(bytes(pkt))
+                            data = _verify_crc(pkt)
+                            if data not in (None, False):
+                                self._update_fault_words_from_data_packet(data)
                             return
 
                     if self.capture_limit > 0 and self.capture_counter >= self.capture_limit:
@@ -1022,6 +1052,7 @@ class Device:
                 samples = np.frombuffer(data, dtype='<i2', count=nsamp, offset=off).reshape(self.channels, SAMPLES_PER_PACKET).tolist()
                 off += 2*nsamp
                 errs = list(data[off:off+self.channels])
+                self._update_fault_words_from_data_packet(data)
                 self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs, ptp)
                 return order
             case self.PKT_TYPE_TRIGGER:
@@ -1223,9 +1254,9 @@ class DeviceManager:
     def reset_counter(self):
         return self._send_cmd_broadcast(10)      
 
-    def reset_fault_state(self):
-        dev = self.ccu_device()
-        return dev.reset_fault_state() if dev is not None else None
+    def reset_fault_state(self, ip:str|None = None, mask:int|None = None):
+        dev = self.devices.get(ip) if ip is not None else self.ccu_device()
+        return dev.reset_fault_state(mask=mask) if dev is not None else None
 
     def force_trigger(self):
         #for dev in self.devices.values(): dev.force_trigger()
@@ -1412,6 +1443,8 @@ class Plotter(QWidget):
         self.device_clock_settings: List[QComboBox] = []
         self.device_trigger_settings: List[QComboBox] = []
         self.device_trigger_holdoff: List[QSpinBox] = []
+        self.device_fault_indicator_layouts: List[QHBoxLayout] = []
+        self.device_fault_indicators: List[List[QPushButton]] = []
 
         for i in range(DeviceManager.MAX_DEVICES):
             lb = QLabel(f'Device {i}')
@@ -1455,15 +1488,25 @@ class Plotter(QWidget):
             self.device_trigger_holdoff.append(sb_holdoff)
             cfg.addLayout(trig_box, i, 5)
 
+            fault_box = QHBoxLayout()
+            fault_box.setContentsMargins(0, 0, 0, 0)
+            fault_box.setSpacing(4)
+            fault_widget = QWidget()
+            fault_widget.setLayout(fault_box)
+            fault_widget.setToolTip('Digital fault outputs')
+            cfg.addWidget(fault_widget, i, 6)
+            self.device_fault_indicator_layouts.append(fault_box)
+            self.device_fault_indicators.append([])
+
         self.leader_buttons.buttonClicked[int].connect(self._leader_changed)
 
-        cfg.addWidget(QLabel('Receiver addr:port'), 0, 6)
+        cfg.addWidget(QLabel('Receiver addr:port'), 0, 7)
         self.receiver_edit = QLineEdit(f'0.0.0.0:{DEFAULT_DATA_PORT}')
-        cfg.addWidget(self.receiver_edit, 0, 7)
+        cfg.addWidget(self.receiver_edit, 0, 8)
 
-        cfg.addWidget(QLabel('Measurement number'), 2, 6)
+        cfg.addWidget(QLabel('Measurement number'), 2, 7)
         self.measurement_number_edit = QLineEdit(f'0')
-        cfg.addWidget(self.measurement_number_edit, 2, 7)
+        cfg.addWidget(self.measurement_number_edit, 2, 8)
 
         self.apply_btn = QPushButton('Apply Device List')
         cfg.addWidget(self.apply_btn, DeviceManager.MAX_DEVICES, 2)
@@ -1699,6 +1742,88 @@ class Plotter(QWidget):
             next = order
         self.last_order[ip] = next
 
+    def _configured_ip_for_row(self, row:int) -> str | None:
+        txt = self.device_edits[row].text().strip()
+        if not txt:
+            return None
+        return txt.split(':')[0]
+
+    def _device_for_row(self, row:int) -> Device | None:
+        ip = self._configured_ip_for_row(row)
+        return self.manager.devices.get(ip) if ip else None
+
+    def _fault_indicator_style(self, fault:int|None, latch:int|None) -> str:
+        if fault is None or latch is None:
+            color = FAULT_INDICATOR_UNKNOWN
+            text_color = 'black'
+        else:
+            color = FAULT_INDICATOR_COLORS[(fault, latch)]
+            text_color = 'white' if (fault, latch) in ((0, 0), (1, 1)) else 'black'
+        radius = FAULT_INDICATOR_SIZE // 2
+        return (
+            'QPushButton {'
+            f'background-color: {color}; color: {text_color}; border: 1px solid #555; '
+            f'border-radius: {radius}px; min-width: {FAULT_INDICATOR_SIZE}px; max-width: {FAULT_INDICATOR_SIZE}px; '
+            f'min-height: {FAULT_INDICATOR_SIZE}px; max-height: {FAULT_INDICATOR_SIZE}px; padding: 0px;'
+            '}'
+        )
+
+    def _rebuild_fault_indicator_row(self, row:int, bit_count:int):
+        layout = self.device_fault_indicator_layouts[row]
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        buttons: List[QPushButton] = []
+        for bit_idx in range(bit_count):
+            btn = QPushButton(str(bit_idx))
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(self._fault_indicator_style(None, None))
+            btn.clicked.connect(lambda _checked=False, row=row, bit=bit_idx: self._reset_fault_bit(row, bit))
+            layout.addWidget(btn)
+            buttons.append(btn)
+        layout.addStretch(1)
+        self.device_fault_indicators[row] = buttons
+
+    def _refresh_fault_indicators(self):
+        for row in range(DeviceManager.MAX_DEVICES):
+            dev = self._device_for_row(row)
+            if dev is None:
+                bit_count = 0
+            else:
+                info = getattr(dev, 'info', None) or {}
+                bit_count = int(info.get('fault_state_count', getattr(dev, 'result_channels', 0)))
+            bit_count = max(0, min(16, bit_count))
+            if len(self.device_fault_indicators[row]) != bit_count:
+                self._rebuild_fault_indicator_row(row, bit_count)
+            if bit_count == 0:
+                continue
+
+            valid = bool(dev and dev.last_fault_valid)
+            fault_word = int(getattr(dev, 'last_fault_state', 0)) if valid else 0
+            latch_word = int(getattr(dev, 'last_fault_latched', 0)) if valid else 0
+            for bit_idx, btn in enumerate(self.device_fault_indicators[row]):
+                if valid:
+                    fault = (fault_word >> bit_idx) & 1
+                    latch = (latch_word >> bit_idx) & 1
+                    btn.setStyleSheet(self._fault_indicator_style(fault, latch))
+                    btn.setToolTip(f'Bit {bit_idx}: fault={fault}, latch={latch}. Click to reset this latch bit.')
+                else:
+                    btn.setStyleSheet(self._fault_indicator_style(None, None))
+                    btn.setToolTip(f'Bit {bit_idx}: no live fault data yet. Click to reset this latch bit.')
+
+    def _reset_fault_bit(self, row:int, bit_idx:int):
+        dev = self._device_for_row(row)
+        if dev is None:
+            self._logger.warning(f'No device mapped to row {row} for fault reset.')
+            return
+        mask = 1 << bit_idx
+        if self.manager.reset_fault_state(ip=dev.ip, mask=mask):
+            self._logger.info(f'Reset latched fault bit {bit_idx} on {dev.ip} (mask=0x{mask:04X})')
+        else:
+            self._logger.error(f'Reset latched fault bit {bit_idx} on {dev.ip} was not acknowledged (mask=0x{mask:04X})')
+
     def _update_defaults(self,text:str):
         try:
             if not ':' in text:
@@ -1754,6 +1879,7 @@ class Plotter(QWidget):
                 count += 1
             except:
                 self._logger.warning(f'Bad entry: {txt}')
+        self._refresh_fault_indicators()
         self._logger.info(f'Applied {count} devices')
 
     def _ping_all(self):
@@ -1773,6 +1899,7 @@ class Plotter(QWidget):
                 f"FW {info['fw_id']} v{info['fw_ver_major']}.{info['fw_ver_minor']}; "
                 f"channels={info['channels_count']}; faults={info.get('fault_state_count', 0)}; "
                 f"latched={info.get('fault_latched_count', 0)}" if info else 'FAIL'))
+        self._refresh_fault_indicators()
 
     def _register_all(self):
         try:
@@ -2632,6 +2759,7 @@ class Plotter(QWidget):
         return files
         
     def _update_plot(self, force=False):
+        self._refresh_fault_indicators()
         # Skip the (expensive) full redraw when no device buffer has changed since the
         # last frame -- e.g. a trigger / "start new sampling" capture is complete and
         # already holds all the data it asked for, even though the system keeps running
