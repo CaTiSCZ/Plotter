@@ -109,6 +109,17 @@ TRIGGER_CAPTURE_MARGIN_PACKETS = 16
 #   'verbose' - same, but the ping is not silent so it shows up in the device log.
 FIREWALL_PENETRATION_MODES = ('off', 'on', 'verbose')
 FIREWALL_PENETRATION = 'on'
+# Device logs (PACKET_LOG) are delivered to SCADA's data socket, but the firmware sends
+# them FROM the device's COMMAND port (cmd_upcb), not its data port. A stateful firewall
+# keys the pinhole on both endpoints' ports, so the data stream's pinhole (data socket
+# <-> device data port) does NOT cover logs (data socket <-> device command port). SCADA
+# therefore keeps a separate pinhole open for logs by sending a ping out of the data
+# socket to the device command port whenever a device has been silent (no data/log/ACK)
+# for this long; the firewall closes an idle pinhole after ~this timeout and a log may
+# not arrive that often. Gated by FIREWALL_PENETRATION ('off' disables it entirely;
+# 'verbose' makes the ping non-silent so it shows up in the device log). Set at or
+# slightly below the real firewall idle timeout. Overridable via default_settings.py.
+FIREWALL_KEEPALIVE_TIMEOUT_S = 25
 
 # Render plot curves with OpenGL (GPU). Off by default (CPU painter); can be much
 # faster for very large traces but needs a working OpenGL driver. Overridable via
@@ -667,6 +678,11 @@ class Device:
         self.ptp_triggered = False
         self.received_last = 0
         self.last_data_time = 0.0
+        # Time of the last packet of ANY type received from this device (data, result,
+        # log or ACK). Used by the firewall keepalive to decide when the pinhole for the
+        # data/log port needs re-opening; distinct from last_data_time (which must only
+        # track real data for the stall watchdog, not logs/ACKs).
+        self.last_recv_time = 0.0
         self.last_ack_time = 0.0
         self.input_packet_ring = deque(maxlen=PTP_TRIGGER_RING_PACKETS)
         self.first_data_order = None
@@ -1128,6 +1144,8 @@ class Device:
 
     def on_raw_packet(self, pkt:bytes):
         typ, order = self.header_struct.unpack(pkt[:4])
+        # Any inbound packet refreshes the firewall pinhole for the data/log port.
+        self.last_recv_time = time.monotonic()
         match typ:
             case self.PKT_TYPE_ACK:
                 self.last_ack_time = time.monotonic()
@@ -1896,11 +1914,14 @@ class Plotter(QWidget):
         self.log_toggle_btn.setChecked(False)
         self._toggle_log(False)
 
-        # Not needed
-        #penetrator = QTimer(self)
-        #penetrator.setInterval(3000)
-        #penetrator.timeout.connect(self.manager.penetrate_firewall)
-        #penetrator.start()
+        # Keep the firewall pinhole for the data/log port open. Device logs share the
+        # data socket and can be rarer than the firewall's idle timeout, so re-ping any
+        # device that has been silent for FIREWALL_KEEPALIVE_TIMEOUT_S. Checked once a
+        # second so the ping goes out promptly once the idle threshold is crossed.
+        self.firewall_keepalive_timer = QTimer(self)
+        self.firewall_keepalive_timer.setInterval(1000)
+        self.firewall_keepalive_timer.timeout.connect(self._firewall_keepalive)
+        self.firewall_keepalive_timer.start()
 
         self.timer = QTimer(self)
         self.timer.setInterval(GUI_REFRESH_INTERVAL_MS)
@@ -2749,6 +2770,28 @@ class Plotter(QWidget):
     def _penetrate_firewall(self):
         self._logger.info('Trying to penetrate firewall')
         self.manager.penetrate_firewall(False)
+
+    def _firewall_keepalive(self):
+        """Keep the firewall pinhole open for the device log stream (PACKET_LOG).
+
+        The firmware delivers logs to SCADA's data socket but sends them FROM the device
+        COMMAND port, so the firewall (which keys on both endpoints' ports) does not
+        cover them with the data stream's pinhole. Re-send a ping out of the data socket
+        to the device command port whenever a device has been silent (no data/log/ACK)
+        for FIREWALL_KEEPALIVE_TIMEOUT_S; the ping's ACK (or any real packet) refreshes
+        last_recv_time, so an actively streaming device is skipped. Gated by
+        FIREWALL_PENETRATION: 'off' disables it, 'verbose' makes the ping non-silent
+        (visible in the device log), otherwise the ping is silent."""
+        if FIREWALL_PENETRATION == 'off':
+            return
+        if not self.manager.devices or self.manager.data_socket is None:
+            return
+        now = time.monotonic()
+        silent = FIREWALL_PENETRATION != 'verbose'
+        for dev in self.manager.devices.values():
+            if dev.last_recv_time and (now - dev.last_recv_time) < FIREWALL_KEEPALIVE_TIMEOUT_S:
+                continue
+            dev.ping(self.manager.data_socket, silent=silent, port=dev.cmd_port)
     
     def _reset_devices(self):
         self._logger.info('Reset devices')
@@ -3367,6 +3410,7 @@ def main(argv):
 
         global PTP_TRIGGER_RING_PACKETS
         global FIREWALL_PENETRATION
+        global FIREWALL_KEEPALIVE_TIMEOUT_S
         global DATA_SOCKET_RCVBUF_BYTES
         global TRIGGER_CAPTURE_MARGIN_PACKETS
         global BUFFER_LENGTH_S, BUFFER_SIZE, MAX_CAPTURE_PACKETS
@@ -3396,6 +3440,7 @@ def main(argv):
             logging_.logger.warning(f"Invalid FIREWALL_PENETRATION={FIREWALL_PENETRATION!r}; falling back to 'on'. "
                                     f"Valid options: {FIREWALL_PENETRATION_MODES}.")
             FIREWALL_PENETRATION = 'on'
+        FIREWALL_KEEPALIVE_TIMEOUT_S = float(getattr(ds, 'FIREWALL_KEEPALIVE_TIMEOUT_S', FIREWALL_KEEPALIVE_TIMEOUT_S))
 
         USE_OPENGL = bool(getattr(ds, 'USE_OPENGL', USE_OPENGL))
         if USE_OPENGL:

@@ -12,4 +12,5 @@ DEFAULT_SOCKET_BACKEND = 'auto' ## 'auto' tries to use C++ and falls back to Pyt
 DATA_SOCKET_RCVBUF_BYTES = 16777216 ## OS UDP receive buffer (SO_RCVBUF) for the data socket; large value prevents packet loss during the trigger flush burst (default 16 MiB)
 GUI_REFRESH_INTERVAL_MS = 100 ## how often the plot, fault indicators and analog value labels are redrawn, in ms (100 ms = 10 Hz)
 FIREWALL_PENETRATION = 'on' ## stall-diagnostic firewall test: 'off' = never test; 'on' = silent ping via data socket; 'verbose' = same but the ping is not silent so it shows up in the device log
+FIREWALL_KEEPALIVE_TIMEOUT_S = 25 ## firewall idle-close timeout (s); SCADA re-pings the device command port (where logs originate) when a device is silent this long so sparse logs keep arriving. Gated by FIREWALL_PENETRATION ('off' disables it; 'verbose' = non-silent ping). Set at or slightly below the real firewall timeout.
 USE_OPENGL = False ## render plot curves with OpenGL (GPU); can be much faster for very large traces but requires a working OpenGL driver (PyOpenGL). Leave False to use the default CPU painter.
