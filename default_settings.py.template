@@ -10,5 +10,6 @@ BUFFER_LENGTH_S = 30   ## per-device sample-buffer length in seconds (max record
 DEFAULT_PTP_MODE_ENABLED = False
 DEFAULT_SOCKET_BACKEND = 'auto' ## 'auto' tries to use C++ and falls back to Python on fail; 'py' uses Python socket, 'cpp' uses C++ socket and crashes when not available
 DATA_SOCKET_RCVBUF_BYTES = 16777216 ## OS UDP receive buffer (SO_RCVBUF) for the data socket; large value prevents packet loss during the trigger flush burst (default 16 MiB)
+GUI_REFRESH_INTERVAL_MS = 100 ## how often the plot, fault indicators and analog value labels are redrawn, in ms (100 ms = 10 Hz)
 FIREWALL_PENETRATION = 'on' ## stall-diagnostic firewall test: 'off' = never test; 'on' = silent ping via data socket; 'verbose' = same but the ping is not silent so it shows up in the device log
 USE_OPENGL = False ## render plot curves with OpenGL (GPU); can be much faster for very large traces but requires a working OpenGL driver (PyOpenGL). Leave False to use the default CPU painter.

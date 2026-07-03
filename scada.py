@@ -83,6 +83,9 @@ MAX_CAPTURE_PACKETS = BUFFER_SIZE // SAMPLES_PER_PACKET  # max pre+post packets 
 # >= the worst-case packet reordering distance; 100 ms (=100 packets) is generous.
 PLOT_SORT_MARGIN_SAMPLES = max(SAMPLES_PER_PACKET, int(round(0.1 / SAMPLING_PERIOD)))
 DEFAULT_AVG_LEN_MS = 1000 # could be overwritten by default_settings.py
+# GUI refresh interval in ms: how often the plot, fault indicators and analog value
+# labels are redrawn. 100 ms = 10 Hz. Overridable via default_settings.py.
+GUI_REFRESH_INTERVAL_MS = 100
 CCU_DEVICE_INDEX   = 0
 DEFAULT_SOCKET_BACKEND = 'auto'
 DATA_SOCKET_RECV_TIMEOUT_S = 0.02
@@ -1859,7 +1862,7 @@ class Plotter(QWidget):
         #penetrator.start()
 
         self.timer = QTimer(self)
-        self.timer.setInterval(1000)
+        self.timer.setInterval(GUI_REFRESH_INTERVAL_MS)
         self.timer.timeout.connect(self._update_plot)
         self.timer.start()
 
@@ -3272,6 +3275,7 @@ def main(argv):
         global TRIGGER_CAPTURE_MARGIN_PACKETS
         global BUFFER_LENGTH_S, BUFFER_SIZE, MAX_CAPTURE_PACKETS
         global USE_OPENGL
+        global GUI_REFRESH_INTERVAL_MS
 
         DEFAULT_FIRST_IP = getattr(ds, 'DEFAULT_FIRST_IP', "192.168.137.100")
         DEFAULT_LEADER = getattr(ds, 'DEFAULT_LEADER', 1)
@@ -3290,6 +3294,7 @@ def main(argv):
         ptp_mode.enabled = getattr(ds, 'DEFAULT_PTP_MODE_ENABLED', False)
         SOCKET_BACKEND = getattr(ds, 'SOCKET_BACKEND', DEFAULT_SOCKET_BACKEND)
         DATA_SOCKET_RCVBUF_BYTES = int(getattr(ds, 'DATA_SOCKET_RCVBUF_BYTES', DATA_SOCKET_RCVBUF_BYTES))
+        GUI_REFRESH_INTERVAL_MS = int(getattr(ds, 'GUI_REFRESH_INTERVAL_MS', GUI_REFRESH_INTERVAL_MS))
         FIREWALL_PENETRATION = str(getattr(ds, 'FIREWALL_PENETRATION', FIREWALL_PENETRATION)).lower()
         if FIREWALL_PENETRATION not in FIREWALL_PENETRATION_MODES:
             logging_.logger.warning(f"Invalid FIREWALL_PENETRATION={FIREWALL_PENETRATION!r}; falling back to 'on'. "
@@ -3322,7 +3327,7 @@ def main(argv):
         gui_log_handler.setLevel(logging.DEBUG)
         logging_.log_printer.add_handler(gui_log_handler)
         logging_.logger.critical(f"Logging to file: {logging_.log_path}") # This has to be in console, so critical
-        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PRETRIGGER_PACKETS={DEFAULT_PRETRIGGER_PACKETS}, DEFAULT_POSTTRIGGER_PACKETS={DEFAULT_POSTTRIGGER_PACKETS}, PTP_TRIGGER_RING_PACKETS={PTP_TRIGGER_RING_PACKETS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}, DATA_SOCKET_RCVBUF_BYTES={DATA_SOCKET_RCVBUF_BYTES}, TRIGGER_CAPTURE_MARGIN_PACKETS={TRIGGER_CAPTURE_MARGIN_PACKETS}, BUFFER_LENGTH_S={BUFFER_LENGTH_S}, FIREWALL_PENETRATION={FIREWALL_PENETRATION}, USE_OPENGL={USE_OPENGL}")
+        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PRETRIGGER_PACKETS={DEFAULT_PRETRIGGER_PACKETS}, DEFAULT_POSTTRIGGER_PACKETS={DEFAULT_POSTTRIGGER_PACKETS}, PTP_TRIGGER_RING_PACKETS={PTP_TRIGGER_RING_PACKETS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}, DATA_SOCKET_RCVBUF_BYTES={DATA_SOCKET_RCVBUF_BYTES}, TRIGGER_CAPTURE_MARGIN_PACKETS={TRIGGER_CAPTURE_MARGIN_PACKETS}, BUFFER_LENGTH_S={BUFFER_LENGTH_S}, FIREWALL_PENETRATION={FIREWALL_PENETRATION}, USE_OPENGL={USE_OPENGL}, GUI_REFRESH_INTERVAL_MS={GUI_REFRESH_INTERVAL_MS}")
         def start_loop():
             loop=asyncio.SelectorEventLoop()
             asyncio.set_event_loop(loop)
