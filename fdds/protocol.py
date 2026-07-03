@@ -138,6 +138,10 @@ class CMD(IntEnumName):
     GPIO_DIAG = 55
     PING_NODE = 56
     PING_NODE_ICMP = 57
+    ENABLE_BROADCAST_RX = 58
+    GET_BROADCAST_RX = 59
+    INJECT_FAULT_STATE = 60
+    GET_DIGITAL_CHANNELS = 61
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +158,14 @@ RECEIVER_DEFAULT_PORTS = {0: UDP_DATA_PORT, 1: UDP_CMD_PORT, 2: UDP_DBG_PORT}
 
 
 # ---------------------------------------------------------------------------
+# Digital (fault-output) channel descriptor flags (CMD_GET_DIGITAL_CHANNELS)
+# ---------------------------------------------------------------------------
+
+DIGITAL_CHANNEL_FLAG_CURRENT = 0x01  # has real-time (current) GPIO output
+DIGITAL_CHANNEL_FLAG_LATCHED = 0x02  # has latched (permanent) output
+
+
+# ---------------------------------------------------------------------------
 # Struct layouts (little-endian, matching firmware packing)
 # ---------------------------------------------------------------------------
 
@@ -161,10 +173,12 @@ class STRUCT:
     """Binary struct formats for FDDS protocol packets."""
     CMD = struct.Struct("<I")
     ACK = struct.Struct("<HHI")             # packet_type, state, cmd
-    ID_V4 = struct.Struct("<HH HBB HBBI3I HBBI HH") # last HH = channels_count + _reserved
+    ID_V4 = struct.Struct("<HH HBB HBBI3I HBBI HH")  # last HH = channels_count + _reserved
     ID_V5 = struct.Struct("<HH HBB HBBI3I HBBI HBB") # channels_count + fault counts
     ID = ID_V4
     CHANNEL = struct.Struct("<4s ff")       # unit(4 bytes), offset, gain
+    DIGITAL_CHANNELS_HEADER = struct.Struct("<B3s")  # count + reserved[3]
+    DIGITAL_CHANNEL = struct.Struct("<4s BB")        # label(4 bytes), flags, reserved
     CRC = struct.Struct("<H")
     FW_INFO = struct.Struct("<HBB I 8s 30s 48s BB H 2x I I")  # fw_info_t (108 bytes)
     NET_INFO = struct.Struct("<6s 2s I I I")               # net_info_t (20 bytes)

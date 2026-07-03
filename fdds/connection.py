@@ -22,6 +22,7 @@ from .protocol import (
     DS_RESULT_HEADER, DS_RESULT_HEADER_SIZE,
     ACK_PACKET_HEADER_SIZE, LOG_PACKET_HEADER_SIZE,
     ALG_SEC_CCU_DS,
+    DIGITAL_CHANNEL_FLAG_CURRENT, DIGITAL_CHANNEL_FLAG_LATCHED,
 )
 
 
@@ -47,13 +48,15 @@ class DeviceConnection:
     """
 
     def __init__(self, ip: str, cmd_port: int = UDP_CMD_PORT,
-                 timeout: float = 2.0, local_port: int = 0, name: str = ""):
+                 timeout: float = 2.0, local_port: int = 0, name: str = "",
+                 transport=None):
         self.ip = ip
         self.cmd_port = cmd_port
         self.timeout = timeout
         self.local_port = local_port
         self.name = name or ip
         self.sock: Optional[socket.socket] = None
+        self.transport = transport
         self.channels: Optional[int] = None
         self.channel_info: list[ChannelInfo] = []
         self._local_ip: Optional[str] = None
@@ -67,6 +70,12 @@ class DeviceConnection:
         return False
 
     def open(self):
+        # A non-UDP transport (serial / broadcast) carries commands itself; no
+        # per-target UDP command socket is created in that case.
+        if self.transport is not None:
+            self.transport.open()
+            self._local_ip = self.transport.local_ip or self._local_ip
+            return
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # Determine local interface routing to target
         tmp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -79,6 +88,9 @@ class DeviceConnection:
         self.sock.settimeout(self.timeout)
 
     def close(self):
+        if self.transport is not None:
+            self.transport.close()
+            return
         if self.sock:
             self.sock.close()
             self.sock = None
@@ -98,17 +110,30 @@ class DeviceConnection:
     # ------------------------------------------------------------------
 
     def send_cmd(self, cmd: CMD, data: bytes = b'',
-                 expect_response: bool = True) -> Optional[bytes]:
+                 expect_response: bool = True,
+                 timeout: float = None) -> Optional[bytes]:
         """Send a command and optionally wait for response."""
         pkt = STRUCT.CMD.pack(cmd) + data
+        if self.transport is not None:
+            if not expect_response:
+                self.transport.send(pkt)
+                return None
+            return self.transport.request(
+                pkt, timeout if timeout is not None else self.timeout)
         self.sock.sendto(pkt, (self.ip, self.cmd_port))
         if not expect_response:
             return None
+        old = self.sock.gettimeout()
         try:
+            if timeout is not None:
+                self.sock.settimeout(timeout)
             resp, addr = self.sock.recvfrom(4096)
             return resp
         except socket.timeout:
             return None
+        finally:
+            if timeout is not None:
+                self.sock.settimeout(old)
 
     def send_cmd_with_ack(self, cmd: CMD, data: bytes = b'') -> Optional[tuple[int, bytes]]:
         """Send a command and parse the ACK response.
@@ -130,6 +155,36 @@ class DeviceConnection:
     def ping(self) -> bool:
         """Ping the device. Returns True if responds."""
         return self.send_cmd(CMD.PING) is not None
+
+    def enable_broadcast_rx(self, enable: bool) -> Optional[bool]:
+        """Enable/disable acceptance of broadcast commands (RAM-only).
+
+        Returns the resulting state (bool) or ``None`` on failure.
+        """
+        result = self.send_cmd_with_ack(
+            CMD.ENABLE_BROADCAST_RX, bytes([1 if enable else 0]))
+        if result is None:
+            return None
+        _state, extra = result
+        if len(extra) < 1:
+            return None
+        return bool(extra[0])
+
+    def get_broadcast_rx(self) -> Optional[dict]:
+        """Query broadcast-command acceptance.
+
+        Returns ``{'enabled': bool, 'auto_locked': bool}`` or ``None`` on failure.
+        """
+        result = self.send_cmd_with_ack(CMD.GET_BROADCAST_RX)
+        if result is None:
+            return None
+        _state, extra = result
+        if len(extra) < 1:
+            return None
+        return {
+            'enabled': bool(extra[0]),
+            'auto_locked': bool(extra[1]) if len(extra) >= 2 else False,
+        }
 
     def ping_node_rtt(self, target_ip: str = None, node_index: int = None,
                       count: int = 10, interval_ms: int = 100,
@@ -182,12 +237,7 @@ class DeviceConnection:
 
         cmd = CMD.PING_NODE_ICMP if icmp else CMD.PING_NODE
 
-        old_timeout = self.sock.gettimeout()
-        try:
-            self.sock.settimeout(timeout)
-            resp = self.send_cmd(cmd, req)
-        finally:
-            self.sock.settimeout(old_timeout)
+        resp = self.send_cmd(cmd, req, timeout=timeout)
 
         if not resp or len(resp) < ACK_PACKET_HEADER_SIZE + STRUCT.PING_RTT_RESULT.size:
             return None
@@ -302,6 +352,37 @@ class DeviceConnection:
             "uptime_ms": uptime_ms,
             "reset_reason": reset_reason,
         }
+
+    def get_digital_channels(self) -> Optional[list]:
+        """Query CMD_GET_DIGITAL_CHANNELS — descriptors for the fault-output channels.
+
+        Returns a list of dicts {label, flags, has_current, has_latched}, or None
+        if the device did not respond (e.g. older firmware without this command).
+        """
+        result = self.send_cmd_with_ack(CMD.GET_DIGITAL_CHANNELS)
+        if result is None:
+            return None
+        state, extra = result
+        if len(extra) < STRUCT.DIGITAL_CHANNELS_HEADER.size:
+            return None
+        count = STRUCT.DIGITAL_CHANNELS_HEADER.unpack(
+            extra[:STRUCT.DIGITAL_CHANNELS_HEADER.size])[0]
+        channels = []
+        base = STRUCT.DIGITAL_CHANNELS_HEADER.size
+        for i in range(count):
+            offset = base + STRUCT.DIGITAL_CHANNEL.size * i
+            chunk = extra[offset:offset + STRUCT.DIGITAL_CHANNEL.size]
+            if len(chunk) < STRUCT.DIGITAL_CHANNEL.size:
+                break
+            label_bytes, flags, _reserved = STRUCT.DIGITAL_CHANNEL.unpack(chunk)
+            label = label_bytes.split(b'\x00', 1)[0].decode('utf-8', errors='replace')
+            channels.append({
+                "label": label,
+                "flags": flags,
+                "has_current": bool(flags & DIGITAL_CHANNEL_FLAG_CURRENT),
+                "has_latched": bool(flags & DIGITAL_CHANNEL_FLAG_LATCHED),
+            })
+        return channels
 
     def get_net_config(self) -> Optional[dict]:
         """Query CMD_GET_NET_CONFIG and return parsed net_info_t fields."""
