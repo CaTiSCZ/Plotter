@@ -675,6 +675,11 @@ class Device:
         self.last_fault_state = 0
         self.last_fault_latched = 0
         self.last_fault_valid = False
+        # Bumped on every incoming packet that refreshes the live fault/analog values,
+        # even when nothing is appended to the plot buffer (e.g. PTP mode waiting for a
+        # trigger). Lets the GUI refresh the indicators/labels independently of
+        # buffer.revision (which only advances while data is captured into the plot).
+        self.live_revision = 0
         self.digital_channels = []  # descriptors from CMD_GET_DIGITAL_CHANNELS
         self.last_analog_values = [0.0] * self.channels
         self.last_analog_valid = False
@@ -882,6 +887,7 @@ class Device:
     def _update_live_values_from_data_packet(self, data: bytes):
         self._update_fault_words_from_data_packet(data)
         self._update_analog_values_from_data_packet(data)
+        self.live_revision += 1
     
     def reset_device(self):
         return self._send_cmd(14, struct.pack('<B', 0xFE))
@@ -1802,6 +1808,10 @@ class Plotter(QWidget):
         # Last per-device buffer.revision drawn; used to skip redundant redraws when
         # no new data has arrived since the previous frame. None forces the first draw.
         self._plot_revisions = None
+        # Last per-device live_revision reflected in the indicators/labels. These
+        # advance on every incoming packet (even when the plot buffer is idle), so the
+        # indicators refresh whenever data flows, independently of the plot redraw.
+        self._live_revisions = None
         # Per-device incremental sort state for plot_sort_order(): each frame only the
         # newly appended tail (+ overlap) is re-sorted instead of the whole buffer.
         self._sort_state: Dict[str, dict] = {}
@@ -3006,8 +3016,15 @@ class Plotter(QWidget):
         return files
         
     def _update_plot(self, force=False):
-        self._refresh_fault_indicators()
-        self._refresh_analog_values()
+        # Indicators/labels reflect the latest LIVE fault/analog values, which update
+        # on every incoming packet even when nothing is being appended to the plot
+        # buffer (e.g. PTP mode waiting for a trigger). Refresh them whenever a new
+        # packet bumped live_revision, independently of the plot's buffer.revision skip.
+        live_revisions = {ip: dev.live_revision for ip, dev in self.manager.devices.items()}
+        if force or self._live_revisions != live_revisions:
+            self._live_revisions = live_revisions
+            self._refresh_fault_indicators()
+            self._refresh_analog_values()
         # Skip the (expensive) full redraw when no device buffer has changed since the
         # last frame -- e.g. a trigger / "start new sampling" capture is complete and
         # already holds all the data it asked for, even though the system keeps running
