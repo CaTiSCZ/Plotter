@@ -2953,8 +2953,6 @@ class Plotter(QWidget):
                     avgs = [0] * dev.channels
                     for ch in range(dev.channels):
                         key = (ip, ch)
-                        if key not in self.curves:
-                            self.curves[key] = self.ax.plot(pen=Plotter.Colors[len(self.curves)], name=f'{ip}[{ch}]')
 
                         #y = np.array(buf.signal[ch + 1])[-len(x):]
                         raw = np.array(buf.signal[ch + 1], dtype=float)
@@ -2976,18 +2974,18 @@ class Plotter(QWidget):
                                     unit = str(unit_raw)
                             except Exception:
                                 pass
-                        # Přepočet pouze pro zobrazení
-                        if gain == 1.0 and offset == 0.0:
-                            y = raw
-                        else:
-                            y = raw * gain
-                            y += offset
                         if key not in self.curves:
                             pen = pg.mkPen(Plotter.Colors[len(self.curves)], width=2)
                             curve_name = f'{ip}[{ch}]'
                             if unit:
                                 curve_name += f' [{unit}]'
                             self.curves[key] = self.ax.plot(pen=pen, name=curve_name)
+                        # Přepočet pouze pro zobrazení
+                        if gain == 1.0 and offset == 0.0:
+                            y = raw
+                        else:
+                            y = raw * gain
+                            y += offset
 
                         avgs[ch] = np.mean(y[-min(len(y), SAMPLES_PER_PACKET * DEFAULT_AVG_LEN_MS):])
                         self.curves[key].setData(x[-len(y):], y)
