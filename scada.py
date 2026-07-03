@@ -162,6 +162,9 @@ FAULT_INDICATOR_COLORS = {
 }
 FAULT_INDICATOR_UNKNOWN = '#bdbdbd'
 ANALOG_VALUE_FONT_STYLE = 'font-family: Consolas, "Courier New", monospace; font-size: 16px; font-weight: 600;'
+# Muted style for analog labels with no live data (shows the '--' placeholder greyed
+# out so a stalled channel is not mistaken for a valid last value).
+ANALOG_VALUE_NO_DATA_STYLE = ANALOG_VALUE_FONT_STYLE + ' color: #9e9e9e;'
 
 # Features
 FCN_QT_LOGGING = True  # Enable Qt logging handler
@@ -1830,6 +1833,16 @@ class Plotter(QWidget):
         # advance on every incoming packet (even when the plot buffer is idle), so the
         # indicators refresh whenever data flows, independently of the plot redraw.
         self._live_revisions = None
+        # Deferred grey-out after a stop/stall transition: wait two GUI refreshes and
+        # grey the indicators only if NO new packet arrived in between, so a genuinely
+        # idle system greys out while a stopped one still fed sporadic (e.g.
+        # test/spoofed) packets keeps colouring. _grey_pending = remaining refresh
+        # countdown; _grey_baseline_rev = total received-packet counter snapshot used
+        # to detect new data; _system_status_ok = last status was RUNNING/OK, so we
+        # arm only on an OK -> non-OK transition (one arm per start+stop cycle).
+        self._grey_pending = 0
+        self._grey_baseline_rev = None
+        self._system_status_ok = False
         # Per-device incremental sort state for plot_sort_order(): each frame only the
         # newly appended tail (+ overlap) is re-sorted instead of the whole buffer.
         self._sort_state: Dict[str, dict] = {}
@@ -2062,9 +2075,25 @@ class Plotter(QWidget):
                 self._rebuild_analog_value_row(row, channel_count)
             if channel_count == 0:
                 continue
+            valid = bool(dev and dev.last_analog_valid)
             for ch_idx, lbl in enumerate(self.device_analog_value_labels[row]):
                 lbl.setText(self._format_analog_value(dev, ch_idx))
-                lbl.setToolTip(f'Channel {ch_idx} live value (calibrated)')
+                if valid:
+                    lbl.setStyleSheet(ANALOG_VALUE_FONT_STYLE)
+                    lbl.setToolTip(f'Channel {ch_idx} live value (calibrated)')
+                else:
+                    lbl.setStyleSheet(ANALOG_VALUE_NO_DATA_STYLE)
+                    lbl.setToolTip(f'Channel {ch_idx}: no live data')
+
+    def _arm_grey_check(self):
+        """Arm the deferred grey-out: over the next two GUI refreshes, grey the
+        indicators only if no new packet arrives in between (see _update_plot). Lets a
+        genuinely idle system grey out while a stopped one still receiving sporadic
+        (e.g. test/spoofed) packets keeps colouring. A lone packet arriving long after
+        the stop colours the indicators and they stay coloured until the next
+        start + stop re-arms the check."""
+        self._grey_pending = 2
+        self._grey_baseline_rev = None
 
     def _reset_fault_bit(self, row:int, bit_idx:int):
         dev = self._device_for_row(row)
@@ -2361,6 +2390,19 @@ class Plotter(QWidget):
         if color:
             style += f'; background-color: {color}'
         self.system_status_lbl.setStyleSheet(style)
+        # Drive the live indicators from the system status. A RUNNING/OK status lets
+        # incoming packets colour them; any other status (stopped/idle/failed/stalled)
+        # ARMS a deferred grey-out that only greys if data actually stopped (no new
+        # packet across two refreshes, see _update_plot). This keeps a stopped-but-
+        # still-fed system (e.g. test/spoofed faults) coloured, while a genuinely idle
+        # one greys out. Armed only on an OK -> non-OK transition (one per stop).
+        if color:
+            ok = (color == SYSTEM_STATUS_COLOR_OK)
+            if ok:
+                self._grey_pending = 0          # cancel a pending grey; packets colour
+            elif self._system_status_ok:        # OK -> non-OK transition: arm the check
+                self._arm_grey_check()
+            self._system_status_ok = ok
 
     def _system_state_color(self, state):
         """Map a startup-state code to its status-label colour."""
@@ -3034,6 +3076,25 @@ class Plotter(QWidget):
         return files
         
     def _update_plot(self, force=False):
+        # Deferred grey-out after a stop/stall transition (armed by _arm_grey_check):
+        # wait two GUI refreshes and grey the indicators only if no new packet arrived
+        # in between, so a stopped system still fed sporadic (e.g. test/spoofed)
+        # packets keeps colouring while a genuinely idle one greys out.
+        if self._grey_pending:
+            total_rev = sum(dev.live_revision for dev in self.manager.devices.values())
+            if self._grey_baseline_rev is None:
+                # First refresh after arming: snapshot the received-packet counter
+                # (trailing packets from just before the stop settle into it here).
+                self._grey_baseline_rev = total_rev
+                self._grey_pending -= 1
+            else:
+                # Second refresh: if no packet arrived since the snapshot, grey out.
+                if total_rev == self._grey_baseline_rev:
+                    for dev in self.manager.devices.values():
+                        dev.last_fault_valid = False
+                        dev.last_analog_valid = False
+                    self._live_revisions = None  # force the refresh below to redraw
+                self._grey_pending = 0
         # Indicators/labels reflect the latest LIVE fault/analog values, which update
         # on every incoming packet even when nothing is being appended to the plot
         # buffer (e.g. PTP mode waiting for a trigger). Refresh them whenever a new
