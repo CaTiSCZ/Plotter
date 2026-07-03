@@ -247,6 +247,16 @@ _DATA_PTP_BACK_STEPS = np.arange(SAMPLES_PER_PACKET - 1, -1, -1, dtype=np.int64)
 def _uses_v5_packet_format(info: dict | None) -> bool:
     return bool(info and info.get('fw_ver_major', 0) >= 5)
 
+def _decode_c_string(raw) -> str:
+    """Decode a fixed-size C string (NUL-terminated) to a Python str.
+
+    Only the bytes before the first NUL are valid; the field's remaining bytes
+    are padding. Non-bytes input is returned stringified/stripped unchanged.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw).split(b'\x00', 1)[0].decode('ascii', errors='ignore').strip()
+    return str(raw).strip()
+
 def parse_id_packet(data):
     if len(data) < ID_HEADER_STRUCT.size:
         raise ValueError("[ERR]: ID packet is short")
@@ -286,6 +296,10 @@ def parse_id_packet(data):
     available_channels = (len(data) - ID_HEADER_STRUCT.size) // CHANNEL_HEADER_STRUCT.size
     parsed_channels = max(0, min(info['channels_count'], available_channels))
     info['channels'] = [dict(zip(channels_info, CHANNEL_HEADER_STRUCT.unpack(data[ID_HEADER_STRUCT.size+i*CHANNEL_HEADER_STRUCT.size:ID_HEADER_STRUCT.size+(i+1)*CHANNEL_HEADER_STRUCT.size]))) for i in range(parsed_channels)]
+    # Decode each channel's fixed 4-byte unit C string once, here, so the rest of
+    # the app can treat info['channels'][i]['unit'] as a ready Python str.
+    for ch in info['channels']:
+        ch['unit'] = _decode_c_string(ch.get('unit', b''))
     return info
 
 class NumpyRing:
@@ -785,11 +799,8 @@ class Device:
             ch = ch_infos[channel_idx]
             gain = float(ch.get('gain', 1.0))
             offset = float(ch.get('offset', 0.0))
-            unit_raw = ch.get('unit', b'')
-            if isinstance(unit_raw, (bytes, bytearray)):
-                unit = bytes(unit_raw).decode('ascii', errors='ignore').replace('\x00', '').strip()
-            else:
-                unit = str(unit_raw).strip()
+            # Unit is decoded to a str once in parse_id_packet.
+            unit = str(ch.get('unit', '')).strip()
             return gain, offset, (unit or '-')
         return 1.0, 0.0, '-'
 
@@ -3058,11 +3069,8 @@ class Plotter(QWidget):
                             try:
                                 gain = dev.info["channels"][ch]["gain"]
                                 offset = dev.info["channels"][ch]["offset"]
-                                unit_raw = dev.info["channels"][ch]["unit"]
-                                if isinstance(unit_raw, bytes):
-                                    unit = unit_raw.decode("ascii", errors="ignore").rstrip("\0").strip()
-                                else:
-                                    unit = str(unit_raw)
+                                # Unit is decoded to a str once in parse_id_packet.
+                                unit = str(dev.info["channels"][ch]["unit"])
                             except Exception:
                                 pass
                         if key not in self.curves:
