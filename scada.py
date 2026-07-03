@@ -2899,7 +2899,16 @@ class Plotter(QWidget):
 
             with open(tmp_name, 'w', newline='') as f:
                 w = csv.writer(f)
-                header = ['time', 'ptp_ns'] + [f'ch{c}' for c in range(csv_channels)]
+                if has_result_meta:
+                    ch_headers = [f'ch{c}' for c in range(csv_channels)]
+                else:
+                    # Analog channels: append the calibrated unit in the same
+                    # '[unit]' format as the plot legend (skip the '-' placeholder).
+                    ch_headers = []
+                    for c in range(csv_channels):
+                        unit = dev.analog_units[c] if c < len(dev.analog_units) else ''
+                        ch_headers.append(f'ch{c} [{unit}]' if unit and unit != '-' else f'ch{c}')
+                header = ['time', 'ptp_ns'] + ch_headers
                 if has_result_meta:
                     n_fault = GATHERING_DEVICES
                     n_parity = GATHERING_DEVICES * ACQUISITION_CHANNELS
