@@ -157,6 +157,7 @@ FAULT_INDICATOR_COLORS = {
     (1, 1): '#c0392b',
 }
 FAULT_INDICATOR_UNKNOWN = '#bdbdbd'
+ANALOG_VALUE_FONT_STYLE = 'font-family: Consolas, "Courier New", monospace; font-size: 16px; font-weight: 600;'
 
 # Features
 FCN_QT_LOGGING = True  # Enable Qt logging handler
@@ -656,6 +657,11 @@ class Device:
         self.last_fault_state = 0
         self.last_fault_latched = 0
         self.last_fault_valid = False
+        self.last_analog_values = [0.0] * self.channels
+        self.last_analog_valid = False
+        self.analog_units = ['-'] * self.channels
+        self.analog_decimals = [3] * self.channels
+        self.analog_widths = [8] * self.channels
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None, port:int|None = None):
         pkt = struct.pack('<I', code) + payload
@@ -691,6 +697,8 @@ class Device:
             self.result_channels = int(info.get('fault_state_count', self.channels))
             self.buffer = DeviceBuffer(max(self.channels, self.result_channels))
             self.info = info
+            self._build_analog_display_meta()
+            self._log_channel_calibration()
             return info
         except Exception as e:
             self._logger.warning(f"Dev {self.ip} failed to parse ID packet: {e}")
@@ -734,6 +742,79 @@ class Device:
         payload = b'' if mask is None else struct.pack('<H', mask & 0xFFFF)
         return self._send_cmd(int(CMD.RESET_FAULT_STATE), payload)
 
+    def _channel_calibration(self, channel_idx: int):
+        info = getattr(self, 'info', None) or {}
+        ch_infos = info.get('channels', [])
+        if channel_idx < len(ch_infos):
+            ch = ch_infos[channel_idx]
+            gain = float(ch.get('gain', 1.0))
+            offset = float(ch.get('offset', 0.0))
+            unit_raw = ch.get('unit', b'')
+            if isinstance(unit_raw, (bytes, bytearray)):
+                unit = bytes(unit_raw).decode('ascii', errors='ignore').replace('\x00', '').strip()
+            else:
+                unit = str(unit_raw).strip()
+            return gain, offset, (unit or '-')
+        return 1.0, 0.0, '-'
+
+    def _build_analog_display_meta(self):
+        self.analog_units = []
+        self.analog_decimals = []
+        self.analog_widths = []
+        for ch_idx in range(self.channels):
+            gain, offset, unit = self._channel_calibration(ch_idx)
+            abs_gain = abs(gain)
+            if not np.isfinite(abs_gain) or abs_gain <= 0:
+                decimals = 3
+            else:
+                decimals = int(max(0, min(6, np.ceil(-np.log10(abs_gain)))))
+
+            lo = -32768.0 * gain + offset
+            hi = 32767.0 * gain + offset
+            max_abs = max(abs(lo), abs(hi), abs(offset))
+            if not np.isfinite(max_abs) or max_abs < 1.0:
+                int_digits = 1
+            else:
+                int_digits = int(np.floor(np.log10(max_abs))) + 1
+            sign_chars = 1 if (lo < 0 or hi < 0 or offset < 0) else 0
+            width = sign_chars + int_digits + (1 + decimals if decimals > 0 else 0)
+
+            self.analog_units.append(unit)
+            self.analog_decimals.append(decimals)
+            self.analog_widths.append(max(4, min(14, width)))
+
+        if len(self.last_analog_values) != self.channels:
+            self.last_analog_values = [0.0] * self.channels
+
+    def _log_channel_calibration(self):
+        parts = []
+        for ch_idx in range(self.channels):
+            gain, offset, unit = self._channel_calibration(ch_idx)
+            decimals = self.analog_decimals[ch_idx] if ch_idx < len(self.analog_decimals) else 3
+            width = self.analog_widths[ch_idx] if ch_idx < len(self.analog_widths) else 8
+            parts.append(
+                f'ch{ch_idx}: offset={offset:.6g}, gain={gain:.6g}, unit={unit}, fmt=width{width}/dec{decimals}'
+            )
+        if parts:
+            self._logger.info(f'ID calibration {self.ip}: ' + '; '.join(parts))
+
+    def _update_analog_values_from_raw_last(self, raw_last_values):
+        vals = []
+        for ch_idx in range(self.channels):
+            gain, offset, _unit = self._channel_calibration(ch_idx)
+            raw_v = float(raw_last_values[ch_idx]) if ch_idx < len(raw_last_values) else 0.0
+            vals.append(raw_v * gain + offset)
+        self.last_analog_values = vals
+        self.last_analog_valid = True
+
+    def _update_analog_values_from_data_packet(self, data: bytes):
+        nsamp = self.channels * SAMPLES_PER_PACKET
+        raw = np.frombuffer(data, dtype='<i2', count=nsamp, offset=12)
+        if raw.size != nsamp:
+            return
+        raw = raw.reshape(self.channels, SAMPLES_PER_PACKET)
+        self._update_analog_values_from_raw_last(raw[:, -1])
+
     def _update_fault_words_from_data_packet(self, data: bytes):
         off = 12 + 2 * self.channels * SAMPLES_PER_PACKET + self.channels
         off += self.channels % 2
@@ -747,6 +828,10 @@ class Device:
         else:
             self.last_fault_latched = 0
         self.last_fault_valid = True
+
+    def _update_live_values_from_data_packet(self, data: bytes):
+        self._update_fault_words_from_data_packet(data)
+        self._update_analog_values_from_data_packet(data)
     
     def reset_device(self):
         return self._send_cmd(14, struct.pack('<B', 0xFE))
@@ -991,7 +1076,7 @@ class Device:
                             self.input_packet_ring.append(bytes(pkt))
                             data = _verify_crc(pkt)
                             if data not in (None, False):
-                                self._update_fault_words_from_data_packet(data)
+                                self._update_live_values_from_data_packet(data)
                             return
 
                     if self.capture_limit > 0 and self.capture_counter >= self.capture_limit:
@@ -1052,7 +1137,7 @@ class Device:
                 samples = np.frombuffer(data, dtype='<i2', count=nsamp, offset=off).reshape(self.channels, SAMPLES_PER_PACKET).tolist()
                 off += 2*nsamp
                 errs = list(data[off:off+self.channels])
-                self._update_fault_words_from_data_packet(data)
+                self._update_live_values_from_data_packet(data)
                 self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs, ptp)
                 return order
             case self.PKT_TYPE_TRIGGER:
@@ -1445,6 +1530,8 @@ class Plotter(QWidget):
         self.device_trigger_holdoff: List[QSpinBox] = []
         self.device_fault_indicator_layouts: List[QHBoxLayout] = []
         self.device_fault_indicators: List[List[QPushButton]] = []
+        self.device_analog_value_layouts: List[QHBoxLayout] = []
+        self.device_analog_value_labels: List[List[QLabel]] = []
 
         for i in range(DeviceManager.MAX_DEVICES):
             lb = QLabel(f'Device {i}')
@@ -1494,19 +1581,29 @@ class Plotter(QWidget):
             fault_widget = QWidget()
             fault_widget.setLayout(fault_box)
             fault_widget.setToolTip('Digital fault outputs')
-            cfg.addWidget(fault_widget, i, 6)
+            cfg.addWidget(fault_widget, i, 6, alignment=Qt.AlignLeft | Qt.AlignVCenter)
             self.device_fault_indicator_layouts.append(fault_box)
             self.device_fault_indicators.append([])
 
+            analog_box = QHBoxLayout()
+            analog_box.setContentsMargins(0, 0, 0, 0)
+            analog_box.setSpacing(10)
+            analog_widget = QWidget()
+            analog_widget.setLayout(analog_box)
+            analog_widget.setToolTip('Live analog values')
+            cfg.addWidget(analog_widget, i, 7, alignment=Qt.AlignLeft | Qt.AlignVCenter)
+            self.device_analog_value_layouts.append(analog_box)
+            self.device_analog_value_labels.append([])
+
         self.leader_buttons.buttonClicked[int].connect(self._leader_changed)
 
-        cfg.addWidget(QLabel('Receiver addr:port'), 0, 7)
+        cfg.addWidget(QLabel('Receiver addr:port'), 0, 8)
         self.receiver_edit = QLineEdit(f'0.0.0.0:{DEFAULT_DATA_PORT}')
-        cfg.addWidget(self.receiver_edit, 0, 8)
+        cfg.addWidget(self.receiver_edit, 0, 9)
 
-        cfg.addWidget(QLabel('Measurement number'), 2, 7)
+        cfg.addWidget(QLabel('Measurement number'), 2, 8)
         self.measurement_number_edit = QLineEdit(f'0')
-        cfg.addWidget(self.measurement_number_edit, 2, 8)
+        cfg.addWidget(self.measurement_number_edit, 2, 9)
 
         self.apply_btn = QPushButton('Apply Device List')
         cfg.addWidget(self.apply_btn, DeviceManager.MAX_DEVICES, 2)
@@ -1813,6 +1910,49 @@ class Plotter(QWidget):
                     btn.setStyleSheet(self._fault_indicator_style(None, None))
                     btn.setToolTip(f'Bit {bit_idx}: no live fault data yet. Click to reset this latch bit.')
 
+    def _rebuild_analog_value_row(self, row:int, channel_count:int):
+        layout = self.device_analog_value_layouts[row]
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        labels: List[QLabel] = []
+        for _ch in range(channel_count):
+            lbl = QLabel()
+            lbl.setStyleSheet(ANALOG_VALUE_FONT_STYLE)
+            lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            layout.addWidget(lbl)
+            labels.append(lbl)
+        layout.addStretch(1)
+        self.device_analog_value_labels[row] = labels
+
+    def _format_analog_value(self, dev: Device, channel_idx: int) -> str:
+        unit = dev.analog_units[channel_idx] if channel_idx < len(dev.analog_units) else '-'
+        width = dev.analog_widths[channel_idx] if channel_idx < len(dev.analog_widths) else 8
+        decimals = dev.analog_decimals[channel_idx] if channel_idx < len(dev.analog_decimals) else 3
+        if dev.last_analog_valid and channel_idx < len(dev.last_analog_values):
+            val = float(dev.last_analog_values[channel_idx])
+            if np.isfinite(val):
+                val_s = f'{val:>{width}.{decimals}f}'
+            else:
+                val_s = f"{'nan':>{width}}"
+        else:
+            val_s = f"{'--':>{width}}"
+        return f'{val_s} {unit}'
+
+    def _refresh_analog_values(self):
+        for row in range(DeviceManager.MAX_DEVICES):
+            dev = self._device_for_row(row)
+            channel_count = int(getattr(dev, 'channels', 0)) if dev is not None else 0
+            if len(self.device_analog_value_labels[row]) != channel_count:
+                self._rebuild_analog_value_row(row, channel_count)
+            if channel_count == 0:
+                continue
+            for ch_idx, lbl in enumerate(self.device_analog_value_labels[row]):
+                lbl.setText(self._format_analog_value(dev, ch_idx))
+                lbl.setToolTip(f'Channel {ch_idx} live value (calibrated)')
+
     def _reset_fault_bit(self, row:int, bit_idx:int):
         dev = self._device_for_row(row)
         if dev is None:
@@ -1880,6 +2020,7 @@ class Plotter(QWidget):
             except:
                 self._logger.warning(f'Bad entry: {txt}')
         self._refresh_fault_indicators()
+        self._refresh_analog_values()
         self._logger.info(f'Applied {count} devices')
 
     def _ping_all(self):
@@ -1900,6 +2041,7 @@ class Plotter(QWidget):
                 f"channels={info['channels_count']}; faults={info.get('fault_state_count', 0)}; "
                 f"latched={info.get('fault_latched_count', 0)}" if info else 'FAIL'))
         self._refresh_fault_indicators()
+        self._refresh_analog_values()
 
     def _register_all(self):
         try:
@@ -2760,6 +2902,7 @@ class Plotter(QWidget):
         
     def _update_plot(self, force=False):
         self._refresh_fault_indicators()
+        self._refresh_analog_values()
         # Skip the (expensive) full redraw when no device buffer has changed since the
         # last frame -- e.g. a trigger / "start new sampling" capture is complete and
         # already holds all the data it asked for, even though the system keeps running
