@@ -87,6 +87,12 @@ DEFAULT_AVG_LEN_MS = 1000 # could be overwritten by default_settings.py
 # labels are redrawn. 100 ms = 10 Hz. Overridable via default_settings.py.
 GUI_REFRESH_INTERVAL_MS = 100
 CCU_DEVICE_INDEX   = 0
+# ISOMON: an additional device type. It sits directly below Node 4 with the next
+# consecutive IP. SCADA registers itself as its data/log receiver during init, but the
+# CCU is NOT registered on it and the CCU is not told about it (see _register_ccu).
+ISOMON_DEVICE_INDEX = 5
+# GUI row labels: index 0 = CCU, 1..4 = Node 1..4, 5 = ISOMON.
+DEVICE_LABELS = ['CCU', 'Node 1', 'Node 2', 'Node 3', 'Node 4', 'ISOMON']
 DEFAULT_SOCKET_BACKEND = 'auto'
 DATA_SOCKET_RECV_TIMEOUT_S = 0.02
 DATA_SOCKET_DRAIN_TIMEOUT_S = 0.3
@@ -1340,7 +1346,7 @@ class Device:
 
 # Manager of multiple devices
 class DeviceManager:
-    MAX_DEVICES = 5
+    MAX_DEVICES = 6
     def __init__(self, data_port:int = DEFAULT_DATA_PORT, socket_backend: str = DEFAULT_SOCKET_BACKEND,
                  data_rcvbuf: int = DATA_SOCKET_RCVBUF_BYTES):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
@@ -1413,8 +1419,12 @@ class DeviceManager:
     def get_all_ids(self):
         return {ip: dev.get_id() for ip,dev in self.devices.items()}
     
-    def register_all(self, addr:str, port:int):
-        for dev in self.devices.values(): dev.register_receiver(addr, port)
+    def register_all(self, addr:str, port:int, exclude_ips=None):
+        exclude = set(exclude_ips or ())
+        for ip, dev in self.devices.items():
+            if ip in exclude:
+                continue
+            dev.register_receiver(addr, port)
 
     def remove_all(self, addr:str, port:int):
         for dev in self.devices.values(): dev.remove_receiver(addr, port)
@@ -1632,7 +1642,7 @@ class Plotter(QWidget):
         self.device_analog_value_labels: List[List[QLabel]] = []
 
         for i in range(DeviceManager.MAX_DEVICES):
-            lb = QLabel(f'Device {i}')
+            lb = QLabel(DEVICE_LABELS[i] if i < len(DEVICE_LABELS) else f'Device {i}')
             cfg.addWidget(lb, i, 0)
             self.device_labels.append(lb)
 
@@ -2229,8 +2239,10 @@ class Plotter(QWidget):
         try:
             addr,pr=self.device_edits[CCU_DEVICE_INDEX].text().split(':')
             port=DEFAULT_DATA_PORT
-            self.manager.register_all(addr,port)
-            self._logger.info(f'Registered {addr}:{port}')
+            # The CCU is not registered on the ISOMON device (the CCU knows nothing about it).
+            isomon_ip = self.device_edits[ISOMON_DEVICE_INDEX].text().strip().split(':')[0]
+            self.manager.register_all(addr, port, exclude_ips=[isomon_ip])
+            self._logger.info(f'Registered CCU {addr}:{port} on all nodes except ISOMON ({isomon_ip})')
         except:
             self._logger.warning('Bad receiver address')
 
@@ -3488,7 +3500,8 @@ def main(argv):
                 if debug:
                     checkbox.setChecked(i in (0,))
                 else:
-                    checkbox.setChecked(i < DEVICES_COUNT)
+                    # ISOMON is always enabled so SCADA registers itself on it during init.
+                    checkbox.setChecked(i < DEVICES_COUNT or i == ISOMON_DEVICE_INDEX)
             gui.leader_buttons.button(DEFAULT_LEADER).setChecked(True)
             gui._apply_devices()
             gui._apply_config()
