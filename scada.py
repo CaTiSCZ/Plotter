@@ -3432,6 +3432,9 @@ def main(argv):
         DEFAULT_FIRST_IP = getattr(ds, 'DEFAULT_FIRST_IP', "192.168.137.100")
         DEFAULT_LEADER = getattr(ds, 'DEFAULT_LEADER', 1)
         DEVICES_COUNT = getattr(ds, 'DEVICES_COUNT', 5)
+        # ISOMON is disabled by default: until it actually streams data, enabling it
+        # would break the running-system status (a checked device with no data).
+        ISOMON_ENABLED = bool(getattr(ds, 'ISOMON_ENABLED', False))
         DEFAULT_AVG_LEN_MS = getattr(ds, 'DEFAULT_AVG_LEN_MS', 1000)
         DEFAULT_PRETRIGGER_PACKETS = getattr(ds, 'DEFAULT_PRETRIGGER_PACKETS', 0)
         # Fall back to DEFAULT_AVG_LEN_MS so behaviour is unchanged when the setting/file is absent.
@@ -3480,7 +3483,7 @@ def main(argv):
         gui_log_handler.setLevel(logging.DEBUG)
         logging_.log_printer.add_handler(gui_log_handler)
         logging_.logger.critical(f"Logging to file: {logging_.log_path}") # This has to be in console, so critical
-        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PRETRIGGER_PACKETS={DEFAULT_PRETRIGGER_PACKETS}, DEFAULT_POSTTRIGGER_PACKETS={DEFAULT_POSTTRIGGER_PACKETS}, PTP_TRIGGER_RING_PACKETS={PTP_TRIGGER_RING_PACKETS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}, DATA_SOCKET_RCVBUF_BYTES={DATA_SOCKET_RCVBUF_BYTES}, TRIGGER_CAPTURE_MARGIN_PACKETS={TRIGGER_CAPTURE_MARGIN_PACKETS}, BUFFER_LENGTH_S={BUFFER_LENGTH_S}, FIREWALL_PENETRATION={FIREWALL_PENETRATION}, USE_OPENGL={USE_OPENGL}, GUI_REFRESH_INTERVAL_MS={GUI_REFRESH_INTERVAL_MS}")
+        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PRETRIGGER_PACKETS={DEFAULT_PRETRIGGER_PACKETS}, DEFAULT_POSTTRIGGER_PACKETS={DEFAULT_POSTTRIGGER_PACKETS}, PTP_TRIGGER_RING_PACKETS={PTP_TRIGGER_RING_PACKETS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}, DATA_SOCKET_RCVBUF_BYTES={DATA_SOCKET_RCVBUF_BYTES}, TRIGGER_CAPTURE_MARGIN_PACKETS={TRIGGER_CAPTURE_MARGIN_PACKETS}, BUFFER_LENGTH_S={BUFFER_LENGTH_S}, FIREWALL_PENETRATION={FIREWALL_PENETRATION}, USE_OPENGL={USE_OPENGL}, GUI_REFRESH_INTERVAL_MS={GUI_REFRESH_INTERVAL_MS}, ISOMON_ENABLED={ISOMON_ENABLED}")
         def start_loop():
             loop=asyncio.SelectorEventLoop()
             asyncio.set_event_loop(loop)
@@ -3500,8 +3503,9 @@ def main(argv):
                 if debug:
                     checkbox.setChecked(i in (0,))
                 else:
-                    # ISOMON is always enabled so SCADA registers itself on it during init.
-                    checkbox.setChecked(i < DEVICES_COUNT or i == ISOMON_DEVICE_INDEX)
+                    # ISOMON is enabled only when ISOMON_ENABLED; otherwise it stays off so
+                    # a device with no data doesn't break the running-system status.
+                    checkbox.setChecked(i < DEVICES_COUNT or (i == ISOMON_DEVICE_INDEX and ISOMON_ENABLED))
             gui.leader_buttons.button(DEFAULT_LEADER).setChecked(True)
             gui._apply_devices()
             gui._apply_config()

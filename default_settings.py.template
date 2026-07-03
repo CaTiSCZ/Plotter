@@ -1,6 +1,7 @@
 DEFAULT_FIRST_IP = "192.168.137.120"
 DEFAULT_LEADER = 1
 DEVICES_COUNT = 5
+ISOMON_ENABLED = False   ## enable the ISOMON device row (registers SCADA as its data/log receiver during init); leave False until ISOMON actually streams data, otherwise a device with no data breaks the running-system status
 DEFAULT_AVG_LEN_MS = 1000
 DEFAULT_PRETRIGGER_PACKETS = 0   ## default pre-trigger packets captured before the trigger (range 0..PTP_TRIGGER_RING_PACKETS)
 DEFAULT_POSTTRIGGER_PACKETS = 1000   ## default post-trigger packets captured after the trigger (Post-trigger packets spinbox)
