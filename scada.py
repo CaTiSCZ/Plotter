@@ -888,6 +888,20 @@ class Device:
         self._update_fault_words_from_data_packet(data)
         self._update_analog_values_from_data_packet(data)
         self.live_revision += 1
+
+    def _update_live_values_from_result_packet(self, data: bytes):
+        # CCU RESULT packets carry the combined fault-output bitmask in `value`
+        # (offset 12); mirror it into the live fault state so the CCU's fault
+        # indicators colour like the nodes' (the CCU never sends DATA packets, so
+        # its live values would otherwise never update). No separate latched word
+        # exists for the CCU's own outputs, so latched stays 0.
+        val_off = 12
+        if val_off + 2 > len(data):
+            return
+        self.last_fault_state = struct.unpack('<H', data[val_off:val_off+2])[0]
+        self.last_fault_latched = 0
+        self.last_fault_valid = True
+        self.live_revision += 1
     
     def reset_device(self):
         return self._send_cmd(14, struct.pack('<B', 0xFE))
@@ -1221,6 +1235,9 @@ class Device:
                             # fall through so this packet is captured as the first post-trigger packet
                         else:
                             self.input_packet_ring.append(bytes(pkt))
+                            data = _verify_crc(pkt)
+                            if data not in (None, False):
+                                self._update_live_values_from_result_packet(data)
                             return
 
                     if self.capture_limit > 0 and self.capture_counter >= self.capture_limit:
@@ -1290,6 +1307,7 @@ class Device:
                 if len(errs) < self.result_channels:
                     errs.extend([0] * (self.result_channels - len(errs)))
 
+                self._update_live_values_from_result_packet(data)
                 self.loop.call_soon_threadsafe(self.buffer.extend_result, t, samples, errs,
                                                ptp, fault_state, fault_latched, parity_errors, crc_error_mask)
                 #self._logger.info(f"Dev {self.ip} packetNumber[{order}]: result {result_code}")
