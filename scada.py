@@ -48,6 +48,7 @@ from fdds.protocol import (
     ACQUISITION_CHANNELS as FDDS_ACQUISITION_CHANNELS,
     MAX_RECEIVERS as FDDS_MAX_RECEIVERS,
     RECEIVER_TYPE_DATA, RECEIVER_TYPE_LOG, RECEIVER_TYPE_DBG,
+    DIGITAL_CHANNEL_FLAG_CURRENT, DIGITAL_CHANNEL_FLAG_LATCHED,
     UDP_CMD_PORT, UDP_DATA_PORT,
 )
 from fdds.crc import crc16_ccitt
@@ -657,6 +658,7 @@ class Device:
         self.last_fault_state = 0
         self.last_fault_latched = 0
         self.last_fault_valid = False
+        self.digital_channels = []  # descriptors from CMD_GET_DIGITAL_CHANNELS
         self.last_analog_values = [0.0] * self.channels
         self.last_analog_valid = False
         self.analog_units = ['-'] * self.channels
@@ -741,6 +743,40 @@ class Device:
     def reset_fault_state(self, mask:int|None = None):
         payload = b'' if mask is None else struct.pack('<H', mask & 0xFFFF)
         return self._send_cmd(int(CMD.RESET_FAULT_STATE), payload)
+
+    def get_digital_channels(self):
+        """CMD_GET_DIGITAL_CHANNELS -> list of per-bit descriptors, or None.
+
+        Each entry: {'label', 'flags', 'has_current', 'has_latched'}. The wire
+        payload (after the 8-byte ACK header) is a digital_channels_packet_t:
+        count(1) + reserved(3) + count x digital_channel_info_t(label[4], flags, reserved).
+        """
+        res = self._send_cmd_with_ack(int(CMD.GET_DIGITAL_CHANNELS))
+        if res is None:
+            self._logger.warning(f"Dev {self.ip} failed to get digital channels (no/invalid ACK).")
+            return None
+        _state, extra = res
+        hdr = STRUCT.DIGITAL_CHANNELS_HEADER
+        ch_struct = STRUCT.DIGITAL_CHANNEL
+        if len(extra) < hdr.size:
+            self._logger.warning(f"Dev {self.ip} digital channels reply too short ({len(extra)}).")
+            return None
+        count = extra[0]
+        channels = []
+        for i in range(count):
+            off = hdr.size + i * ch_struct.size
+            if off + ch_struct.size > len(extra):
+                break
+            label_raw, flags, _reserved = ch_struct.unpack_from(extra, off)
+            label = label_raw.decode('ascii', errors='ignore').replace('\x00', '').strip()
+            channels.append({
+                'label': label or str(i),
+                'flags': flags,
+                'has_current': bool(flags & DIGITAL_CHANNEL_FLAG_CURRENT),
+                'has_latched': bool(flags & DIGITAL_CHANNEL_FLAG_LATCHED),
+            })
+        self.digital_channels = channels
+        return channels
 
     def _channel_calibration(self, channel_idx: int):
         info = getattr(self, 'info', None) or {}
@@ -1336,6 +1372,9 @@ class DeviceManager:
     def get_trigger_config_all(self):
         return {ip: dev.get_trigger_config() for ip, dev in self.devices.items()}
 
+    def get_digital_channels_all(self):
+        return {ip: dev.get_digital_channels() for ip, dev in self.devices.items()}
+
     def reset_counter(self):
         return self._send_cmd_broadcast(10)      
 
@@ -1849,7 +1888,7 @@ class Plotter(QWidget):
         ip = self._configured_ip_for_row(row)
         return self.manager.devices.get(ip) if ip else None
 
-    def _fault_indicator_style(self, fault:int|None, latch:int|None) -> str:
+    def _fault_indicator_style(self, fault:int|None, latch:int|None, has_label:bool=False) -> str:
         if fault is None or latch is None:
             color = FAULT_INDICATOR_UNKNOWN
             text_color = 'black'
@@ -1857,15 +1896,20 @@ class Plotter(QWidget):
             color = FAULT_INDICATOR_COLORS[(fault, latch)]
             text_color = 'white' if (fault, latch) in ((0, 0), (1, 1)) else 'black'
         radius = FAULT_INDICATOR_SIZE // 2
+        if has_label:
+            size = (f'min-width: {FAULT_INDICATOR_SIZE}px; padding: 0px 6px; '
+                    f'min-height: {FAULT_INDICATOR_SIZE}px; max-height: {FAULT_INDICATOR_SIZE}px;')
+        else:
+            size = (f'min-width: {FAULT_INDICATOR_SIZE}px; max-width: {FAULT_INDICATOR_SIZE}px; '
+                    f'min-height: {FAULT_INDICATOR_SIZE}px; max-height: {FAULT_INDICATOR_SIZE}px; padding: 0px;')
         return (
             'QPushButton {'
             f'background-color: {color}; color: {text_color}; border: 1px solid #555; '
-            f'border-radius: {radius}px; min-width: {FAULT_INDICATOR_SIZE}px; max-width: {FAULT_INDICATOR_SIZE}px; '
-            f'min-height: {FAULT_INDICATOR_SIZE}px; max-height: {FAULT_INDICATOR_SIZE}px; padding: 0px;'
+            f'border-radius: {radius}px; {size}'
             '}'
         )
 
-    def _rebuild_fault_indicator_row(self, row:int, bit_count:int):
+    def _rebuild_fault_indicator_row(self, row:int, labels:List[str]):
         layout = self.device_fault_indicator_layouts[row]
         while layout.count():
             item = layout.takeAt(0)
@@ -1873,42 +1917,69 @@ class Plotter(QWidget):
             if widget is not None:
                 widget.deleteLater()
         buttons: List[QPushButton] = []
-        for bit_idx in range(bit_count):
-            btn = QPushButton(str(bit_idx))
+        for bit_idx, label in enumerate(labels):
+            btn = QPushButton(label)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet(self._fault_indicator_style(None, None))
+            btn.setStyleSheet(self._fault_indicator_style(None, None, has_label=len(label) > 1))
             btn.clicked.connect(lambda _checked=False, row=row, bit=bit_idx: self._reset_fault_bit(row, bit))
             layout.addWidget(btn)
             buttons.append(btn)
         layout.addStretch(1)
         self.device_fault_indicators[row] = buttons
 
+    def _digital_bit_label(self, dev, bit_idx:int) -> str | None:
+        """Digital-channel mnemonic for a fault-output bit, or None when only the
+        plain numeric index is available."""
+        descriptors = getattr(dev, 'digital_channels', None) if dev is not None else None
+        if descriptors and bit_idx < len(descriptors):
+            label = descriptors[bit_idx].get('label')
+            if label and label != str(bit_idx):
+                return label
+        return None
+
+    def _fault_indicator_labels(self, dev) -> List[str]:
+        """Per-bit button labels: digital-channel mnemonics when available,
+        otherwise the plain bit index."""
+        descriptors = getattr(dev, 'digital_channels', None) if dev is not None else None
+        if descriptors:
+            labels = [d.get('label') or str(i) for i, d in enumerate(descriptors)]
+        else:
+            info = getattr(dev, 'info', None) or {}
+            bit_count = int(info.get('fault_state_count', getattr(dev, 'result_channels', 0)))
+            labels = [str(i) for i in range(bit_count)]
+        return labels[:16]
+
     def _refresh_fault_indicators(self):
         for row in range(DeviceManager.MAX_DEVICES):
             dev = self._device_for_row(row)
-            if dev is None:
-                bit_count = 0
-            else:
-                info = getattr(dev, 'info', None) or {}
-                bit_count = int(info.get('fault_state_count', getattr(dev, 'result_channels', 0)))
-            bit_count = max(0, min(16, bit_count))
-            if len(self.device_fault_indicators[row]) != bit_count:
-                self._rebuild_fault_indicator_row(row, bit_count)
-            if bit_count == 0:
+            labels = self._fault_indicator_labels(dev)
+            current = [b.text() for b in self.device_fault_indicators[row]]
+            if current != labels:
+                self._rebuild_fault_indicator_row(row, labels)
+            if not labels:
                 continue
 
+            descriptors = getattr(dev, 'digital_channels', None) if dev is not None else None
             valid = bool(dev and dev.last_fault_valid)
             fault_word = int(getattr(dev, 'last_fault_state', 0)) if valid else 0
             latch_word = int(getattr(dev, 'last_fault_latched', 0)) if valid else 0
             for bit_idx, btn in enumerate(self.device_fault_indicators[row]):
+                has_label = len(btn.text()) > 1
+                if descriptors and bit_idx < len(descriptors):
+                    caps = ('current' if descriptors[bit_idx]['has_current'] else '') \
+                        + ('+latched' if descriptors[bit_idx]['has_latched'] else '')
+                    caps = caps.strip('+') or 'none'
+                    name = f"'{descriptors[bit_idx]['label']}' (bit {bit_idx}, {caps})"
+                else:
+                    name = f'Bit {bit_idx}'
                 if valid:
                     fault = (fault_word >> bit_idx) & 1
                     latch = (latch_word >> bit_idx) & 1
-                    btn.setStyleSheet(self._fault_indicator_style(fault, latch))
-                    btn.setToolTip(f'Bit {bit_idx}: fault={fault}, latch={latch}. Click to reset this latch bit.')
+                    btn.setStyleSheet(self._fault_indicator_style(fault, latch, has_label=has_label))
+                    btn.setToolTip(f'{name}: fault={fault}, latch={latch}. Click to reset this latch bit.')
                 else:
-                    btn.setStyleSheet(self._fault_indicator_style(None, None))
-                    btn.setToolTip(f'Bit {bit_idx}: no live fault data yet. Click to reset this latch bit.')
+                    btn.setStyleSheet(self._fault_indicator_style(None, None, has_label=has_label))
+                    btn.setToolTip(f'{name}: no live fault data yet. Click to reset this latch bit.')
 
     def _rebuild_analog_value_row(self, row:int, channel_count:int):
         layout = self.device_analog_value_layouts[row]
@@ -2042,6 +2113,17 @@ class Plotter(QWidget):
                 f"latched={info.get('fault_latched_count', 0)}" if info else 'FAIL'))
         self._refresh_fault_indicators()
         self._refresh_analog_values()
+
+    def _get_digital_channels(self):
+        for ip, chans in self.manager.get_digital_channels_all().items():
+            if chans is None:
+                self._logger.info(f'Digital channels {ip}: FAIL')
+                continue
+            desc = ', '.join(
+                f"{i}:'{c['label']}'(" + ('C' if c['has_current'] else '') + ('L' if c['has_latched'] else '') + ')'
+                for i, c in enumerate(chans))
+            self._logger.info(f'Digital channels {ip}: count={len(chans)}; {desc}')
+        self._refresh_fault_indicators()
 
     def _register_all(self):
         try:
@@ -3062,7 +3144,9 @@ class Plotter(QWidget):
                     # CCU digital outputs (legacy plotting path).
                     for bit_idx in range(dev.result_channels):
                         y_pkt = np.array(buf.signal[bit_idx + 1], dtype=float)
-                        series.append((("ccu", bit_idx), f'ccu_bit{bit_idx}', y_pkt))
+                        lbl = self._digital_bit_label(dev, bit_idx)
+                        name = f'ccu_bit{bit_idx}' + (f' [{lbl}]' if lbl else '')
+                        series.append((("ccu", bit_idx), name, y_pkt))
 
                     # Node digital outputs from fault_state[node_idx] bitfields.
                     node_devices = [(i, ip_n, dev_n) for i, (ip_n, dev_n) in enumerate(self.manager.devices.items())
@@ -3080,7 +3164,9 @@ class Plotter(QWidget):
                             node_word = fault_state_arr[:, node_idx]
                             for bit_idx in range(node_bits):
                                 y_pkt = ((node_word >> bit_idx) & 1).astype(float)
-                                series.append(((f"node{node_idx}", bit_idx), f'{node_ip}_bit{bit_idx}', y_pkt))
+                                lbl = self._digital_bit_label(node_dev, bit_idx)
+                                name = f'{node_ip}_bit{bit_idx}' + (f' [{lbl}]' if lbl else '')
+                                series.append(((f"node{node_idx}", bit_idx), name, y_pkt))
 
                     center = (len(series) - 1) / 2.0 if series else 0.0
                     for series_idx, (curve_key, curve_name, y_pkt) in enumerate(series):
@@ -3148,7 +3234,7 @@ class Plotter(QWidget):
         #self._penetrate_firewall()
         #for i, f in enumerate((self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._register_all, self._reset_counter)):
         # TODO: add self._leader_changed
-        init_fns = (self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._get_trigger_config, self._register_all, self._register_ccu, self._reset_counter)
+        init_fns = (self._ping_all, self._register_logger_all, self._get_ids, self._get_digital_channels, self._get_clock_config, self._get_trigger_config, self._register_all, self._register_ccu, self._reset_counter)
         for i, f in enumerate(init_fns):
             QTimer(self).singleShot(i * 100, f)
         # After init, query the current system state, display it and react to it.
