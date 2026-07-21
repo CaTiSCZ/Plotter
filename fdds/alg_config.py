@@ -19,10 +19,12 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 from .protocol import (
-    ALG_CONFIG_TAG_NODE, ALG_CONFIG_TAG_CCU,
+    ALG_CONFIG_TAG_NODE, ALG_CONFIG_TAG_CCU, ALG_CONFIG_TAG_ISOMON,
     NODE_ALG_SCHEMA_VER, CCU_ALG_SCHEMA_VER,
+    ISOMON_STREAM_SCHEMA_VER, ISOMON_ISO_SCHEMA_VER,
     ALG_SEC_NODE_SC, ALG_SEC_NODE_DV_FILT, ALG_SEC_NODE_DV_CURV,
     ALG_SEC_CCU_ARC, ALG_SEC_CCU_SC, ALG_SEC_CCU_DS,
+    ALG_SEC_ISOMON_STREAM, ALG_SEC_ISOMON_ISO,
 )
 
 
@@ -140,6 +142,31 @@ CCU_SECTIONS: List[Section] = [
     ]),
 ]
 
+# ---------------------------------------------------------------------------
+# ISOMON sections — mirror isomon_stream_config_t / isomon_iso_config_t.
+# ---------------------------------------------------------------------------
+
+ISOMON_SECTIONS: List[Section] = [
+    Section(ALG_SEC_ISOMON_STREAM, "isomon_stream", 0, [
+        ("agg_count", 1, "I"),
+        ("stream_enable", 1, "B"),
+        ("reserved0", 1, "B"),
+        ("reserved1", 1, "H"),
+    ]),
+    Section(ALG_SEC_ISOMON_ISO, "isomon_iso", 8, [
+        ("r3", 1, "f"),
+        ("r4", 1, "f"),
+        ("r5", 1, "f"),
+        ("r6", 1, "f"),
+        ("r7", 1, "f"),
+        ("r8", 1, "f"),
+        ("fault_threshold", 1, "f"),
+        ("avg_samples", 1, "I"),
+        ("enable", 1, "B"),
+        ("reserved", 3, "B"),
+    ]),
+]
+
 
 DEVICE_TABLES = {
     "node": {
@@ -152,15 +179,24 @@ DEVICE_TABLES = {
         "schema": CCU_ALG_SCHEMA_VER,
         "sections": CCU_SECTIONS,
     },
+    "isomon": {
+        "tag": ALG_CONFIG_TAG_ISOMON,
+        # FW currently defines both stream/iso schema as 1; keep one device-level
+        # schema value for compatibility with the on-wire header.
+        "schema": max(ISOMON_STREAM_SCHEMA_VER, ISOMON_ISO_SCHEMA_VER),
+        "sections": ISOMON_SECTIONS,
+    },
 }
 
 
 def device_for_tag(tag: int) -> str | None:
-    """Map a record tag to a device name ('node' / 'ccu')."""
+    """Map a record tag to a device name ('node' / 'ccu' / 'isomon')."""
     if tag == ALG_CONFIG_TAG_NODE:
         return "node"
     if tag == ALG_CONFIG_TAG_CCU:
         return "ccu"
+    if tag == ALG_CONFIG_TAG_ISOMON:
+        return "isomon"
     return None
 
 

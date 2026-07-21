@@ -16,6 +16,7 @@ Features:
   - UDP I/O via selector-based asyncio loop (Windows compatible)
 """
 from __future__ import annotations
+import json
 import logging
 import logger
 import importlib
@@ -53,6 +54,7 @@ from fdds.protocol import (
     WIDE_CH_POS, WIDE_CH_NEG, wide_record_bytes,
 )
 from fdds.crc import crc16_ccitt
+from fdds import alg_config as fdds_alg_config
 
 APPLICATION_NAME = 'Eaton FDDS SCADA'
 APPLICATION_VERSION = '1.14.3'
@@ -799,6 +801,22 @@ class Device:
 
     def get_id(self)->dict|None:
         return self._parse_id(self._send_cmd(1) or b'')
+
+    @staticmethod
+    def _parse_alg_get(extra: bytes) -> dict | None:
+        """Parse CMD_GET_ALG_CONFIG ACK payload: tag, schema, section, body."""
+        if len(extra) < 5:
+            return None
+        tag, schema, section = struct.unpack_from('<HHB', extra, 0)
+        return {'tag': tag, 'schema': schema, 'section': section, 'body': extra[5:]}
+
+    def get_alg_config_section(self, section_id: int) -> dict | None:
+        """Read one section of current (RAM) algorithm parameters."""
+        res = self._send_cmd_with_ack(int(CMD.GET_ALG_CONFIG), bytes([section_id & 0xFF]))
+        if res is None:
+            return None
+        _state, extra = res
+        return self._parse_alg_get(extra)
 
     def set_id(self, new_id:int):
         payload = struct.pack('<B', new_id)
@@ -1990,6 +2008,10 @@ class Plotter(QWidget):
         self.save_trigger_config_btn = QPushButton('Save trigger config')
         cfg.addWidget(self.save_trigger_config_btn, DeviceManager.MAX_DEVICES, 5)
         self.save_trigger_config_btn.clicked.connect(self._save_trigger_config)
+
+        self.save_calibration_btn = QPushButton('Save calibration')
+        cfg.addWidget(self.save_calibration_btn, DeviceManager.MAX_DEVICES, 6)
+        self.save_calibration_btn.clicked.connect(self._save_calibration_bundle)
 
         btns = QHBoxLayout()
         root.addLayout(btns)
@@ -3308,6 +3330,132 @@ class Plotter(QWidget):
         #    "Measurement saved",
         #    "Saved files:\n" + "\n".join(files)
         #)
+
+    def _calibration_from_loaded_id(self, dev: Device) -> dict:
+        """Build calibration snapshot from data currently loaded in SCADA."""
+        info = getattr(dev, 'info', None)
+        if not info or 'channels' not in info:
+            info = dev.get_id()
+        if not info or 'channels' not in info:
+            raise RuntimeError(f'Zařízení {dev.ip} nemá načtené ID/kalibraci.')
+
+        channels = []
+        for ch in info.get('channels', []):
+            unit = ch.get('unit', '')
+            if isinstance(unit, bytes):
+                unit = unit.decode('utf-8', errors='replace')
+            unit = str(unit).rstrip('\x00')
+            channels.append({
+                'unit': unit,
+                'offset': float(ch.get('offset', 0.0)),
+                'gain': float(ch.get('gain', 1.0)),
+            })
+
+        return {
+            'source': 0,
+            'channels': channels,
+            'calibration_info': None,
+            'origin': 'scada_loaded_id',
+        }
+
+    def _read_alg_config_snapshot(self, dev: Device) -> dict:
+        """Read current algorithm sections in utils/alg_config.py export format."""
+        hdr = dev.get_alg_config_section(0xFF)
+        if hdr is None:
+            raise RuntimeError(f'Zařízení {dev.ip}: nelze načíst hlavičku alg_config.')
+
+        tag = int(hdr.get('tag', 0))
+        schema = int(hdr.get('schema', 0))
+        device_name = fdds_alg_config.device_for_tag(tag)
+        if device_name is None:
+            body = hdr.get('body', b'')
+            # Unknown FW tag (e.g. ISOMON-private schema): keep the raw blob so
+            # the snapshot still contains the full on-device configuration.
+            return {
+                'device': 'unknown',
+                'tag': tag,
+                'schema': schema,
+                'source': 'current',
+                'sections': {},
+                'raw_blob_hex': body.hex(),
+                'note': f'unknown alg_config tag 0x{tag:04X}',
+            }
+
+        sections_out = {}
+        missing_sections = []
+        for sec in fdds_alg_config.sections_for_device(device_name):
+            res = dev.get_alg_config_section(sec.id)
+            if res is None:
+                missing_sections.append(sec.name)
+                continue
+            body = res.get('body', b'')
+            if len(body) < sec.size:
+                missing_sections.append(sec.name)
+                continue
+            sections_out[sec.name] = sec.unpack(body)
+
+        if not sections_out:
+            raise RuntimeError(f'Zařízení {dev.ip}: nepodařilo se načíst žádnou alg_config sekci.')
+
+        if missing_sections:
+            self._logger.warning(
+                f'Zařízení {dev.ip}: chybějící/nesouhlasné alg_config sekce: {", ".join(missing_sections)} '
+                f'(pravděpodobně starší FW schema).')
+
+        out = {
+            'device': device_name,
+            'tag': tag,
+            'schema': schema,
+            'source': 'current',
+            'sections': sections_out,
+        }
+        if missing_sections:
+            out['missing_sections'] = missing_sections
+        return out
+
+    def _save_calibration_bundle(self):
+        if not self.manager.devices:
+            QMessageBox.warning(self, 'Save calibration', 'Nejsou aplikovaná žádná zařízení.')
+            return
+
+        os.makedirs('RICE_mereni', exist_ok=True)
+        default_name = datetime.now().strftime('RICE_mereni/calibration_%Y%m%d_%H%M%S.json')
+        path, _ = QFileDialog.getSaveFileName(self, 'Save calibration + alg config', default_name,
+                                              'JSON Files (*.json)')
+        if not path:
+            return
+
+        try:
+            devices_out = []
+            for ip, dev in self.manager.devices.items():
+                cal = self._calibration_from_loaded_id(dev)
+                alg = self._read_alg_config_snapshot(dev)
+                devices_out.append({
+                    'ip': ip,
+                    'cmd_port': int(dev.cmd_port),
+                    'calibration': cal,
+                    'alg_config': alg,
+                })
+
+            payload = {
+                'format': 'fdds_scada_calibration_alg_config_v1',
+                'created_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'app': {
+                    'name': APPLICATION_NAME,
+                    'version': APPLICATION_VERSION,
+                },
+                'devices': devices_out,
+            }
+
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+                f.write('\n')
+
+            self._logger.info(f'Saved calibration+alg config JSON: {path}')
+            QMessageBox.information(self, 'Save calibration', f'Uloženo:\n{path}')
+        except Exception as e:
+            self._logger.exception('Calibration/config save failed')
+            QMessageBox.critical(self, 'Save calibration', f'Uložení selhalo:\n{e}')
 
     def save_data(self, file_prefix=None, strict=True):
         if not file_prefix:
