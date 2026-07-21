@@ -524,9 +524,13 @@ class DeviceBuffer:
             self.ptp.extend(ptp)
             # Store WIDE metadata
             for ch_idx in range(len(self.wide_sums)):
-                if ch_idx < len(wide_sums[0]) if wide_sums else 0:
-                    # Extract ch_idx-th sum from each wide_sums tuple
+                if wide_sums and ch_idx < len(wide_sums[0]):
+                    # Extract ch_idx-th sum from each wide_sums tuple.
                     self.wide_sums[ch_idx].extend(w[ch_idx] for w in wide_sums)
+                else:
+                    # Keep all WIDE metadata columns length-aligned for CSV export
+                    # even when this channel is not present in a given packet.
+                    self.wide_sums[ch_idx].extend([0] * len(t))
             self.wide_agg_counts.extend(agg_counts)
             self.wide_agpio_bits.extend(agpio_bits_list)
             self.revision += 1
@@ -750,6 +754,7 @@ class Device:
         self.analog_units = ['-'] * self.channels
         self.analog_decimals = [3] * self.channels
         self.analog_widths = [8] * self.channels
+        self.wide_channel_mask = WIDE_CH_POS | WIDE_CH_NEG
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None, port:int|None = None):
         pkt = struct.pack('<I', code) + payload
@@ -921,7 +926,14 @@ class Device:
         vals = []
         for ch_idx in range(self.channels):
             gain, offset, _unit = self._channel_calibration(ch_idx)
-            raw_v = float(raw_last_values[ch_idx]) if ch_idx < len(raw_last_values) else 0.0
+            if ch_idx < len(raw_last_values):
+                raw_v = float(raw_last_values[ch_idx])
+            elif self.last_analog_valid and ch_idx < len(self.last_analog_values):
+                # Keep the previous value when the packet does not carry this channel.
+                vals.append(float(self.last_analog_values[ch_idx]))
+                continue
+            else:
+                raw_v = 0.0
             vals.append(raw_v * gain + offset)
         self.last_analog_values = vals
         self.last_analog_valid = True
@@ -967,8 +979,47 @@ class Device:
         self.last_fault_valid = True
         self.live_revision += 1
 
-    def _update_live_values_from_wide_packet(self, data: bytes, records: List[dict], agg_count: int):
-        """Update live values (analog + fault) from WIDE packet."""
+    def _update_live_values_from_wide_packet(self, data: bytes,
+                                             records: List[dict] | None = None,
+                                             agg_count: int | None = None):
+        """Update live values (analog + fault) from WIDE packet.
+
+        Accepts either fully parsed `records`+`agg_count` (normal WIDE path) or
+        raw `data` only (PTP waiting path where we avoid full buffer append).
+        """
+        if records is None or agg_count is None:
+            if len(data) < STRUCT.WIDE_HEADER.size:
+                return
+            try:
+                _, _, _, _, agg_count_h, records_per_channel, channel_mask, _ = \
+                    STRUCT.WIDE_HEADER.unpack(data[:STRUCT.WIDE_HEADER.size])
+            except struct.error:
+                return
+
+            if agg_count_h <= 0 or records_per_channel <= 0:
+                return
+
+            rec_bytes = wide_record_bytes(agg_count_h)
+            rec_char = 'i' if rec_bytes == 4 else 'q'
+            off = STRUCT.WIDE_HEADER.size
+            last_rec = {}
+            try:
+                if channel_mask & WIDE_CH_POS:
+                    pos_vals = struct.unpack_from(f'<{records_per_channel}{rec_char}', data, off)
+                    last_rec['pos'] = pos_vals[-1]
+                    off += records_per_channel * rec_bytes
+                if channel_mask & WIDE_CH_NEG:
+                    neg_vals = struct.unpack_from(f'<{records_per_channel}{rec_char}', data, off)
+                    last_rec['neg'] = neg_vals[-1]
+            except struct.error:
+                return
+
+            if not last_rec:
+                return
+
+            records = [last_rec]
+            agg_count = agg_count_h
+
         if not records:
             return
         # Use the last record for live values
@@ -1439,6 +1490,8 @@ class Device:
                     self._logger.warning(f"Dev {self.ip} returned WIDE packet with invalid header.")
                     return
 
+                self.wide_channel_mask = int(channel_mask)
+
                 if agg_count == 0:
                     self._logger.warning(f"Dev {self.ip} returned WIDE packet with agg_count=0.")
                     return
@@ -1524,28 +1577,23 @@ class Device:
                     ptp_list.append(ptp_last_ns - (records_per_channel - i - 1) * (1_000_000_000 // SAMPLES_PER_PACKET))
                     
                     # Build averaged samples (sum / agg_count)
-                    wide_sum_tuple = []
-                    samples_row = []
-                    ch_idx = 0
+                    samples_row = [0] * self.channels
+                    wide_sum_row = [0] * self.channels
                     if channel_mask & WIDE_CH_POS:
                         pos_avg = int(rec['pos'] // agg_count) if agg_count > 0 else 0
-                        samples_row.append(pos_avg)
-                        wide_sum_tuple.append(rec['pos'])
-                        ch_idx += 1
+                        if self.channels > 0:
+                            samples_row[0] = pos_avg
+                            wide_sum_row[0] = int(rec['pos'])
                     if channel_mask & WIDE_CH_NEG:
                         neg_avg = int(rec['neg'] // agg_count) if agg_count > 0 else 0
-                        samples_row.append(neg_avg)
-                        wide_sum_tuple.append(rec['neg'])
-                        ch_idx += 1
-                    
-                    # Pad with zeros if we have fewer channels than self.channels
-                    while len(samples_row) < self.channels:
-                        samples_row.append(0)
+                        neg_slot = 1 if self.channels > 1 else 0
+                        samples_row[neg_slot] = neg_avg
+                        wide_sum_row[neg_slot] = int(rec['neg'])
                     
                     for ch in range(self.channels):
                         samples_list[ch].append(samples_row[ch])
                     
-                    wide_sums_list.append(tuple(wide_sum_tuple))
+                    wide_sums_list.append(tuple(wide_sum_row[:self.channels]))
                     agg_counts_list.append(agg_count)
                     agpio_bits_list.append(agpio_bits)
 
@@ -2302,6 +2350,12 @@ class Plotter(QWidget):
         unit = dev.analog_units[channel_idx] if channel_idx < len(dev.analog_units) else '-'
         width = dev.analog_widths[channel_idx] if channel_idx < len(dev.analog_widths) else 8
         decimals = dev.analog_decimals[channel_idx] if channel_idx < len(dev.analog_decimals) else 3
+        if self._is_isomon_ip(getattr(dev, 'ip', '')):
+            mask = int(getattr(dev, 'wide_channel_mask', WIDE_CH_POS | WIDE_CH_NEG))
+            if ((channel_idx == 0 and not (mask & WIDE_CH_POS)) or
+                (channel_idx == 1 and not (mask & WIDE_CH_NEG))):
+                val_s = f"{'--':>{width}}"
+                return f'{val_s} {unit}'
         if dev.last_analog_valid and channel_idx < len(dev.last_analog_values):
             val = float(dev.last_analog_values[channel_idx])
             if np.isfinite(val):
@@ -2623,12 +2677,61 @@ class Plotter(QWidget):
         self._logger.info('Stopped all sampling')
 
     # ----- System startup/stop control + state monitoring ---------------------
-    def _system_ccu(self):
+    def _system_device_from_row(self, row_index: int):
+        """Return the applied device matching the GUI row IP, or None."""
+        if not (0 <= row_index < len(self.device_edits)):
+            return None
+        ip = self.device_edits[row_index].text().strip().split(':')[0]
+        return self.manager.devices.get(ip) if ip else None
+
+    def _system_ccu(self, warn: bool = True):
         """Return the CCU device (CCU_DEVICE_INDEX) or None, logging a warning."""
-        dev = self.manager.ccu_device()
-        if dev is None:
+        dev = self._system_device_from_row(CCU_DEVICE_INDEX)
+        if dev is None and warn:
             self._logger.warning('No CCU device available (apply devices first).')
         return dev
+
+    def _system_isomon(self):
+        """Return the ISOMON device (ISOMON_DEVICE_INDEX) or None if not applied."""
+        return self._system_device_from_row(ISOMON_DEVICE_INDEX)
+
+    def _device_ip_from_row(self, row_index: int) -> str:
+        """Return IP configured in the given GUI device row, or empty string."""
+        if not (0 <= row_index < len(self.device_edits)):
+            return ''
+        return self.device_edits[row_index].text().strip().split(':')[0]
+
+    def _is_ccu_ip(self, ip: str) -> bool:
+        return bool(ip) and ip == self._device_ip_from_row(CCU_DEVICE_INDEX)
+
+    def _is_isomon_ip(self, ip: str) -> bool:
+        return bool(ip) and ip == self._device_ip_from_row(ISOMON_DEVICE_INDEX)
+
+    def _system_start_isomon(self):
+        """Start standalone ISOMON and pre-open firewall pinholes for its traffic."""
+        dev = self._system_isomon()
+        if dev is None:
+            return True, False
+
+        if not dev.start_sampling(0):
+            self._logger.error(f'Could not start standalone ISOMON {dev.ip} (no ACK).')
+            self._set_device_status_color(dev.ip, SYSTEM_STATUS_COLOR_ERROR)
+            return False, True
+
+        self._logger.info(f'Standalone ISOMON started on {dev.ip}.')
+        self._set_device_status_color(dev.ip, SYSTEM_STATUS_COLOR_BUSY)
+
+        if self.manager.data_socket is None:
+            self._logger.warning(f'Cannot open ISOMON firewall pinhole on {dev.ip}: data socket is not available.')
+            return True, True
+
+        silent = FIREWALL_PENETRATION != 'verbose'
+        # Open both tuples from the data socket: data stream (data port) and sparse
+        # logs/ACKs (command port).
+        dev.ping(self.manager.data_socket, silent=silent, port=dev.data_port)
+        dev.ping(self.manager.data_socket, silent=silent, port=dev.cmd_port)
+        self._logger.info(f'Opened ISOMON firewall pinholes via data socket: data_port={dev.data_port}, cmd_port={dev.cmd_port}.')
+        return True, True
 
     def _set_system_status(self, text, color=''):
         """Set the system status label text and background colour."""
@@ -2704,35 +2807,71 @@ class Plotter(QWidget):
             self._system_status_timer.start()
 
     def _system_start(self):
-        dev = self._system_ccu()
-        if dev is None:
-            self._set_system_status('System: no CCU', SYSTEM_STATUS_COLOR_ERROR)
+        ccu = self._system_ccu(warn=False)
+        if ccu is not None:
+            if not ccu.system_startup_start(0):
+                self._logger.error(f'Start command not acknowledged by CCU {ccu.ip}.')
+                self._set_system_status('System: start failed (no ACK)', SYSTEM_STATUS_COLOR_ERROR)
+                return
+            self._logger.info(f'Startup sequence started on CCU {ccu.ip}.')
+
+            isomon_ok, isomon_present = self._system_start_isomon()
+            if isomon_present and not isomon_ok:
+                self._logger.warning('CCU startup started, but standalone ISOMON start failed.')
+
+            self._set_system_status('System: starting...', SYSTEM_STATUS_COLOR_BUSY)
+            self._system_watchdog_timer.stop()
+            self._system_stalled = False
+            self._system_poll_count = 0
+            self._system_status_timer.start()
             return
-        if not dev.system_startup_start(0):
-            self._logger.error(f'Start command not acknowledged by CCU {dev.ip}.')
-            self._set_system_status('System: start failed (no ACK)', SYSTEM_STATUS_COLOR_ERROR)
+
+        isomon_ok, isomon_present = self._system_start_isomon()
+        if not isomon_present:
+            self._set_system_status('System: no CCU and no ISOMON', SYSTEM_STATUS_COLOR_ERROR)
             return
-        self._logger.info(f'Startup sequence started on CCU {dev.ip}.')
-        self._set_system_status('System: starting...', SYSTEM_STATUS_COLOR_BUSY)
-        self._system_watchdog_timer.stop()
+        if not isomon_ok:
+            self._set_system_status('System: ISOMON start failed (no ACK)', SYSTEM_STATUS_COLOR_ERROR)
+            return
+
+        # Standalone ISOMON path: no CCU startup state exists, so go directly to RUNNING.
+        self._set_system_status('System: RUNNING (ISOMON standalone)', SYSTEM_STATUS_COLOR_OK)
+        self._system_status_timer.stop()
         self._system_stalled = False
-        self._system_poll_count = 0
-        self._system_status_timer.start()
+        self._system_watchdog_timer.start()
 
     def _system_stop(self):
         self._system_status_timer.stop()
         self._system_watchdog_timer.stop()
         self._system_stalled = False
-        dev = self._system_ccu()
-        if dev is None:
-            self._set_system_status('System: no CCU', SYSTEM_STATUS_COLOR_ERROR)
+        ccu = self._system_ccu(warn=False)
+        isomon = self._system_isomon()
+        ccu_ok = None
+
+        if ccu is not None:
+            ccu_ok = bool(ccu.system_stop())
+            if ccu_ok:
+                self._logger.info(f'Stop command sent to CCU {ccu.ip}.')
+            else:
+                self._logger.error(f'Stop command not acknowledged by CCU {ccu.ip}.')
+
+        isomon_ok = None
+        if isomon is not None:
+            isomon_ok = bool(isomon.stop_sampling())
+            if isomon_ok:
+                self._logger.info(f'Stop command sent to standalone ISOMON {isomon.ip}.')
+            else:
+                self._logger.error(f'Stop command not acknowledged by standalone ISOMON {isomon.ip}.')
+
+        if ccu is None and isomon is None:
+            self._set_system_status('System: no CCU and no ISOMON', SYSTEM_STATUS_COLOR_ERROR)
             return
-        if dev.system_stop():
-            self._logger.info(f'Stop command sent to CCU {dev.ip}.')
-            self._set_system_status('System: stopped', SYSTEM_STATUS_COLOR_IDLE)
-        else:
-            self._logger.error(f'Stop command not acknowledged by CCU {dev.ip}.')
+
+        if ((ccu_ok is not None and not ccu_ok) or (isomon_ok is not None and not isomon_ok)):
             self._set_system_status('System: stop failed (no ACK)', SYSTEM_STATUS_COLOR_ERROR)
+            return
+
+        self._set_system_status('System: stopped', SYSTEM_STATUS_COLOR_IDLE)
 
     def _system_poll_status(self):
         """Poll the CCU startup state until RUNNING or FAILED (FW-style)."""
@@ -3265,6 +3404,9 @@ class Plotter(QWidget):
                 w = csv.writer(f)
                 if has_result_meta:
                     ch_headers = [f'ch{c}' for c in range(csv_channels)]
+                elif has_wide_meta:
+                    # WIDE export stores only integer sums (no calibrated channels).
+                    ch_headers = [f'ch{c}' for c in range(len(wide_sums))]
                 else:
                     # Analog channels: append the calibrated unit in the same
                     # '[unit]' format as the plot legend (skip the '-' placeholder).
@@ -3281,7 +3423,6 @@ class Plotter(QWidget):
                     header += [f'parity_n{p // ACQUISITION_CHANNELS}c{p % ACQUISITION_CHANNELS}' for p in range(n_parity)]
                     header += ['crc_error_mask']
                 if has_wide_meta:
-                    header += [f'ch{c}_sum' for c in range(len(wide_sums))]
                     header += ['agg_count', 'agpio_bits']
                 w.writerow(header)
 
@@ -3314,20 +3455,19 @@ class Plotter(QWidget):
                     sig_lists = [s[keep].tolist() for s in signals_a]
                     
                     if has_wide_meta:
-                        # For WIDE data, append sums, agg_count, and agpio_bits
+                        # For WIDE data, export only integer sums as chX columns,
+                        # then append agg_count and agpio_bits metadata.
                         wide_sums_arr = [np.array(s) for s in wide_sums]
                         wide_sums_kept = [s[keep].tolist() for s in wide_sums_arr]
                         wide_agg_counts_kept = np.array(wide_agg_counts)[keep].tolist()
                         wide_agpio_bits_kept = np.array(wide_agpio_bits)[keep].tolist()
                         
                         if t_shift_list:
-                            # Template: time, ptp_ns, ch0, ch1, ..., ch0_sum, ch1_sum, ..., agg_count, agpio_bits
-                            tmpl = '%.6f,' + ','.join(['%d'] * (csv_channels + len(wide_sums) + 2))
+                            # Template: time, ptp_ns, ch0, ch1, ..., agg_count, agpio_bits
+                            tmpl = '%.6f,' + ','.join(['%d'] * (len(wide_sums) + 3))
                             rows = []
                             for i in range(len(t_shift_list)):
                                 row = [t_shift_list[i], ptp_list[i]]
-                                for ch in range(csv_channels):
-                                    row.append(sig_lists[ch][i])
                                 for s_idx in range(len(wide_sums_kept)):
                                     row.append(wide_sums_kept[s_idx][i])
                                 row.append(wide_agg_counts_kept[i])
@@ -3363,7 +3503,15 @@ class Plotter(QWidget):
         # repaint right after saving.
         self.plot_widget.viewport().repaint()
         QApplication.processEvents()
-        pixmap = self.plot_widget.grab()
+        if USE_OPENGL:
+            # QWidget.grab() may return a white image with OpenGL-backed paint
+            # engines on some drivers. Capture the native widget window instead.
+            screen = QApplication.screenAt(self.plot_widget.mapToGlobal(self.plot_widget.rect().center()))
+            if screen is None:
+                screen = QApplication.primaryScreen()
+            pixmap = screen.grabWindow(int(self.plot_widget.winId())) if screen is not None else self.plot_widget.grab()
+        else:
+            pixmap = self.plot_widget.grab()
         if not pixmap.save(png_name, "PNG"):
             raise RuntimeError(f"Nepodařilo se uložit obrázek {png_name}.")
 
@@ -3412,6 +3560,10 @@ class Plotter(QWidget):
             self._live_revisions = live_revisions
             self._refresh_fault_indicators()
             self._refresh_analog_values()
+        if self._system_status_ok:
+            for ip, dev in self.manager.devices.items():
+                if self._device_data_fresh(dev):
+                    self._set_device_status_color(ip, SYSTEM_STATUS_COLOR_OK)
         # Skip the (expensive) full redraw when no device buffer has changed since the
         # last frame -- e.g. a trigger / "start new sampling" capture is complete and
         # already holds all the data it asked for, even though the system keeps running
@@ -3430,7 +3582,7 @@ class Plotter(QWidget):
                 continue
             with buf.lock:
                 # Data processing
-                if (dev_index != CCU_DEVICE_INDEX):
+                if not self._is_ccu_ip(ip):
                     idx0 = np.asarray(buf.signal[0])
                     # Sort the per-sample buffer by time so a late/replayed packet
                     # around the trigger cannot draw a zig-zag at the pre/post
@@ -3462,6 +3614,16 @@ class Plotter(QWidget):
                     avgs = [0] * dev.channels
                     for ch in range(dev.channels):
                         key = (ip, ch)
+
+                        if self._is_isomon_ip(ip):
+                            mask = int(getattr(dev, 'wide_channel_mask', WIDE_CH_POS | WIDE_CH_NEG))
+                            ch_enabled = ((ch == 0 and (mask & WIDE_CH_POS)) or
+                                          (ch == 1 and (mask & WIDE_CH_NEG)) or
+                                          (ch > 1))
+                            if not ch_enabled:
+                                if key in self.curves:
+                                    self.curves[key].setData([], [])
+                                continue
 
                         #y = np.array(buf.signal[ch + 1])[-len(x):]
                         raw = np.array(buf.signal[ch + 1], dtype=float)
@@ -3501,6 +3663,30 @@ class Plotter(QWidget):
                     # instead of materialising the whole (multi-million) ring.
                     errs = ','.join(str(int(buf.error[c].tail(SAMPLES_PER_PACKET).sum(dtype=np.int64)))
                                     for c in range(dev.channels))
+
+                    # ISOMON digital (AGPIO) traces come from WIDE metadata. Draw
+                    # them on the result pane also when no CCU/result packets exist.
+                    if self._is_isomon_ip(ip):
+                        agpio_bits_rows = np.asarray(list(buf.wide_agpio_bits), dtype=np.uint8)
+                        if order_perm is not None and agpio_bits_rows.size == len(order_perm):
+                            agpio_bits_rows = agpio_bits_rows[order_perm]
+                        if agpio_bits_rows.size:
+                            agpio_bits_rows = agpio_bits_rows[trim:trim_end]
+                            center = (bin(WIDE_AGPIO_DISPLAY_MASK & 0xFF).count('1') - 1) / 2.0
+                            offset_step = 0.05
+                            series_idx = 0
+                            for bit_idx in range(8):
+                                if not (WIDE_AGPIO_DISPLAY_MASK & (1 << bit_idx)):
+                                    continue
+                                curve_key = ("agpio", bit_idx)
+                                curve_name = f'AGPIO{bit_idx}'
+                                if curve_key not in self.ax_result_curves:
+                                    color = Plotter.Colors[len(self.ax_result_curves) % len(Plotter.Colors)]
+                                    self.ax_result_curves[curve_key] = self.ax_result.plot(pen=color, name=curve_name)
+                                y_bits = ((agpio_bits_rows >> bit_idx) & 1).astype(float)
+                                y_bits += (series_idx - center) * offset_step
+                                self.ax_result_curves[curve_key].setData(x[-len(y_bits):], y_bits)
+                                series_idx += 1
 
                     # Statistics part
                     received = received_full
@@ -3574,7 +3760,7 @@ class Plotter(QWidget):
 
                     # Node digital outputs from fault_state[node_idx] bitfields.
                     node_devices = [(i, ip_n, dev_n) for i, (ip_n, dev_n) in enumerate(self.manager.devices.items())
-                                    if i != CCU_DEVICE_INDEX]
+                                    if not self._is_ccu_ip(ip_n)]
                     fault_state_rows = list(buf.result_fault_state)
                     if fault_state_rows:
                         fault_state_arr = np.asarray(fault_state_rows, dtype=np.uint16)
@@ -3593,7 +3779,7 @@ class Plotter(QWidget):
                                 series.append(((f"node{node_idx}", bit_idx), name, y_pkt))
 
                     # WIDE packet AGPIO bits (from Isomon device, typically dev_index 5)
-                    if dev_index == ISOMON_DEVICE_INDEX:
+                    if self._is_isomon_ip(ip):
                         agpio_bits_rows = list(buf.wide_agpio_bits)
                         if agpio_bits_rows:
                             agpio_arr = np.asarray(agpio_bits_rows, dtype=np.uint8)
@@ -3769,9 +3955,20 @@ def main(argv):
                 if debug:
                     checkbox.setChecked(i in (0,))
                 else:
-                    # ISOMON is enabled only when ISOMON_ENABLED; otherwise it stays off so
-                    # a device with no data doesn't break the running-system status.
-                    checkbox.setChecked(i < DEVICES_COUNT or (i == ISOMON_DEVICE_INDEX and ISOMON_ENABLED))
+                    # DEVICES_COUNT >= 0: enable from the start (CCU..), with optional ISOMON.
+                    # DEVICES_COUNT < 0 : enable from the end (..ISOMON), e.g. -1 => only ISOMON.
+                    if DEVICES_COUNT >= 0:
+                        # ISOMON is enabled only when ISOMON_ENABLED; otherwise it stays off so
+                        # a device with no data doesn't break the running-system status.
+                        checkbox.setChecked(i < DEVICES_COUNT or (i == ISOMON_DEVICE_INDEX and ISOMON_ENABLED))
+                    else:
+                        n_from_end = min(-int(DEVICES_COUNT), DeviceManager.MAX_DEVICES)
+                        first_idx = DeviceManager.MAX_DEVICES - n_from_end
+                        use = i >= first_idx
+                        # Keep ISOMON opt-in behavior also for end-based selection.
+                        if i == ISOMON_DEVICE_INDEX and not ISOMON_ENABLED:
+                            use = False
+                        checkbox.setChecked(use)
             gui.leader_buttons.button(DEFAULT_LEADER).setChecked(True)
             gui._apply_devices()
             gui._apply_config()
