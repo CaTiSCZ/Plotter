@@ -3452,7 +3452,6 @@ class Plotter(QWidget):
                 f.write('\n')
 
             self._logger.info(f'Saved calibration+alg config JSON: {path}')
-            QMessageBox.information(self, 'Save calibration', f'Uloženo:\n{path}')
         except Exception as e:
             self._logger.exception('Calibration/config save failed')
             QMessageBox.critical(self, 'Save calibration', f'Uložení selhalo:\n{e}')
