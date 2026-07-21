@@ -50,6 +50,7 @@ from fdds.protocol import (
     RECEIVER_TYPE_DATA, RECEIVER_TYPE_LOG, RECEIVER_TYPE_DBG,
     DIGITAL_CHANNEL_FLAG_CURRENT, DIGITAL_CHANNEL_FLAG_LATCHED,
     UDP_CMD_PORT, UDP_DATA_PORT,
+    WIDE_CH_POS, WIDE_CH_NEG, wide_record_bytes,
 )
 from fdds.crc import crc16_ccitt
 
@@ -131,6 +132,10 @@ FIREWALL_KEEPALIVE_TIMEOUT_S = 25
 # faster for very large traces but needs a working OpenGL driver. Overridable via
 # default_settings.py (USE_OPENGL).
 USE_OPENGL = False
+
+# WIDE packet AGPIO bits display mask: which AGPIO bits to show in digital signals plot
+# AGPIO has bits 0-4 (5 bits total), mask 0x1F shows all of them. Overridable via default_settings.py.
+WIDE_AGPIO_DISPLAY_MASK = 0x1F  # bits 0-4: all AGPIO lines
 
 # System startup control (command codes sourced from the shared fdds CMD enum)
 CMD_GET_RECEIVERS         = int(CMD.GET_RECEIVERS)
@@ -462,6 +467,11 @@ class DeviceBuffer:
         self.result_fault_latched  = deque(maxlen=BUFFER_SIZE)  # tuple per row: per-node fault_latched[GATHERING_DEVICES]
         self.result_parity_errors  = deque(maxlen=BUFFER_SIZE)  # tuple per row: parity_errors[GATHERING_DEVICES][ACQUISITION_CHANNELS]
         self.result_crc_error_mask = deque(maxlen=BUFFER_SIZE)  # int per row
+        # WIDE packet metadata (Isomon wide-aggregated data; empty for nodes).
+        # One entry per WIDE sample record, stored as deques of ints.
+        self.wide_sums       = [deque(maxlen=BUFFER_SIZE) for _ in range(channels)]  # per-channel sum per row
+        self.wide_agg_counts = deque(maxlen=BUFFER_SIZE)  # aggregation count per row
+        self.wide_agpio_bits = deque(maxlen=BUFFER_SIZE)  # AGPIO logical-level snapshot per row
         # Monotonic change counter bumped on every append; lets the plot skip a
         # redraw when nothing new has arrived (e.g. a finished trigger/new-sampling
         # capture that already holds all the data it wanted).
@@ -491,6 +501,34 @@ class DeviceBuffer:
             self.result_fault_latched.extend([fault_latched]*len(t))
             self.result_parity_errors.extend([parity_errors]*len(t))
             self.result_crc_error_mask.extend([crc_error_mask]*len(t))
+            self.revision += 1
+
+    def extend_wide(self, t:List[int], samples:List[List[int]], ptp:List[int],
+                    wide_sums:List[Tuple[int, ...]], agg_counts:List[int], agpio_bits_list:List[int]):
+        """Extend buffer with WIDE packet aggregated data.
+        
+        Args:
+            t: time indices (sample numbers)
+            samples: averaged samples per channel (sum/agg_count) as int32 per channel
+            ptp: PTP timestamps in nanoseconds
+            wide_sums: original sums per channel per sample
+            agg_counts: aggregation count per sample
+            agpio_bits_list: AGPIO bits snapshot per sample
+        """
+        with self.lock:
+            self.time.extend(t)
+            for ch, sig in enumerate(samples):
+                self.signal[ch+1].extend(sig)
+                self.error[ch].extend_const(0, len(sig))  # no parity errors for WIDE
+            self.signal[0].extend(t)
+            self.ptp.extend(ptp)
+            # Store WIDE metadata
+            for ch_idx in range(len(self.wide_sums)):
+                if ch_idx < len(wide_sums[0]) if wide_sums else 0:
+                    # Extract ch_idx-th sum from each wide_sums tuple
+                    self.wide_sums[ch_idx].extend(w[ch_idx] for w in wide_sums)
+            self.wide_agg_counts.extend(agg_counts)
+            self.wide_agpio_bits.extend(agpio_bits_list)
             self.revision += 1
 
 
@@ -664,6 +702,7 @@ class Device:
     PKT_TYPE_TRIGGER = int(PACKET.TRIGGER)
     PKT_TYPE_LOG  = int(PACKET.LOG)
     PKT_TYPE_RESULT  = int(PACKET.RESULT)
+    PKT_TYPE_WIDE = int(PACKET.WIDE_DATA)
 
     def __init__(self, ip:str, cmd_port:int, data_port:int, loop, manager=None):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
@@ -927,7 +966,26 @@ class Device:
         self.last_fault_latched = 0
         self.last_fault_valid = True
         self.live_revision += 1
-    
+
+    def _update_live_values_from_wide_packet(self, data: bytes, records: List[dict], agg_count: int):
+        """Update live values (analog + fault) from WIDE packet."""
+        if not records:
+            return
+        # Use the last record for live values
+        last_rec = records[-1]
+        raw_last = []
+        if 'pos' in last_rec:
+            raw_last.append(last_rec['pos'] // agg_count if agg_count > 0 else 0)
+        if 'neg' in last_rec:
+            raw_last.append(last_rec['neg'] // agg_count if agg_count > 0 else 0)
+        # Pad with zeros if needed
+        while len(raw_last) < self.channels:
+            raw_last.append(0)
+        
+        self._update_analog_values_from_raw_last(raw_last)
+        # WIDE packets don't have explicit fault state; leave last_fault_state/latched unchanged
+        self.live_revision += 1
+
     def reset_device(self):
         return self._send_cmd(14, struct.pack('<B', 0xFE))
     
@@ -1338,6 +1396,162 @@ class Device:
                 self.loop.call_soon_threadsafe(self.buffer.extend_result, t, samples, errs,
                                                ptp, fault_state, fault_latched, parity_errors, crc_error_mask)
                 #self._logger.info(f"Dev {self.ip} packetNumber[{order}]: result {result_code}")
+                return order
+            case self.PKT_TYPE_WIDE:
+                self.last_data_time = time.monotonic()
+                if ptp_mode.enabled:
+                    if not self.capture_active:
+                        if ptp_mode.immediate_trigger and ptp_mode.waiting_for_trigger:
+                            ptp_mode.trigger_sample_num = 0
+                            ptp_mode.immediate_trigger = False
+                            ptp_mode.fire_trigger(order)
+                        else:
+                            self.input_packet_ring.append(bytes(pkt))
+                            data = _verify_crc(pkt)
+                            if data not in (None, False):
+                                self._update_live_values_from_wide_packet(data)
+                            return
+
+                    if self.capture_limit > 0 and self.capture_counter >= self.capture_limit:
+                        if self.capture_active:
+                            self._logger.info(
+                                f"PTP capture done dev {self.id} (WIDE): trigger_order={self.trigger_order}, "
+                                f"first={self.first_data_order}, last={self.last_data_order}, "
+                                f"count={self.capture_counter}/{self.capture_limit}")
+                        self.capture_active = False
+                        return
+
+                    self.capture_counter += 1
+
+                data = _verify_crc(pkt)
+                if data is None:
+                    self._logger.warning(f"Dev {self.ip} returned too short WIDE packet.")
+                    return
+                elif data is False:
+                    self._logger.warning(f"Dev {self.ip} returned WIDE packet with incorrect CRC.")
+                    return
+
+                # Parse WIDE_HEADER
+                try:
+                    pkt_type, pkt_num, ptp_seconds, ptp_nanoseconds, agg_count, records_per_channel, channel_mask, agpio_bits = \
+                        STRUCT.WIDE_HEADER.unpack(data[:STRUCT.WIDE_HEADER.size])
+                except struct.error:
+                    self._logger.warning(f"Dev {self.ip} returned WIDE packet with invalid header.")
+                    return
+
+                if agg_count == 0:
+                    self._logger.warning(f"Dev {self.ip} returned WIDE packet with agg_count=0.")
+                    return
+
+                # Determine record width
+                record_bytes = wide_record_bytes(agg_count)
+                record_format = '<i' if record_bytes == 4 else '<q'  # int32 or int64
+
+                # Parse records per channel
+                off = STRUCT.WIDE_HEADER.size
+                num_channels = 0
+                if channel_mask & WIDE_CH_POS:
+                    num_channels += 1
+                if channel_mask & WIDE_CH_NEG:
+                    num_channels += 1
+
+                if num_channels == 0:
+                    self._logger.warning(f"Dev {self.ip} returned WIDE packet with no channels.")
+                    return
+
+                records = []  # List of dicts: {pos_sum, neg_sum}
+                try:
+                    # Parse POS channel records if present
+                    pos_records = []
+                    if channel_mask & WIDE_CH_POS:
+                        rec_format = f'<{records_per_channel}{record_format[1]}'  # e.g., '<19i' or '<19q'
+                        pos_records = list(struct.unpack_from(rec_format, data, off))
+                        off += records_per_channel * record_bytes
+
+                    # Parse NEG channel records if present
+                    neg_records = []
+                    if channel_mask & WIDE_CH_NEG:
+                        rec_format = f'<{records_per_channel}{record_format[1]}'
+                        neg_records = list(struct.unpack_from(rec_format, data, off))
+                        off += records_per_channel * record_bytes
+
+                    # Combine records: each record is (pos_sum, neg_sum)
+                    for i in range(records_per_channel):
+                        rec = {}
+                        if channel_mask & WIDE_CH_POS:
+                            rec['pos'] = pos_records[i]
+                        if channel_mask & WIDE_CH_NEG:
+                            rec['neg'] = neg_records[i]
+                        records.append(rec)
+
+                    # Parse parity errors and fault state (skip them for now)
+                    off += num_channels * 4  # parity errors
+                    off += 4  # fault_state + fault_latched combined
+
+                except struct.error:
+                    self._logger.warning(f"Dev {self.ip} returned WIDE packet with invalid payload.")
+                    return
+
+                # Update first_data_order and packet_index
+                if self.first_data_order is None:
+                    self.first_data_order = order
+                    self.last_data_order = order
+                    self.packet_index = 0
+                else:
+                    delta = _signed_u16_delta(order, self.last_data_order)
+                    if delta > 1000:
+                        self._logger.warning(
+                            f"Dev {self.ip} large packet jump: order={order}, "
+                            f"last={self.last_data_order}, delta={delta}"
+                        )
+                    self.packet_index += delta
+                    self.last_data_order = order
+
+                # Build time indices and samples (averaged: sum/agg_count)
+                rel_order = self.packet_index
+                ptp_last_ns = ptp_seconds * 1_000_000_000 + ptp_nanoseconds
+                ptp_list = []
+                time_list = []
+                samples_list = [[] for _ in range(self.channels)]
+                wide_sums_list = []
+                agg_counts_list = []
+                agpio_bits_list = []
+
+                for i, rec in enumerate(records):
+                    sample_idx = rel_order * SAMPLES_PER_PACKET + i
+                    time_list.append(sample_idx)
+                    # PTP timestamp: each record represents an interval; place it at record end
+                    ptp_list.append(ptp_last_ns - (records_per_channel - i - 1) * (1_000_000_000 // SAMPLES_PER_PACKET))
+                    
+                    # Build averaged samples (sum / agg_count)
+                    wide_sum_tuple = []
+                    samples_row = []
+                    ch_idx = 0
+                    if channel_mask & WIDE_CH_POS:
+                        pos_avg = int(rec['pos'] // agg_count) if agg_count > 0 else 0
+                        samples_row.append(pos_avg)
+                        wide_sum_tuple.append(rec['pos'])
+                        ch_idx += 1
+                    if channel_mask & WIDE_CH_NEG:
+                        neg_avg = int(rec['neg'] // agg_count) if agg_count > 0 else 0
+                        samples_row.append(neg_avg)
+                        wide_sum_tuple.append(rec['neg'])
+                        ch_idx += 1
+                    
+                    # Pad with zeros if we have fewer channels than self.channels
+                    while len(samples_row) < self.channels:
+                        samples_row.append(0)
+                    
+                    for ch in range(self.channels):
+                        samples_list[ch].append(samples_row[ch])
+                    
+                    wide_sums_list.append(tuple(wide_sum_tuple))
+                    agg_counts_list.append(agg_count)
+                    agpio_bits_list.append(agpio_bits)
+
+                self._update_live_values_from_wide_packet(data, records, agg_count)
+                self.loop.call_soon_threadsafe(self.buffer.extend_wide, time_list, samples_list, ptp_list,
+                                               wide_sums_list, agg_counts_list, agpio_bits_list)
                 return order
             case self.PKT_TYPE_ID:
                 self._logger.info(f"Dev {self.ip} ID packet received on data socket.")
@@ -2984,9 +3198,13 @@ class Plotter(QWidget):
                 result_fault_latched = list(dev.buffer.result_fault_latched)
                 result_parity_errors = list(dev.buffer.result_parity_errors)
                 result_crc_error_mask = list(dev.buffer.result_crc_error_mask)
+                wide_agpio_bits = list(dev.buffer.wide_agpio_bits)
+                wide_agg_counts = list(dev.buffer.wide_agg_counts)
+                wide_sums = [list(s) for s in dev.buffer.wide_sums]
 
             # CCU devices carry per-result-packet metadata; nodes leave these empty.
             has_result_meta = bool(result_crc_error_mask)
+            has_wide_meta = bool(wide_agpio_bits)
             csv_channels = dev.result_channels if has_result_meta else dev.channels
             signals_a = [np.asarray(dev.buffer.signal[c + 1]) for c in range(csv_channels)]
 
@@ -3018,6 +3236,9 @@ class Plotter(QWidget):
             lengths = [len(times_a), len(ptp_a), *(len(s) for s in signals_a)]
             if has_result_meta:
                 lengths += [len(result_fault_state), len(result_fault_latched), len(result_parity_errors), len(result_crc_error_mask)]
+            if has_wide_meta:
+                lengths += [len(wide_agpio_bits), len(wide_agg_counts)]
+                lengths += [len(s) for s in wide_sums]
             row_count = min(lengths)
 
             if strict and row_count == 0:
@@ -3030,6 +3251,10 @@ class Plotter(QWidget):
             times_a = times_a[:row_count]
             ptp_a = ptp_a[:row_count]
             signals_a = [s[:row_count] for s in signals_a]
+            if has_wide_meta:
+                wide_agpio_bits = wide_agpio_bits[:row_count]
+                wide_agg_counts = wide_agg_counts[:row_count]
+                wide_sums = [s[:row_count] for s in wide_sums]
             if _trim_window:
                 keep = (times_a >= _n_lo) & (times_a < _n_hi)
             else:
@@ -3055,6 +3280,9 @@ class Plotter(QWidget):
                     header += [f'fault_latched{d}' for d in range(n_fault)]
                     header += [f'parity_n{p // ACQUISITION_CHANNELS}c{p % ACQUISITION_CHANNELS}' for p in range(n_parity)]
                     header += ['crc_error_mask']
+                if has_wide_meta:
+                    header += [f'ch{c}_sum' for c in range(len(wide_sums))]
+                    header += ['agg_count', 'agpio_bits']
                 w.writerow(header)
 
                 if has_result_meta:
@@ -3084,11 +3312,36 @@ class Plotter(QWidget):
                     t_shift_list = t_shift_a[keep].tolist()
                     ptp_list = ptp_a[keep].tolist()
                     sig_lists = [s[keep].tolist() for s in signals_a]
-                    if t_shift_list:
-                        tmpl = '%.6f,' + ','.join(['%d'] * (csv_channels + 1))
-                        lines = [tmpl % row for row in zip(t_shift_list, ptp_list, *sig_lists)]
-                        f.write('\r\n'.join(lines))
-                        f.write('\r\n')
+                    
+                    if has_wide_meta:
+                        # For WIDE data, append sums, agg_count, and agpio_bits
+                        wide_sums_arr = [np.array(s) for s in wide_sums]
+                        wide_sums_kept = [s[keep].tolist() for s in wide_sums_arr]
+                        wide_agg_counts_kept = np.array(wide_agg_counts)[keep].tolist()
+                        wide_agpio_bits_kept = np.array(wide_agpio_bits)[keep].tolist()
+                        
+                        if t_shift_list:
+                            # Template: time, ptp_ns, ch0, ch1, ..., ch0_sum, ch1_sum, ..., agg_count, agpio_bits
+                            tmpl = '%.6f,' + ','.join(['%d'] * (csv_channels + len(wide_sums) + 2))
+                            rows = []
+                            for i in range(len(t_shift_list)):
+                                row = [t_shift_list[i], ptp_list[i]]
+                                for ch in range(csv_channels):
+                                    row.append(sig_lists[ch][i])
+                                for s_idx in range(len(wide_sums_kept)):
+                                    row.append(wide_sums_kept[s_idx][i])
+                                row.append(wide_agg_counts_kept[i])
+                                row.append(wide_agpio_bits_kept[i])
+                                rows.append(row)
+                            lines = [tmpl % tuple(row) for row in rows]
+                            f.write('\r\n'.join(lines))
+                            f.write('\r\n')
+                    else:
+                        if t_shift_list:
+                            tmpl = '%.6f,' + ','.join(['%d'] * (csv_channels + 1))
+                            lines = [tmpl % row for row in zip(t_shift_list, ptp_list, *sig_lists)]
+                            f.write('\r\n'.join(lines))
+                            f.write('\r\n')
 
                 f.flush()
                 os.fsync(f.fileno())
@@ -3338,6 +3591,19 @@ class Plotter(QWidget):
                                 lbl = self._digital_bit_label(node_dev, bit_idx)
                                 name = f'{node_ip}_bit{bit_idx}' + (f' [{lbl}]' if lbl else '')
                                 series.append(((f"node{node_idx}", bit_idx), name, y_pkt))
+
+                    # WIDE packet AGPIO bits (from Isomon device, typically dev_index 5)
+                    if dev_index == ISOMON_DEVICE_INDEX:
+                        agpio_bits_rows = list(buf.wide_agpio_bits)
+                        if agpio_bits_rows:
+                            agpio_arr = np.asarray(agpio_bits_rows, dtype=np.uint8)
+                            # Build one series per AGPIO bit in the mask
+                            for bit_idx in range(8):  # AGPIO has bits 0-7
+                                if not (WIDE_AGPIO_DISPLAY_MASK & (1 << bit_idx)):
+                                    continue  # Skip bits outside the mask
+                                y_pkt = ((agpio_arr >> bit_idx) & 1).astype(float)
+                                name = f'AGPIO{bit_idx}'
+                                series.append((("agpio", bit_idx), name, y_pkt))
 
                     center = (len(series) - 1) / 2.0 if series else 0.0
                     for series_idx, (curve_key, curve_name, y_pkt) in enumerate(series):

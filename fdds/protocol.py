@@ -72,6 +72,16 @@ class PACKET(IntEnumName):
     DS_RESULT = 6
     SAMPLE_RESULT = 7
     CCU_PHYSICAL = 8
+    WIDE_DATA = 9
+
+
+# ---------------------------------------------------------------------------
+# WIDE packet constants (PACKET_WIDE_DATA)
+# ---------------------------------------------------------------------------
+
+WIDE_CH_POS = 0x01
+WIDE_CH_NEG = 0x02
+WIDE_SUMS_INT32_MAX_N = 4096
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +152,7 @@ class CMD(IntEnumName):
     GET_BROADCAST_RX = 59
     INJECT_FAULT_STATE = 60
     GET_DIGITAL_CHANNELS = 61
+    LOCATE = 62
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +205,11 @@ class STRUCT:
     PING_RTT_REQUEST = struct.Struct("<BBIHHBB")  # addr_mode, node_index, target_ip, count, interval_ms, silent, target_silent (12 B)
     PING_RTT_RESULT = struct.Struct("<IIHHQQQ")  # origin_ip, target_ip, count_sent, count_recv, min, avg, max (36 B)
     PING_RTT_SAMPLE = struct.Struct("<I")        # per-ping RTT in ns (0xFFFFFFFF = lost)
+    WIDE_HEADER = struct.Struct("<HHIIIHB B")    # packet_type, packet_num, ptp_s, ptp_ns, agg_count, records_per_channel, channel_mask, agpio_bits
+
+
+# Backward-compat alias for existing imports using module-level WIDE_HEADER.
+WIDE_HEADER = STRUCT.WIDE_HEADER
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +278,22 @@ def ds_result_packet_size(samples: int = SAMPLES_PER_PACKET) -> int:
         + samples * 4               # float32[samples]
         + 2                         # crc
     )
+
+
+def wide_record_bytes(agg_count: int) -> int:
+    """Return bytes per WIDE sum record for aggregation count N."""
+    return 4 if agg_count <= WIDE_SUMS_INT32_MAX_N else 8
+
+
+def wide_packet_size(records_per_channel: int, channel_mask: int, agg_count: int) -> int:
+    """Calculate PACKET_WIDE_DATA wire size."""
+    channels = 0
+    if channel_mask & WIDE_CH_POS:
+        channels += 1
+    if channel_mask & WIDE_CH_NEG:
+        channels += 1
+    payload = channels * records_per_channel * wide_record_bytes(agg_count) + channels * 4 + 4
+    return STRUCT.WIDE_HEADER.size + payload + 2
 
 
 # ---------------------------------------------------------------------------
