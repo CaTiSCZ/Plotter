@@ -1993,6 +1993,10 @@ class Plotter(QWidget):
         self.measurement_number_edit = QLineEdit(f'0')
         cfg.addWidget(self.measurement_number_edit, 2, 9)
 
+        self.save_calibration_btn = QPushButton('Save calibration')
+        cfg.addWidget(self.save_calibration_btn, 3, 9)
+        self.save_calibration_btn.clicked.connect(self._save_calibration_bundle)
+
         self.apply_btn = QPushButton('Apply Device List')
         cfg.addWidget(self.apply_btn, DeviceManager.MAX_DEVICES, 2)
         self.apply_btn.clicked.connect(self._apply_devices)
@@ -2008,10 +2012,6 @@ class Plotter(QWidget):
         self.save_trigger_config_btn = QPushButton('Save trigger config')
         cfg.addWidget(self.save_trigger_config_btn, DeviceManager.MAX_DEVICES, 5)
         self.save_trigger_config_btn.clicked.connect(self._save_trigger_config)
-
-        self.save_calibration_btn = QPushButton('Save calibration')
-        cfg.addWidget(self.save_calibration_btn, DeviceManager.MAX_DEVICES, 6)
-        self.save_calibration_btn.clicked.connect(self._save_calibration_bundle)
 
         btns = QHBoxLayout()
         root.addLayout(btns)
