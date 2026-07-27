@@ -757,6 +757,7 @@ class Device:
         self.analog_decimals = [3] * self.channels
         self.analog_widths = [8] * self.channels
         self.wide_channel_mask = WIDE_CH_POS | WIDE_CH_NEG
+        self._wide_last_raw = [0] * self.channels
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None, port:int|None = None):
         pkt = struct.pack('<I', code) + payload
@@ -945,7 +946,14 @@ class Device:
         for ch_idx in range(self.channels):
             gain, offset, _unit = self._channel_calibration(ch_idx)
             if ch_idx < len(raw_last_values):
-                raw_v = float(raw_last_values[ch_idx])
+                rv = raw_last_values[ch_idx]
+                if rv is None:
+                    if self.last_analog_valid and ch_idx < len(self.last_analog_values):
+                        vals.append(float(self.last_analog_values[ch_idx]))
+                        continue
+                    raw_v = 0.0
+                else:
+                    raw_v = float(rv)
             elif self.last_analog_valid and ch_idx < len(self.last_analog_values):
                 # Keep the previous value when the packet does not carry this channel.
                 vals.append(float(self.last_analog_values[ch_idx]))
@@ -1040,16 +1048,15 @@ class Device:
 
         if not records:
             return
-        # Use the last record for live values
+        # Use the last record for live values with fixed channel slots:
+        # POS -> ch0, NEG -> ch1 (if present).
         last_rec = records[-1]
-        raw_last = []
+        raw_last = [None] * self.channels
         if 'pos' in last_rec:
-            raw_last.append(last_rec['pos'] // agg_count if agg_count > 0 else 0)
+            raw_last[0] = last_rec['pos'] // agg_count if agg_count > 0 else 0
         if 'neg' in last_rec:
-            raw_last.append(last_rec['neg'] // agg_count if agg_count > 0 else 0)
-        # Pad with zeros if needed
-        while len(raw_last) < self.channels:
-            raw_last.append(0)
+            neg_slot = 1 if self.channels > 1 else 0
+            raw_last[neg_slot] = last_rec['neg'] // agg_count if agg_count > 0 else 0
         
         self._update_analog_values_from_raw_last(raw_last)
         # WIDE packets don't have explicit fault state; leave last_fault_state/latched unchanged
@@ -1595,17 +1602,21 @@ class Device:
                     ptp_list.append(ptp_last_ns - (records_per_channel - i - 1) * (1_000_000_000 // SAMPLES_PER_PACKET))
                     
                     # Build averaged samples (sum / agg_count)
-                    samples_row = [0] * self.channels
+                    # Preserve the previously seen raw value for a channel when this
+                    # packet does not carry it (e.g. alternating POS/NEG masks).
+                    samples_row = list(self._wide_last_raw)
                     wide_sum_row = [0] * self.channels
                     if channel_mask & WIDE_CH_POS:
                         pos_avg = int(rec['pos'] // agg_count) if agg_count > 0 else 0
                         if self.channels > 0:
                             samples_row[0] = pos_avg
+                            self._wide_last_raw[0] = pos_avg
                             wide_sum_row[0] = int(rec['pos'])
                     if channel_mask & WIDE_CH_NEG:
                         neg_avg = int(rec['neg'] // agg_count) if agg_count > 0 else 0
                         neg_slot = 1 if self.channels > 1 else 0
                         samples_row[neg_slot] = neg_avg
+                        self._wide_last_raw[neg_slot] = neg_avg
                         wide_sum_row[neg_slot] = int(rec['neg'])
                     
                     for ch in range(self.channels):
@@ -2372,12 +2383,6 @@ class Plotter(QWidget):
         unit = dev.analog_units[channel_idx] if channel_idx < len(dev.analog_units) else '-'
         width = dev.analog_widths[channel_idx] if channel_idx < len(dev.analog_widths) else 8
         decimals = dev.analog_decimals[channel_idx] if channel_idx < len(dev.analog_decimals) else 3
-        if self._is_isomon_ip(getattr(dev, 'ip', '')):
-            mask = int(getattr(dev, 'wide_channel_mask', WIDE_CH_POS | WIDE_CH_NEG))
-            if ((channel_idx == 0 and not (mask & WIDE_CH_POS)) or
-                (channel_idx == 1 and not (mask & WIDE_CH_NEG))):
-                val_s = f"{'--':>{width}}"
-                return f'{val_s} {unit}'
         if dev.last_analog_valid and channel_idx < len(dev.last_analog_values):
             val = float(dev.last_analog_values[channel_idx])
             if np.isfinite(val):
@@ -3761,16 +3766,6 @@ class Plotter(QWidget):
                     avgs = [0] * dev.channels
                     for ch in range(dev.channels):
                         key = (ip, ch)
-
-                        if self._is_isomon_ip(ip):
-                            mask = int(getattr(dev, 'wide_channel_mask', WIDE_CH_POS | WIDE_CH_NEG))
-                            ch_enabled = ((ch == 0 and (mask & WIDE_CH_POS)) or
-                                          (ch == 1 and (mask & WIDE_CH_NEG)) or
-                                          (ch > 1))
-                            if not ch_enabled:
-                                if key in self.curves:
-                                    self.curves[key].setData([], [])
-                                continue
 
                         #y = np.array(buf.signal[ch + 1])[-len(x):]
                         raw = np.array(buf.signal[ch + 1], dtype=float)
