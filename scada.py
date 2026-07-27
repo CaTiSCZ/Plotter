@@ -135,6 +135,10 @@ FIREWALL_KEEPALIVE_TIMEOUT_S = 25
 # default_settings.py (USE_OPENGL).
 USE_OPENGL = False
 
+# Whether ISOMON is enabled in default settings. Used to decide if the
+# ISOMON-specific resistance plot row should be shown.
+ISOMON_ENABLED = False
+
 # WIDE packet AGPIO bits display mask: which AGPIO bits to show in digital signals plot
 # AGPIO has bits 0-4 (5 bits total), mask 0x1F shows all of them. Overridable via default_settings.py.
 WIDE_AGPIO_DISPLAY_MASK = 0x1F  # bits 0-4: all AGPIO lines
@@ -268,6 +272,15 @@ ID_HEADER_STRUCT_V5 = STRUCT.ID_V5      # <HH HBB HBBI3I HBBI HBB (channels_coun
 CHANNEL_HEADER_STRUCT = STRUCT.CHANNEL  # <4s ff (unit, offset, gain)
 DATA_HEADER_STRUCT = STRUCT.DATA_HEADER # <HHII (packet_type, packet_num, ptp_seconds, ptp_nanoseconds)
 TRIGGER_PACKET_STRUCT = struct.Struct("<HHB3xII") # packet_type, packet_num, sample_num, ptp_seconds, ptp_nanoseconds
+# PACKET_ISO_RESULT fixed leading fields (ignore any trailing FW-extension bytes):
+# type(H), num(H), ptp_s(I), ptp_ns(I), 10x float (u*, r*), fault_state(H), fault_latched(H)
+ISO_RESULT_PREFIX_STRUCT = struct.Struct("<HHII10fHH")
+ISO_U_FIELDS = (
+    'u1_baseline', 'u2_baseline', 'u1_s2', 'u2_s2', 'u1_s3', 'u2_s3',
+)
+ISO_R_FIELDS = (
+    'r1_via_r3', 'r2_via_r3', 'r1_via_r4', 'r2_via_r4',
+)
 
 # Precomputed vectors for vectorised DATA-packet parsing (Phase 2 fast path).
 _DATA_SAMPLE_INDEX = np.arange(SAMPLES_PER_PACKET, dtype=np.int64)
@@ -474,6 +487,10 @@ class DeviceBuffer:
         self.wide_sums       = [deque(maxlen=BUFFER_SIZE) for _ in range(channels)]  # per-channel sum per row
         self.wide_agg_counts = deque(maxlen=BUFFER_SIZE)  # aggregation count per row
         self.wide_agpio_bits = deque(maxlen=BUFFER_SIZE)  # AGPIO logical-level snapshot per row
+        # PACKET_ISO_RESULT series (Isomon): time-indexed float values.
+        self.iso_time = NumpyRing(BUFFER_SIZE, np.int64)
+        self.iso_u = {name: NumpyRing(BUFFER_SIZE, np.float32) for name in ISO_U_FIELDS}
+        self.iso_r = {name: NumpyRing(BUFFER_SIZE, np.float32) for name in ISO_R_FIELDS}
         # Monotonic change counter bumped on every append; lets the plot skip a
         # redraw when nothing new has arrived (e.g. a finished trigger/new-sampling
         # capture that already holds all the data it wanted).
@@ -535,6 +552,15 @@ class DeviceBuffer:
                     self.wide_sums[ch_idx].extend([0] * len(t))
             self.wide_agg_counts.extend(agg_counts)
             self.wide_agpio_bits.extend(agpio_bits_list)
+            self.revision += 1
+
+    def extend_iso_result(self, t:int, u_vals:dict, r_vals:dict):
+        with self.lock:
+            self.iso_time.extend([int(t)])
+            for name in ISO_U_FIELDS:
+                self.iso_u[name].extend([float(u_vals.get(name, np.nan))])
+            for name in ISO_R_FIELDS:
+                self.iso_r[name].extend([float(r_vals.get(name, np.nan))])
             self.revision += 1
 
 
@@ -709,6 +735,7 @@ class Device:
     PKT_TYPE_LOG  = int(PACKET.LOG)
     PKT_TYPE_RESULT  = int(PACKET.RESULT)
     PKT_TYPE_WIDE = int(PACKET.WIDE_DATA)
+    PKT_TYPE_ISO_RESULT = 10
 
     def __init__(self, ip:str, cmd_port:int, data_port:int, loop, manager=None):
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
@@ -758,6 +785,35 @@ class Device:
         self.analog_widths = [8] * self.channels
         self.wide_channel_mask = WIDE_CH_POS | WIDE_CH_NEG
         self._wide_last_raw = [0] * self.channels
+        self._iso_first_ptp_ns = None
+        self.iso_live_valid = False
+        self.iso_live_values = {name: np.nan for name in (*ISO_U_FIELDS, *ISO_R_FIELDS)}
+
+    def _parse_iso_result_packet(self, data: bytes):
+        """Parse PACKET_ISO_RESULT payload prefix and return dict or None."""
+        if len(data) < ISO_RESULT_PREFIX_STRUCT.size:
+            return None
+        vals = ISO_RESULT_PREFIX_STRUCT.unpack_from(data, 0)
+        (_ptype, packet_num, ptp_sec, ptp_ns,
+         u1_baseline, u2_baseline, u1_s2, u2_s2, u1_s3, u2_s3,
+         r1_via_r3, r2_via_r3, r1_via_r4, r2_via_r4,
+         fault_state, fault_latched) = vals
+        return {
+            'packet_num': packet_num,
+            'ptp_ns_total': int(ptp_sec) * 1_000_000_000 + int(ptp_ns),
+            'u1_baseline': float(u1_baseline),
+            'u2_baseline': float(u2_baseline),
+            'u1_s2': float(u1_s2),
+            'u2_s2': float(u2_s2),
+            'u1_s3': float(u1_s3),
+            'u2_s3': float(u2_s3),
+            'r1_via_r3': float(r1_via_r3),
+            'r2_via_r3': float(r2_via_r3),
+            'r1_via_r4': float(r1_via_r4),
+            'r2_via_r4': float(r2_via_r4),
+            'fault_state': int(fault_state),
+            'fault_latched': int(fault_latched),
+        }
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None, port:int|None = None):
         pkt = struct.pack('<I', code) + payload
@@ -1630,6 +1686,38 @@ class Device:
                 self.loop.call_soon_threadsafe(self.buffer.extend_wide, time_list, samples_list, ptp_list,
                                                wide_sums_list, agg_counts_list, agpio_bits_list)
                 return order
+            case self.PKT_TYPE_ISO_RESULT:
+                self.last_data_time = time.monotonic()
+                data = _verify_crc(pkt)
+                if data is None:
+                    self._logger.warning(f"Dev {self.ip} returned too short ISO_RESULT packet.")
+                    return
+                elif data is False:
+                    self._logger.warning(f"Dev {self.ip} returned ISO_RESULT packet with incorrect CRC.")
+                    return
+
+                iso = self._parse_iso_result_packet(data)
+                if iso is None:
+                    self._logger.warning(f"Dev {self.ip} returned malformed ISO_RESULT packet.")
+                    return
+
+                ptp_total = iso['ptp_ns_total']
+                if self._iso_first_ptp_ns is None:
+                    self._iso_first_ptp_ns = ptp_total
+                t_idx = int(round((ptp_total - self._iso_first_ptp_ns) / NS_PER_SAMPLE))
+
+                u_vals = {k: iso[k] for k in ISO_U_FIELDS}
+                r_vals = {k: iso[k] for k in ISO_R_FIELDS}
+                self.iso_live_values.update(u_vals)
+                self.iso_live_values.update(r_vals)
+                self.iso_live_valid = True
+                self.last_fault_state = int(iso['fault_state'])
+                self.last_fault_latched = int(iso['fault_latched'])
+                self.last_fault_valid = True
+                self.live_revision += 1
+
+                self.loop.call_soon_threadsafe(self.buffer.extend_iso_result, t_idx, u_vals, r_vals)
+                return iso['packet_num']
             case self.PKT_TYPE_ID:
                 self._logger.info(f"Dev {self.ip} ID packet received on data socket.")
                 self._parse_id(pkt)
@@ -2184,6 +2272,17 @@ class Plotter(QWidget):
         self.ax_result_curves: Dict[Tuple[str, int], pg.PlotDataItem] = {}
         self.ax_result.setYRange(0, 1)
 
+        # ISOMON resistance result plot (shown only when ISOMON is enabled).
+        self.plot_widget.nextRow()
+        self.ax_iso_r = self.plot_widget.addPlot(title='ISOMON resistance result')
+        self.ax_iso_r.showGrid(x=True, y=True, alpha=0.3)
+        self.ax_iso_r.setLabel('bottom', 'Time', units='s')
+        self.ax_iso_r.setLabel('left', 'Resistance')
+        self.ax_iso_r.addLegend()
+        self.ax_iso_r.setXLink(self.ax)
+        self.ax_iso_r_curves: Dict[str, pg.PlotDataItem] = {}
+        self.ax_iso_r.setVisible(ISOMON_ENABLED)
+
         # Now that both plots exist, wire the downsampling controls and apply once.
         self.downsample_mode_combo.currentIndexChanged.connect(self._apply_downsampling)
         self.downsample_factor_spin.valueChanged.connect(self._apply_downsampling)
@@ -2370,12 +2469,31 @@ class Plotter(QWidget):
             if widget is not None:
                 widget.deleteLater()
         labels: List[QLabel] = []
+
+        dev = self._device_for_row(row)
+        is_isomon = bool(dev and self._is_isomon_ip(getattr(dev, 'ip', '')))
+
         for _ch in range(channel_count):
             lbl = QLabel()
             lbl.setStyleSheet(ANALOG_VALUE_FONT_STYLE)
             lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             layout.addWidget(lbl)
             labels.append(lbl)
+
+        if is_isomon:
+            layout.addSpacing(12)
+            iso_pairs = [
+                ('u1_baseline', 'u1_s2', 'u2_s2', 'r1_via_r3', 'r2_via_r3'),
+                ('u2_baseline', 'u1_s3', 'u2_s3', 'r1_via_r4', 'r2_via_r4'),
+            ]
+            for names in iso_pairs:
+                iso_lbl = QLabel()
+                iso_lbl.setStyleSheet(ANALOG_VALUE_NO_DATA_STYLE)
+                iso_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                iso_lbl.setProperty('iso_fields', names)
+                layout.addWidget(iso_lbl)
+                labels.append(iso_lbl)
+
         layout.addStretch(1)
         self.device_analog_value_labels[row] = labels
 
@@ -2397,12 +2515,14 @@ class Plotter(QWidget):
         for row in range(DeviceManager.MAX_DEVICES):
             dev = self._device_for_row(row)
             channel_count = int(getattr(dev, 'channels', 0)) if dev is not None else 0
-            if len(self.device_analog_value_labels[row]) != channel_count:
+            is_isomon = bool(dev and self._is_isomon_ip(getattr(dev, 'ip', '')))
+            expected_labels = channel_count + (2 if is_isomon else 0)
+            if len(self.device_analog_value_labels[row]) != expected_labels:
                 self._rebuild_analog_value_row(row, channel_count)
             if channel_count == 0:
                 continue
             valid = bool(dev and dev.last_analog_valid)
-            for ch_idx, lbl in enumerate(self.device_analog_value_labels[row]):
+            for ch_idx, lbl in enumerate(self.device_analog_value_labels[row][:channel_count]):
                 lbl.setText(self._format_analog_value(dev, ch_idx))
                 if valid:
                     lbl.setStyleSheet(ANALOG_VALUE_FONT_STYLE)
@@ -2410,6 +2530,24 @@ class Plotter(QWidget):
                 else:
                     lbl.setStyleSheet(ANALOG_VALUE_NO_DATA_STYLE)
                     lbl.setToolTip(f'Channel {ch_idx}: no live data')
+
+            if is_isomon:
+                iso_valid = bool(getattr(dev, 'iso_live_valid', False))
+                iso_values = getattr(dev, 'iso_live_values', {}) or {}
+                for lbl in self.device_analog_value_labels[row][channel_count:]:
+                    fields = lbl.property('iso_fields')
+                    if not fields:
+                        continue
+                    parts = []
+                    for name in fields:
+                        v = iso_values.get(name, np.nan)
+                        if iso_valid and np.isfinite(v):
+                            parts.append(f'{name}:{float(v):.3f}')
+                        else:
+                            parts.append(f'{name}:--')
+                    lbl.setText('   '.join(parts))
+                    lbl.setStyleSheet(ANALOG_VALUE_FONT_STYLE if iso_valid else ANALOG_VALUE_NO_DATA_STYLE)
+                    lbl.setToolTip('ISOMON PACKET_ISO_RESULT live values')
 
     def _arm_grey_check(self):
         """Arm the deferred grey-out: over the next two GUI refreshes, grey the
@@ -3830,6 +3968,33 @@ class Plotter(QWidget):
                                 self.ax_result_curves[curve_key].setData(x[-len(y_bits):], y_bits)
                                 series_idx += 1
 
+                        # PACKET_ISO_RESULT analog U-series are plotted directly as
+                        # floats (no calibration), on the analog pane.
+                        iso_time = np.asarray(buf.iso_time, dtype=float)
+                        if iso_time.size:
+                            if tsi is not None:
+                                iso_time = iso_time - tsi
+                            x_iso = iso_time * SAMPLING_PERIOD
+                            for name in ISO_U_FIELDS:
+                                y_iso = np.asarray(buf.iso_u[name], dtype=float)
+                                if y_iso.size != x_iso.size:
+                                    continue
+                                key = (ip, name)
+                                if key not in self.curves:
+                                    pen = pg.mkPen(Plotter.Colors[len(self.curves) % len(Plotter.Colors)], width=2)
+                                    self.curves[key] = self.ax.plot(pen=pen, name=f'{ip}[{name}]')
+                                self.curves[key].setData(x_iso, y_iso)
+
+                            if ISOMON_ENABLED:
+                                for name in ISO_R_FIELDS:
+                                    y_r = np.asarray(buf.iso_r[name], dtype=float)
+                                    if y_r.size != x_iso.size:
+                                        continue
+                                    if name not in self.ax_iso_r_curves:
+                                        color = Plotter.Colors[len(self.ax_iso_r_curves) % len(Plotter.Colors)]
+                                        self.ax_iso_r_curves[name] = self.ax_iso_r.plot(pen=color, name=name)
+                                    self.ax_iso_r_curves[name].setData(x_iso, y_r)
+
                     # Statistics part
                     received = received_full
                     # Count only packets inside the requested window so a missing
@@ -4022,6 +4187,7 @@ def main(argv):
         global BUFFER_LENGTH_S, BUFFER_SIZE, MAX_CAPTURE_PACKETS
         global USE_OPENGL
         global GUI_REFRESH_INTERVAL_MS
+        global ISOMON_ENABLED
 
         DEFAULT_FIRST_IP = getattr(ds, 'DEFAULT_FIRST_IP', "192.168.137.100")
         DEFAULT_LEADER = getattr(ds, 'DEFAULT_LEADER', 1)
