@@ -768,6 +768,9 @@ class Device:
         self.first_data_order = None
         self.last_data_order = None
         self.packet_index = 0
+        self.first_iso_order = None
+        self.last_iso_order = None
+        self.iso_packet_index = 0
         self.trigger_order = None
         self.trigger_sample_num = 0
         self.pretrigger_packets = 0
@@ -1160,6 +1163,10 @@ class Device:
         self.first_data_order = None
         self.last_data_order = None
         self.packet_index = 0
+        self.first_iso_order = None
+        self.last_iso_order = None
+        self.iso_packet_index = 0
+        self._iso_first_ptp_ns = None
         self.trigger_order = None
         self.trigger_sample_num = 0
         self.pretrigger_packets = 0
@@ -1171,6 +1178,10 @@ class Device:
         self.first_data_order = None
         self.last_data_order = None
         self.packet_index = 0
+        self.first_iso_order = None
+        self.last_iso_order = None
+        self.iso_packet_index = 0
+        self._iso_first_ptp_ns = None
     
     def flush_input_packet_ring(self, trigger_order:int, pretrigger_packets:int):
         """Replay buffered packets around the trigger from the input ring.
@@ -1702,6 +1713,20 @@ class Device:
                 if iso is None:
                     self._logger.warning(f"Dev {self.ip} returned malformed ISO_RESULT packet.")
                     return
+
+                if self.first_iso_order is None:
+                    self.first_iso_order = order
+                    self.last_iso_order = order
+                    self.iso_packet_index = 0
+                else:
+                    delta = _signed_u16_delta(order, self.last_iso_order)
+                    if delta > 1000:
+                        self._logger.warning(
+                            f"Dev {self.ip} large ISO_RESULT packet jump: order={order}, "
+                            f"last={self.last_iso_order}, delta={delta}"
+                        )
+                    self.iso_packet_index += delta
+                    self.last_iso_order = order
 
                 ptp_total = iso['ptp_ns_total']
                 if self._iso_first_ptp_ns is None:
@@ -4033,11 +4058,18 @@ class Plotter(QWidget):
                         if iso_time.size:
                             if tsi is not None:
                                 iso_time = iso_time - tsi
-                            x_iso = iso_time * SAMPLING_PERIOD
+                            if tsi is not None and ptp_mode.samples_awaited > 0:
+                                trim = int(np.searchsorted(iso_time, -dev.pretrigger_packets * SAMPLES_PER_PACKET, side='left'))
+                                trim_end = int(np.searchsorted(iso_time, ptp_mode.samples_awaited * SAMPLES_PER_PACKET, side='left'))
+                            else:
+                                trim = 0
+                                trim_end = len(iso_time)
+                            x_iso = (iso_time[trim:trim_end] * SAMPLING_PERIOD)
                             for name in ISO_U_FIELDS:
                                 y_iso = np.asarray(buf.iso_u[name], dtype=float)
-                                if y_iso.size != x_iso.size:
+                                if y_iso.size != len(iso_time):
                                     continue
+                                y_iso = y_iso[trim:trim_end]
                                 key = (ip, name)
                                 if key not in self.curves:
                                     pen = pg.mkPen(Plotter.Colors[len(self.curves) % len(Plotter.Colors)], width=2)
@@ -4047,8 +4079,9 @@ class Plotter(QWidget):
                             if ISOMON_ENABLED:
                                 for name in ISO_R_FIELDS:
                                     y_r = np.asarray(buf.iso_r[name], dtype=float)
-                                    if y_r.size != x_iso.size:
+                                    if y_r.size != len(iso_time):
                                         continue
+                                    y_r = y_r[trim:trim_end]
                                     if name not in self.ax_iso_r_curves:
                                         color = Plotter.Colors[len(self.ax_iso_r_curves) % len(Plotter.Colors)]
                                         self.ax_iso_r_curves[name] = self.ax_iso_r.plot(pen=color, name=name)
