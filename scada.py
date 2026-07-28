@@ -20,6 +20,7 @@ import json
 import logging
 import logger
 import importlib
+import math
 import asyncio, struct, socket, sys, time, threading, csv, os, tempfile
 from collections import deque
 from dataclasses import dataclass
@@ -112,6 +113,14 @@ PTP_TRIGGER_RING_PACKETS = 500  # default pre-trigger ring size; overridable via
 # never stored -> 199/200). This margin absorbs such strays; the plot/CSV trim back
 # to exactly samples_awaited so the extra packets are harmless. Overridable via default_settings.py.
 TRIGGER_CAPTURE_MARGIN_PACKETS = 16
+# ISOMON ISO result cadence. The FW state cycle currently has 3 states; keep this
+# as a named constant so a future 4-state FW can be mapped in one place.
+ISOMON_STATE_CYCLE_COUNT = 3
+ISOMON_ALG_SAMPLE_RATE_HZ = 200000.0
+# isomon_stream.stream_enable bitmask (FW contract):
+#   bit0 -> WIDE stream, bit1 -> ISO_RESULT stream.
+ISOMON_STREAM_ENABLE_WIDE = 0x01
+ISOMON_STREAM_ENABLE_ISO_RESULT = 0x02
 # Firewall penetration mode for the stall diagnostic (overridable via default_settings.py):
 #   'off'     - never attempt firewall penetration; treat the stall as genuine.
 #   'on'      - send a silent ping through the data socket (default).
@@ -195,6 +204,13 @@ ANALOG_VALUE_FONT_STYLE = 'font-family: Consolas, "Courier New", monospace; font
 ANALOG_VALUE_NO_DATA_STYLE = ANALOG_VALUE_FONT_STYLE + ' color: #9e9e9e;'
 ISO_VALUE_WIDTH = 8
 ISO_VALUE_DECIMALS = 3
+
+# Stream keys used across capture gating, order tracking and statistics.
+STREAM_DATA = 'data'
+STREAM_RESULT = 'result'
+STREAM_WIDE = 'wide'
+STREAM_ISO_RESULT = 'iso_result'
+STREAM_KEYS = (STREAM_DATA, STREAM_RESULT, STREAM_WIDE, STREAM_ISO_RESULT)
 
 # Features
 FCN_QT_LOGGING = True  # Enable Qt logging handler
@@ -487,6 +503,7 @@ class DeviceBuffer:
         # WIDE packet metadata (Isomon wide-aggregated data; empty for nodes).
         # One entry per WIDE sample record, stored as deques of ints.
         self.wide_sums       = [deque(maxlen=BUFFER_SIZE) for _ in range(channels)]  # per-channel sum per row
+        self.wide_present    = [deque(maxlen=BUFFER_SIZE) for _ in range(channels)]  # per-channel presence flag per row
         self.wide_agg_counts = deque(maxlen=BUFFER_SIZE)  # aggregation count per row
         self.wide_agpio_bits = deque(maxlen=BUFFER_SIZE)  # AGPIO logical-level snapshot per row
         # PACKET_ISO_RESULT series (Isomon): time-indexed float values.
@@ -525,7 +542,8 @@ class DeviceBuffer:
             self.revision += 1
 
     def extend_wide(self, t:List[int], samples:List[List[int]], ptp:List[int],
-                    wide_sums:List[Tuple[int, ...]], agg_counts:List[int], agpio_bits_list:List[int]):
+                    wide_sums:List[Tuple[int, ...]], wide_present:List[Tuple[bool, ...]],
+                    agg_counts:List[int], agpio_bits_list:List[int]):
         """Extend buffer with WIDE packet aggregated data.
         
         Args:
@@ -552,6 +570,10 @@ class DeviceBuffer:
                     # Keep all WIDE metadata columns length-aligned for CSV export
                     # even when this channel is not present in a given packet.
                     self.wide_sums[ch_idx].extend([0] * len(t))
+                if wide_present and ch_idx < len(wide_present[0]):
+                    self.wide_present[ch_idx].extend(bool(w[ch_idx]) for w in wide_present)
+                else:
+                    self.wide_present[ch_idx].extend([False] * len(t))
             self.wide_agg_counts.extend(agg_counts)
             self.wide_agpio_bits.extend(agpio_bits_list)
             self.revision += 1
@@ -710,6 +732,8 @@ class PTPMode:
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.samples_awaited = 0
         self.pretrigger_packets = 0
+        self.posttrigger_ms = 0
+        self.pretrigger_ms = 0
         self.trigger_sample_num = 0
         self.waiting_for_trigger = False
         self.trigger_mode = False
@@ -724,6 +748,13 @@ class PTPMode:
             return
         self.waiting_for_trigger = False
         self.device_manager.ptp_trigger(trigger_order)
+
+
+def _packets_from_ms_ceil(ms: int | float, rate_hz: float) -> int:
+    """Convert a capture window in ms to packet count with upward rounding."""
+    if ms <= 0 or rate_hz <= 0:
+        return 0
+    return int(math.ceil((float(ms) * float(rate_hz)) / 1000.0))
 
 ptp_mode = PTPMode()
 
@@ -752,9 +783,18 @@ class Device:
         self.id = int(ip.split('.')[3])
         self.header_struct = struct.Struct('<HH')
         self.silent_ping = False
+        self.role = 'node'
+        self.is_isomon = False
+        self.stream_enable_mask = ISOMON_STREAM_ENABLE_WIDE | ISOMON_STREAM_ENABLE_ISO_RESULT
+        self.stream_rate_hz = {
+            STREAM_DATA: float(PACKET_RATE_HZ),
+            STREAM_RESULT: float(PACKET_RATE_HZ),
+            STREAM_WIDE: float(PACKET_RATE_HZ),
+            STREAM_ISO_RESULT: float(PACKET_RATE_HZ),
+        }
         self.capture_active = False
-        self.capture_counter = 0
-        self.capture_limit = 0
+        self.capture_counters = {k: 0 for k in STREAM_KEYS}
+        self.capture_limits = {k: 0 for k in STREAM_KEYS}
         self.ptp_triggered = False
         self.received_last = 0
         self.last_data_time = 0.0
@@ -764,16 +804,15 @@ class Device:
         # track real data for the stall watchdog, not logs/ACKs).
         self.last_recv_time = 0.0
         self.last_ack_time = 0.0
-        self.input_packet_ring = deque(maxlen=PTP_TRIGGER_RING_PACKETS)
-        self.first_data_order = None
-        self.last_data_order = None
-        self.packet_index = 0
-        self.first_iso_order = None
-        self.last_iso_order = None
-        self.iso_packet_index = 0
-        self.trigger_order = None
+        self.input_packet_rings = {k: deque(maxlen=PTP_TRIGGER_RING_PACKETS) for k in STREAM_KEYS}
+        self.first_order_by_stream = {k: None for k in STREAM_KEYS}
+        self.last_order_by_stream = {k: None for k in STREAM_KEYS}
+        self.packet_index_by_stream = {k: 0 for k in STREAM_KEYS}
+        self.trigger_order_by_stream = {k: None for k in STREAM_KEYS}
         self.trigger_sample_num = 0
-        self.pretrigger_packets = 0
+        self.pretrigger_packets_by_stream = {k: 0 for k in STREAM_KEYS}
+        self.capture_expected_by_stream = {k: 0 for k in STREAM_KEYS}
+        self.last_flush_info_by_stream = {k: None for k in STREAM_KEYS}
         self.last_fault_state = 0
         self.last_fault_latched = 0
         self.last_fault_valid = False
@@ -819,6 +858,102 @@ class Device:
             'fault_state': int(fault_state),
             'fault_latched': int(fault_latched),
         }
+
+    def active_capture_streams(self) -> List[str]:
+        if self.role == 'ccu':
+            return [STREAM_RESULT]
+        if self.role == 'isomon' or self.is_isomon:
+            streams = []
+            if self.stream_enable_mask & ISOMON_STREAM_ENABLE_WIDE:
+                streams.append(STREAM_WIDE)
+            if self.stream_enable_mask & ISOMON_STREAM_ENABLE_ISO_RESULT:
+                streams.append(STREAM_ISO_RESULT)
+            return streams or [STREAM_WIDE, STREAM_ISO_RESULT]
+        return [STREAM_DATA]
+
+    def stream_rate(self, stream_key: str) -> float:
+        return max(1.0, float(self.stream_rate_hz.get(stream_key, PACKET_RATE_HZ)))
+
+    def _track_order(self, stream_key: str, order: int) -> int:
+        """Track packet order for one stream.
+
+        Returns:
+          1  -> new/advanced order (time index advances)
+          0  -> duplicate order (same logical time step)
+         -1  -> late/out-of-order packet (older than last accepted order)
+        """
+        first = self.first_order_by_stream[stream_key]
+        if first is None:
+            self.first_order_by_stream[stream_key] = order
+            self.last_order_by_stream[stream_key] = order
+            self.packet_index_by_stream[stream_key] = 0
+            return 1
+        last = self.last_order_by_stream[stream_key]
+        delta = _signed_u16_delta(order, last)
+        if delta < 0:
+            return -1
+        if delta == 0:
+            return 0
+        if delta > 1000:
+            self._logger.warning(
+                f"Dev {self.ip} large {stream_key} packet jump: order={order}, "
+                f"last={last}, delta={delta}"
+            )
+        self.packet_index_by_stream[stream_key] += delta
+        self.last_order_by_stream[stream_key] = order
+        return 1
+
+    def _capture_limit_reached(self, stream_key: str) -> bool:
+        limit = int(self.capture_limits.get(stream_key, 0))
+        if limit <= 0:
+            return False
+        return int(self.capture_counters.get(stream_key, 0)) >= limit
+
+    def _capture_count_packet(self, stream_key: str):
+        if int(self.capture_limits.get(stream_key, 0)) > 0:
+            self.capture_counters[stream_key] = int(self.capture_counters.get(stream_key, 0)) + 1
+
+    def _capture_accept_packet(self, stream_key: str):
+        """Mark one packet as accepted into capture for the given stream."""
+        self._capture_count_packet(stream_key)
+        if self.capture_active and self._capture_all_streams_done():
+            stream_windows = []
+            for key in self.active_capture_streams():
+                trig = self.trigger_order_by_stream.get(key)
+                first = self.first_order_by_stream.get(key)
+                last = self.last_order_by_stream.get(key)
+                if trig is None or first is None or last is None:
+                    stream_windows.append(f"{key}:n/a")
+                    continue
+                pre_eff = int(_signed_u16_delta(trig, first))
+                post_eff = int(_signed_u16_delta(last, trig))
+                stream_windows.append(f"{key}:pre={pre_eff},post={post_eff}")
+            self._logger.info(
+                f"PTP capture done dev {self.id}: "
+                f"counters={self.capture_counters}, limits={self.capture_limits}, "
+                f"windows=[{', '.join(stream_windows)}]"
+            )
+            self.capture_active = False
+
+    def _capture_all_streams_done(self) -> bool:
+        streams = self.active_capture_streams()
+        if not streams:
+            return True
+        for stream_key in streams:
+            limit = int(self.capture_limits.get(stream_key, 0))
+            if limit > 0 and int(self.capture_counters.get(stream_key, 0)) < limit:
+                return False
+        return True
+
+    def _set_isomon_stream_config(self, stream_enable_mask: int, agg_count: int, avg_samples: int):
+        self.is_isomon = True
+        self.role = 'isomon'
+        self.stream_enable_mask = int(stream_enable_mask) & 0xFF
+        agg = max(1, int(agg_count))
+        avg = max(1, int(avg_samples))
+        self.stream_rate_hz[STREAM_WIDE] = float(PACKET_RATE_HZ) / float(agg)
+        iso_period_us = float(ISOMON_STATE_CYCLE_COUNT) * (ISOMON_ALG_SAMPLE_RATE_HZ / float(avg))
+        self.stream_rate_hz[STREAM_ISO_RESULT] = (1_000_000.0 / iso_period_us) if iso_period_us > 0 else float(PACKET_RATE_HZ)
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None, port:int|None = None):
         pkt = struct.pack('<I', code) + payload
@@ -1130,20 +1265,40 @@ class Device:
         if not ptp_mode.enabled or not ptp_mode.trigger_mode:
             return
         self.ptp_triggered = True
-        self.trigger_order = trigger_order
         self.trigger_sample_num = ptp_mode.trigger_sample_num
-        self.pretrigger_packets = ptp_mode.pretrigger_packets
-        if trigger_order is not None:
-            self.flush_input_packet_ring(trigger_order, ptp_mode.pretrigger_packets)
+        for stream_key in self.active_capture_streams():
+            self.trigger_order_by_stream[stream_key] = trigger_order
+            if trigger_order is not None:
+                pre = int(self.pretrigger_packets_by_stream.get(stream_key, 0))
+                flush_info = self.flush_input_packet_ring(stream_key, trigger_order, pre)
+                self.last_flush_info_by_stream[stream_key] = flush_info
+                if flush_info is not None:
+                    self._logger.info(
+                        f"PTP flush dev {self.id}/{stream_key}: ring={flush_info['ring_len']}, "
+                        f"pre_req={flush_info['pre_requested']}, pre_sel_u={flush_info['pre_selected_unique']}, "
+                        f"pre_sel_pkt={flush_info['pre_selected_packets']}, "
+                        f"trig_sel={flush_info['trigger_selected']}, post_sel={flush_info['post_selected']}, "
+                        f"pre_first={flush_info['pre_first_order']}, pre_last={flush_info['pre_last_order']}, "
+                        f"trigger_order={trigger_order}"
+                    )
+                    if flush_info['pre_selected_unique'] < flush_info['pre_requested']:
+                        self._logger.warning(
+                            f"PTP pretrigger shortage dev {self.id}/{stream_key}: "
+                            f"requested={flush_info['pre_requested']}, available={flush_info['pre_selected_unique']}"
+                        )
 
-    def trigger_sample_index(self):
+    def trigger_sample_index(self, stream_key: str | None = None):
         """Linear sample index (in buffer.signal[0] units) of the trigger sample
         (t = 0), or None when no trigger reference is available. Derived from the
         packet order of the trigger packet, so it is independent of how many
         pre-/post-trigger packets were actually captured."""
-        if self.trigger_order is None or self.first_data_order is None:
+        if stream_key is None:
+            stream_key = self.active_capture_streams()[0] if self.active_capture_streams() else STREAM_DATA
+        trigger_order = self.trigger_order_by_stream.get(stream_key)
+        first_order = self.first_order_by_stream.get(stream_key)
+        if trigger_order is None or first_order is None:
             return None
-        return _signed_u16_delta(self.trigger_order, self.first_data_order) * SAMPLES_PER_PACKET + self.trigger_sample_num
+        return _signed_u16_delta(trigger_order, first_order) * SAMPLES_PER_PACKET + self.trigger_sample_num
 
     def ptp_wait_trigger(self):
         # Do NOT clear the input ring here: arming only enables the hardware
@@ -1155,35 +1310,33 @@ class Device:
 
     def ptp_reset(self, keep_ring: bool = False):
         self.capture_active = False
-        self.capture_counter = 0
-        self.capture_limit = 0
+        self.capture_counters = {k: 0 for k in STREAM_KEYS}
+        self.capture_limits = {k: 0 for k in STREAM_KEYS}
+        self.capture_expected_by_stream = {k: 0 for k in STREAM_KEYS}
         self.ptp_triggered = False
         if not keep_ring:
-            self.input_packet_ring.clear()
-        self.first_data_order = None
-        self.last_data_order = None
-        self.packet_index = 0
-        self.first_iso_order = None
-        self.last_iso_order = None
-        self.iso_packet_index = 0
+            for ring in self.input_packet_rings.values():
+                ring.clear()
+        self.first_order_by_stream = {k: None for k in STREAM_KEYS}
+        self.last_order_by_stream = {k: None for k in STREAM_KEYS}
+        self.packet_index_by_stream = {k: 0 for k in STREAM_KEYS}
         self._iso_first_ptp_ns = None
-        self.trigger_order = None
+        self.trigger_order_by_stream = {k: None for k in STREAM_KEYS}
         self.trigger_sample_num = 0
-        self.pretrigger_packets = 0
+        self.pretrigger_packets_by_stream = {k: 0 for k in STREAM_KEYS}
     
-    def begin_capture(self, n: int):
+    def begin_capture(self, per_stream_limits: dict[str, int], per_stream_pretrigger: dict[str, int], per_stream_expected: dict[str, int]):
         self.capture_active = True
-        self.capture_limit = n
-        self.capture_counter = 0
-        self.first_data_order = None
-        self.last_data_order = None
-        self.packet_index = 0
-        self.first_iso_order = None
-        self.last_iso_order = None
-        self.iso_packet_index = 0
+        self.capture_limits = {k: int(per_stream_limits.get(k, 0)) for k in STREAM_KEYS}
+        self.capture_expected_by_stream = {k: int(per_stream_expected.get(k, 0)) for k in STREAM_KEYS}
+        self.pretrigger_packets_by_stream = {k: int(per_stream_pretrigger.get(k, 0)) for k in STREAM_KEYS}
+        self.capture_counters = {k: 0 for k in STREAM_KEYS}
+        self.first_order_by_stream = {k: None for k in STREAM_KEYS}
+        self.last_order_by_stream = {k: None for k in STREAM_KEYS}
+        self.packet_index_by_stream = {k: 0 for k in STREAM_KEYS}
         self._iso_first_ptp_ns = None
     
-    def flush_input_packet_ring(self, trigger_order:int, pretrigger_packets:int):
+    def flush_input_packet_ring(self, stream_key: str, trigger_order:int, pretrigger_packets:int):
         """Replay buffered packets around the trigger from the input ring.
 
         Processes, in chronological order:
@@ -1193,10 +1346,12 @@ class Device:
           * any packets that arrived just after the trigger but before this flush
             ran (so the pre/post boundary has no missing-packet gap).
         """
+        ring = self.input_packet_rings[stream_key]
+        ring_len = len(ring)
         pre = []   # (distance_back, pkt) for order <  trigger_order
         trig = []  # pkt for order == trigger_order
         post = []  # (distance_fwd, pkt) for order >  trigger_order
-        for pkt in self.input_packet_ring:
+        for pkt in ring:
             order = self.header_struct.unpack(pkt[:4])[1]
             back = (trigger_order - order) & 0xFFFF
             if back == 0:
@@ -1205,16 +1360,41 @@ class Device:
                 pre.append((back, pkt))
             else:
                 post.append(((order - trigger_order) & 0xFFFF, pkt))
-        self.input_packet_ring.clear()
+        ring.clear()
         pre.sort(key=lambda e: e[0])
-        pre = pre[:pretrigger_packets]     # exactly N packets before the trigger
-        pre.reverse()                      # chronological order (oldest first)
+        # Select pre-trigger window by UNIQUE order distances (ms-steps), then
+        # include all packets that belong to those steps (e.g. split POS/NEG WIDE
+        # packets with the same order).
+        selected_backs = []
+        selected_back_set = set()
+        for back, _pkt in pre:
+            if back in selected_back_set:
+                continue
+            selected_back_set.add(back)
+            selected_backs.append(back)
+            if len(selected_backs) >= int(pretrigger_packets):
+                break
+        pre = [(back, pkt) for back, pkt in pre if back in selected_back_set]
+        # Chronological order (oldest first): larger 'back' means older packet.
+        pre.sort(key=lambda e: e[0], reverse=True)
         post.sort(key=lambda e: e[0])      # chronological order
         ordered = [pkt for _, pkt in pre] + trig + [pkt for _, pkt in post]
+        pre_orders = [self.header_struct.unpack(pkt[:4])[1] for _, pkt in pre]
+        flush_info = {
+            'ring_len': ring_len,
+            'pre_requested': int(pretrigger_packets),
+            'pre_selected_unique': int(len(selected_back_set)),
+            'pre_selected_packets': int(len(pre)),
+            'trigger_selected': int(len(trig)),
+            'post_selected': int(len(post)),
+            'pre_first_order': pre_orders[0] if pre_orders else None,
+            'pre_last_order': pre_orders[-1] if pre_orders else None,
+        }
         for buffered_pkt in ordered:
-            if self.capture_limit > 0 and self.capture_counter >= self.capture_limit:
-                return
+            if self._capture_limit_reached(stream_key):
+                return flush_info
             self.on_raw_packet(buffered_pkt)
+        return flush_info
 
     def set_clock_ctrl(self, clock_ctrl:int, save: bool = False):
         """According CLOCK_SETTINGS index."""
@@ -1351,6 +1531,36 @@ class Device:
             'packets':         packets,
         }
 
+    def _ptp_gate_packet(self, stream_key: str, pkt: bytes, order: int, live_update_cb=None) -> bool:
+        """Return True when packet should be consumed for live/ring only (no buffer append)."""
+        if not ptp_mode.enabled:
+            return False
+
+        active_streams = self.active_capture_streams()
+        if stream_key not in active_streams and self.capture_active:
+            if live_update_cb is not None:
+                data = _verify_crc(pkt)
+                if data not in (None, False):
+                    live_update_cb(data)
+            return True
+
+        if not self.capture_active:
+            if ptp_mode.immediate_trigger and ptp_mode.waiting_for_trigger:
+                ptp_mode.trigger_sample_num = 0
+                ptp_mode.immediate_trigger = False
+                ptp_mode.fire_trigger(order)
+                return False
+            self.input_packet_rings[stream_key].append(bytes(pkt))
+            if live_update_cb is not None:
+                data = _verify_crc(pkt)
+                if data not in (None, False):
+                    live_update_cb(data)
+            return True
+
+        if self._capture_limit_reached(stream_key):
+            return True
+        return False
+
     def on_raw_packet(self, pkt:bytes):
         typ, order = self.header_struct.unpack(pkt[:4])
         # Any inbound packet refreshes the firewall pinhole for the data/log port.
@@ -1363,40 +1573,8 @@ class Device:
                 return
             case self.PKT_TYPE_DATA:
                 self.last_data_time = time.monotonic()
-                if ptp_mode.enabled:
-                    if not self.capture_active:
-                        if ptp_mode.immediate_trigger and ptp_mode.waiting_for_trigger:
-                            # Software (immediate) trigger: this packet is t = 0; the
-                            # pre-trigger packets come from the continuously buffered ring.
-                            ptp_mode.trigger_sample_num = 0
-                            ptp_mode.immediate_trigger = False
-                            ptp_mode.fire_trigger(order)
-                            # fall through so this packet is captured as the first post-trigger packet
-                        else:
-                            self.input_packet_ring.append(bytes(pkt))
-                            data = _verify_crc(pkt)
-                            if data not in (None, False):
-                                self._update_live_values_from_data_packet(data)
-                            return
-
-                    if self.capture_limit > 0 and self.capture_counter >= self.capture_limit:
-                        if self.capture_active:
-                            self._logger.info(
-                                f"PTP capture done dev {self.id} (DATA): trigger_order={self.trigger_order}, "
-                                f"first={self.first_data_order}, last={self.last_data_order}, "
-                                f"count={self.capture_counter}/{self.capture_limit}")
-                        self.capture_active = False
-                        return
-
-                    self.capture_counter += 1
-                    #if ptp_mode.samples_awaited <= 0:
-                    #    return
-                    #if ptp_mode.trigger_mode and not self.ptp_triggered:
-                    #    self.input_packet_ring.append(bytes(pkt))
-                    #    return
-                    #if self.packet_counter >= ptp_mode.samples_awaited:
-                    #    self.ptp_triggered = False
-                    #self.packet_counter += 1
+                if self._ptp_gate_packet(STREAM_DATA, pkt, order, self._update_live_values_from_data_packet):
+                    return
 
                 data = _verify_crc(pkt)
                 if data is None:
@@ -1411,21 +1589,11 @@ class Device:
                 # off 8 = uint32 ptp_nanoseconds
                 ptp_seconds, ptp_nanoseconds = struct.unpack('<II', data[4:12])
                 off = 12 # off 12 = data
-                if self.first_data_order is None:
-                    self.first_data_order = order
-                    self.last_data_order = order
-                    self.packet_index = 0
-                else:
-                    delta = _signed_u16_delta(order, self.last_data_order)
-                    if delta > 1000:
-                        self._logger.warning(
-                            f"Dev {self.ip} large packet jump: order={order}, "
-                            f"last={self.last_data_order}, delta={delta}"
-                        )
-                    self.packet_index += delta
-                    self.last_data_order = order
-                
-                rel_order = self.packet_index
+                order_state = self._track_order(STREAM_DATA, order)
+                if order_state <= 0:
+                    return
+                self._capture_accept_packet(STREAM_DATA)
+                rel_order = self.packet_index_by_stream[STREAM_DATA]
                 base = rel_order*SAMPLES_PER_PACKET
                 t = (base + _DATA_SAMPLE_INDEX).tolist()
                 # The packet PTP timestamp marks the last sample in the window; earlier
@@ -1439,7 +1607,7 @@ class Device:
                 errs = list(data[off:off+self.channels])
                 self._update_live_values_from_data_packet(data)
                 self.loop.call_soon_threadsafe(self.buffer.extend, t, samples, errs, ptp)
-                return order
+                return (STREAM_DATA, order)
             case self.PKT_TYPE_TRIGGER:
                 _, packet_num, sample_num, ptp_seconds, ptp_nanoseconds = TRIGGER_PACKET_STRUCT.unpack(pkt[:TRIGGER_PACKET_STRUCT.size])
                 if self.manager is not None and self.manager.trigger_signal is not None:
@@ -1454,32 +1622,8 @@ class Device:
                 return
             case self.PKT_TYPE_RESULT:
                 self.last_data_time = time.monotonic()
-                if ptp_mode.enabled:
-                    if not self.capture_active:
-                        if ptp_mode.immediate_trigger and ptp_mode.waiting_for_trigger:
-                            # Software (immediate) trigger: this packet is t = 0; the
-                            # pre-trigger packets come from the continuously buffered ring.
-                            ptp_mode.trigger_sample_num = 0
-                            ptp_mode.immediate_trigger = False
-                            ptp_mode.fire_trigger(order)
-                            # fall through so this packet is captured as the first post-trigger packet
-                        else:
-                            self.input_packet_ring.append(bytes(pkt))
-                            data = _verify_crc(pkt)
-                            if data not in (None, False):
-                                self._update_live_values_from_result_packet(data)
-                            return
-
-                    if self.capture_limit > 0 and self.capture_counter >= self.capture_limit:
-                        if self.capture_active:
-                            self._logger.info(
-                                f"PTP capture done dev {self.id} (RESULT): trigger_order={self.trigger_order}, "
-                                f"first={self.first_data_order}, last={self.last_data_order}, "
-                                f"count={self.capture_counter}/{self.capture_limit}")
-                        self.capture_active = False
-                        return
-
-                    self.capture_counter += 1
+                if self._ptp_gate_packet(STREAM_RESULT, pkt, order, self._update_live_values_from_result_packet):
+                    return
 
                 data = _verify_crc(pkt)
                 if data is None:
@@ -1488,21 +1632,11 @@ class Device:
                 elif data is False:
                     self._logger.warning(f"Dev {self.ip} returned RESULT packet with incorrect CRC.")
                     return
-                if self.first_data_order is None:
-                    self.first_data_order = order
-                    self.last_data_order = order
-                    self.packet_index = 0
-                else:
-                    delta = _signed_u16_delta(order, self.last_data_order)
-                    if delta > 1000:
-                        self._logger.warning(
-                            f"Dev {self.ip} large packet jump: order={order}, "
-                            f"last={self.last_data_order}, delta={delta}"
-                        )
-                    self.packet_index += delta
-                    self.last_data_order = order
-                
-                rel_order = self.packet_index
+                order_state = self._track_order(STREAM_RESULT, order)
+                if order_state <= 0:
+                    return
+                self._capture_accept_packet(STREAM_RESULT)
+                rel_order = self.packet_index_by_stream[STREAM_RESULT]
                 t = [rel_order]
                 # result_packet_t header: packet_type, packet_num, ptp_seconds,
                 # ptp_nanoseconds, value (the PTP time mirrors the node DATA packet's
@@ -1541,32 +1675,11 @@ class Device:
                 self.loop.call_soon_threadsafe(self.buffer.extend_result, t, samples, errs,
                                                ptp, fault_state, fault_latched, parity_errors, crc_error_mask)
                 #self._logger.info(f"Dev {self.ip} packetNumber[{order}]: result {result_code}")
-                return order
+                return (STREAM_RESULT, order)
             case self.PKT_TYPE_WIDE:
                 self.last_data_time = time.monotonic()
-                if ptp_mode.enabled:
-                    if not self.capture_active:
-                        if ptp_mode.immediate_trigger and ptp_mode.waiting_for_trigger:
-                            ptp_mode.trigger_sample_num = 0
-                            ptp_mode.immediate_trigger = False
-                            ptp_mode.fire_trigger(order)
-                        else:
-                            self.input_packet_ring.append(bytes(pkt))
-                            data = _verify_crc(pkt)
-                            if data not in (None, False):
-                                self._update_live_values_from_wide_packet(data)
-                            return
-
-                    if self.capture_limit > 0 and self.capture_counter >= self.capture_limit:
-                        if self.capture_active:
-                            self._logger.info(
-                                f"PTP capture done dev {self.id} (WIDE): trigger_order={self.trigger_order}, "
-                                f"first={self.first_data_order}, last={self.last_data_order}, "
-                                f"count={self.capture_counter}/{self.capture_limit}")
-                        self.capture_active = False
-                        return
-
-                    self.capture_counter += 1
+                if self._ptp_gate_packet(STREAM_WIDE, pkt, order, self._update_live_values_from_wide_packet):
+                    return
 
                 data = _verify_crc(pkt)
                 if data is None:
@@ -1639,68 +1752,66 @@ class Device:
                     self._logger.warning(f"Dev {self.ip} returned WIDE packet with invalid payload.")
                     return
 
-                # Update first_data_order and packet_index
-                if self.first_data_order is None:
-                    self.first_data_order = order
-                    self.last_data_order = order
-                    self.packet_index = 0
-                else:
-                    delta = _signed_u16_delta(order, self.last_data_order)
-                    if delta > 1000:
-                        self._logger.warning(
-                            f"Dev {self.ip} large packet jump: order={order}, "
-                            f"last={self.last_data_order}, delta={delta}"
-                        )
-                    self.packet_index += delta
-                    self.last_data_order = order
+                order_state = self._track_order(STREAM_WIDE, order)
+                if order_state < 0:
+                    return
+                if order_state > 0:
+                    self._capture_accept_packet(STREAM_WIDE)
 
                 # Build time indices and samples (averaged: sum/agg_count)
-                rel_order = self.packet_index
+                rel_order = self.packet_index_by_stream[STREAM_WIDE]
                 ptp_last_ns = ptp_seconds * 1_000_000_000 + ptp_nanoseconds
                 ptp_list = []
                 time_list = []
                 samples_list = [[] for _ in range(self.channels)]
                 wide_sums_list = []
+                wide_present_list = []
                 agg_counts_list = []
                 agpio_bits_list = []
 
                 for i, rec in enumerate(records):
-                    sample_idx = rel_order * SAMPLES_PER_PACKET + i
+                    # WIDE records are aggregated over agg_count base samples, so
+                    # their sample-domain spacing is agg_count (not 1).
+                    sample_idx = rel_order * SAMPLES_PER_PACKET + i * agg_count
                     time_list.append(sample_idx)
                     # PTP timestamp: each record represents an interval; place it at record end
-                    ptp_list.append(ptp_last_ns - (records_per_channel - i - 1) * (1_000_000_000 // SAMPLES_PER_PACKET))
+                    ptp_list.append(ptp_last_ns - (records_per_channel - i - 1) * agg_count * NS_PER_SAMPLE)
                     
-                    # Build averaged samples (sum / agg_count)
-                    # Preserve the previously seen raw value for a channel when this
-                    # packet does not carry it (e.g. alternating POS/NEG masks).
-                    samples_row = list(self._wide_last_raw)
+                    # Build averaged samples (sum / agg_count). Channels not present
+                    # in this packet keep 0 in storage and are filtered at plot time
+                    # using explicit wide_present metadata.
+                    samples_row = [0] * self.channels
                     wide_sum_row = [0] * self.channels
+                    present_row = [False] * self.channels
                     if channel_mask & WIDE_CH_POS:
                         pos_avg = int(rec['pos'] // agg_count) if agg_count > 0 else 0
                         if self.channels > 0:
                             samples_row[0] = pos_avg
-                            self._wide_last_raw[0] = pos_avg
                             wide_sum_row[0] = int(rec['pos'])
+                            present_row[0] = True
                     if channel_mask & WIDE_CH_NEG:
                         neg_avg = int(rec['neg'] // agg_count) if agg_count > 0 else 0
                         neg_slot = 1 if self.channels > 1 else 0
                         samples_row[neg_slot] = neg_avg
-                        self._wide_last_raw[neg_slot] = neg_avg
                         wide_sum_row[neg_slot] = int(rec['neg'])
+                        present_row[neg_slot] = True
                     
                     for ch in range(self.channels):
                         samples_list[ch].append(samples_row[ch])
                     
                     wide_sums_list.append(tuple(wide_sum_row[:self.channels]))
+                    wide_present_list.append(tuple(present_row[:self.channels]))
                     agg_counts_list.append(agg_count)
                     agpio_bits_list.append(agpio_bits)
 
                 self._update_live_values_from_wide_packet(data, records, agg_count)
                 self.loop.call_soon_threadsafe(self.buffer.extend_wide, time_list, samples_list, ptp_list,
-                                               wide_sums_list, agg_counts_list, agpio_bits_list)
-                return order
+                                               wide_sums_list, wide_present_list, agg_counts_list, agpio_bits_list)
+                return (STREAM_WIDE, order)
             case self.PKT_TYPE_ISO_RESULT:
                 self.last_data_time = time.monotonic()
+                if self._ptp_gate_packet(STREAM_ISO_RESULT, pkt, order):
+                    return
                 data = _verify_crc(pkt)
                 if data is None:
                     self._logger.warning(f"Dev {self.ip} returned too short ISO_RESULT packet.")
@@ -1714,19 +1825,10 @@ class Device:
                     self._logger.warning(f"Dev {self.ip} returned malformed ISO_RESULT packet.")
                     return
 
-                if self.first_iso_order is None:
-                    self.first_iso_order = order
-                    self.last_iso_order = order
-                    self.iso_packet_index = 0
-                else:
-                    delta = _signed_u16_delta(order, self.last_iso_order)
-                    if delta > 1000:
-                        self._logger.warning(
-                            f"Dev {self.ip} large ISO_RESULT packet jump: order={order}, "
-                            f"last={self.last_iso_order}, delta={delta}"
-                        )
-                    self.iso_packet_index += delta
-                    self.last_iso_order = order
+                order_state = self._track_order(STREAM_ISO_RESULT, order)
+                if order_state <= 0:
+                    return
+                self._capture_accept_packet(STREAM_ISO_RESULT)
 
                 ptp_total = iso['ptp_ns_total']
                 if self._iso_first_ptp_ns is None:
@@ -1744,7 +1846,7 @@ class Device:
                 self.live_revision += 1
 
                 self.loop.call_soon_threadsafe(self.buffer.extend_iso_result, t_idx, u_vals, r_vals)
-                return iso['packet_num']
+                return (STREAM_ISO_RESULT, order)
             case self.PKT_TYPE_ID:
                 self._logger.info(f"Dev {self.ip} ID packet received on data socket.")
                 self._parse_id(pkt)
@@ -1870,13 +1972,20 @@ class DeviceManager:
         # bad-CRC packet) would truncate the tail. Capture a margin of extra packets
         # so the full window (incl. the last packet trigger_order+samples_awaited) is
         # always stored; the plot/CSV trim back to exactly samples_awaited.
-        extra = TRIGGER_CAPTURE_MARGIN_PACKETS
-        capture_limit = max(0, ptp_mode.samples_awaited + ptp_mode.pretrigger_packets + extra)
-        for idx, dev in enumerate(self.devices.values()):
-            dev.trigger_order = trigger_order
-            # The CCU emits its result one packet behind the nodes' data, so grant
-            # it one more packet to fill the same post window (the plot/CSV trim it).
-            dev.begin_capture(capture_limit + (1 if idx == CCU_DEVICE_INDEX else 0))
+        extra = max(0, int(TRIGGER_CAPTURE_MARGIN_PACKETS))
+        for dev in self.devices.values():
+            active_streams = dev.active_capture_streams()
+            limits: Dict[str, int] = {k: 0 for k in STREAM_KEYS}
+            pre_packets: Dict[str, int] = {k: 0 for k in STREAM_KEYS}
+            expected_packets: Dict[str, int] = {k: 0 for k in STREAM_KEYS}
+            for stream_key in active_streams:
+                rate_hz = dev.stream_rate(stream_key)
+                pre_n = _packets_from_ms_ceil(ptp_mode.pretrigger_ms, rate_hz)
+                post_n = _packets_from_ms_ceil(ptp_mode.posttrigger_ms, rate_hz)
+                pre_packets[stream_key] = pre_n
+                expected_packets[stream_key] = pre_n + post_n
+                limits[stream_key] = pre_n + post_n + extra
+            dev.begin_capture(limits, pre_packets, expected_packets)
             dev.ptp_trigger(trigger_order)
     
     def ptp_wait_trigger(self):
@@ -1887,7 +1996,14 @@ class DeviceManager:
         for dev in self.devices.values(): dev.ptp_reset(keep_ring=keep_ring)
     
     def begin_capture_all(self, n: int):
-        for dev in self.devices.values(): dev.begin_capture(n)
+        for dev in self.devices.values():
+            limits = {k: 0 for k in STREAM_KEYS}
+            pre_packets = {k: 0 for k in STREAM_KEYS}
+            expected_packets = {k: 0 for k in STREAM_KEYS}
+            for stream_key in dev.active_capture_streams():
+                limits[stream_key] = int(n)
+                expected_packets[stream_key] = int(n)
+            dev.begin_capture(limits, pre_packets, expected_packets)
 
     def ccu_device(self):
         """Return the CCU device (CCU_DEVICE_INDEX) or None if not applied yet."""
@@ -1912,7 +2028,11 @@ class DeviceManager:
                         continue
 
                     if order is not None:
-                        signal.emit(ip, order)
+                        if isinstance(order, tuple) and len(order) == 2:
+                            stream_key, stream_order = order
+                        else:
+                            stream_key, stream_order = STREAM_DATA, int(order)
+                        signal.emit(ip, int(stream_order), str(stream_key))
             except asyncio.CancelledError:
                 return
         self.dispatch_task = self.loop.create_task(run())
@@ -1975,8 +2095,8 @@ class DeviceManager:
 
 # Main GUI application
 class Plotter(QWidget):
-    # emits (ip, packet_order)
-    data_ready = pyqtSignal(str, int)
+    # emits (ip, packet_order, stream_key)
+    data_ready = pyqtSignal(str, int, str)
     log_signal = pyqtSignal(str)
     # emits (ip) when a trigger packet arrives from the given device
     trigger_received = pyqtSignal(str)
@@ -2022,8 +2142,9 @@ class Plotter(QWidget):
         super().__init__()
         self.manager = manager
         self.default_cmd_port = DEFAULT_CMD_PORT
-        self.last_order: Dict[str,int] = {}
+        self.last_order: Dict[Tuple[str, str], int] = {}
         self.expected_samples = 0
+        self.expected_by_stream: Dict[Tuple[str, str], int] = {}
         self.sampling_indicator_button = None
         ptp_mode.device_manager = manager
 
@@ -2177,7 +2298,7 @@ class Plotter(QWidget):
             self.system_status_lbl.fontMetrics().horizontalAdvance('System: state unknown (no response)') + 8)
         btns.addWidget(self.system_status_lbl)
 
-        pretrigger_lbl = QLabel('Pre-trigger packets:')
+        pretrigger_lbl = QLabel('Pre-trigger [ms]:')
         pretrigger_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         btns.addWidget(pretrigger_lbl)
         self.pretrigger_spin = QSpinBox()
@@ -2185,14 +2306,14 @@ class Plotter(QWidget):
         self.pretrigger_spin.setValue(0)
         btns.addWidget(self.pretrigger_spin)
 
-        posttrigger_lbl = QLabel('Post-trigger packets:')
+        posttrigger_lbl = QLabel('Post-trigger [ms]:')
         posttrigger_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         btns.addWidget(posttrigger_lbl)
         self.sample_spin = QSpinBox()
         self.sample_spin.setRange(0, MAX_CAPTURE_PACKETS)
         self.sample_spin.setValue(10)
         btns.addWidget(self.sample_spin)
-        # Keep pre-trigger + post-trigger packets within the sample buffer capacity.
+        # Keep pre-trigger + post-trigger windows within per-stream ring/buffer capacity.
         self.pretrigger_spin.valueChanged.connect(self._update_capture_limits)
         self._update_capture_limits()
 
@@ -2380,18 +2501,38 @@ class Plotter(QWidget):
         self.log_scroll.setVisible(checked)
         self.log_toggle_btn.setText(('▼' if checked else '▶') + ' Log')
 
-    def _check_order(self, ip:str, order:int):
-        last = self.last_order.get(ip)
+    def _check_order(self, ip:str, order:int, stream_key:str):
+        key = (ip, stream_key)
+        last = self.last_order.get(key)
         if last is not None:
+            last_u16 = last & 0xFFFF
+            if order == last_u16:
+                # Duplicate packet of the same logical stream step.
+                return
             expected = (full_expected := (last + 1)) & 0xFFFF
             if order != expected:
-                self._logger.warning(f'[PKT ORDER]\t{ip}: got {order:5}, expected {expected:5} ({full_expected:15})')
-            next = ((last & ~0xFFFF) | order)
-            if expected > 0xC000 and order <  0x4000:
-                next += 0x10000
+                forward_delta = (order - expected) & 0xFFFF
+                if 0 < forward_delta < 0x8000:
+                    miss_lo = expected
+                    miss_hi = (order - 1) & 0xFFFF
+                    self._logger.warning(
+                        f'[PKT ORDER]\t{ip}/{stream_key}: packet loss {forward_delta} pkt, '
+                        f'missing {miss_lo:5}..{miss_hi:5}, got {order:5}')
+                    next = ((last & ~0xFFFF) | order)
+                    if expected > 0xC000 and order < 0x4000:
+                        next += 0x10000
+                else:
+                    self._logger.warning(
+                        f'[PKT ORDER]\t{ip}/{stream_key}: out-of-order/late pkt, '
+                        f'got {order:5}, expected {expected:5} ({full_expected:15})')
+                    next = last
+            else:
+                next = ((last & ~0xFFFF) | order)
+                if expected > 0xC000 and order < 0x4000:
+                    next += 0x10000
         else:
             next = order
-        self.last_order[ip] = next
+        self.last_order[key] = next
 
     def _configured_ip_for_row(self, row:int) -> str | None:
         txt = self.device_edits[row].text().strip()
@@ -2692,7 +2833,7 @@ class Plotter(QWidget):
         self.ax.clear()
         self.curves.clear()
         count = 0
-        for chk, le in zip(self.device_checks,self.device_edits):
+        for row, (chk, le) in enumerate(zip(self.device_checks, self.device_edits)):
             if not chk.isChecked():
                 continue
             txt = le.text().strip()
@@ -2706,11 +2847,21 @@ class Plotter(QWidget):
                     ip = txt
                     port = self.default_cmd_port
                 self.manager.add_device(ip,port)
+                dev = self.manager.devices.get(ip)
+                if dev is not None:
+                    if row == CCU_DEVICE_INDEX:
+                        dev.role = 'ccu'
+                    elif row == ISOMON_DEVICE_INDEX:
+                        dev.role = 'isomon'
+                        dev.is_isomon = True
+                    else:
+                        dev.role = 'node'
                 count += 1
             except:
                 self._logger.warning(f'Bad entry: {txt}')
         self._refresh_fault_indicators()
         self._refresh_analog_values()
+        self._update_capture_limits()
         self._logger.info(f'Applied {count} devices')
 
     def _ping_all(self):
@@ -2732,6 +2883,43 @@ class Plotter(QWidget):
                 f"latched={info.get('fault_latched_count', 0)}" if info else 'FAIL'))
         self._refresh_fault_indicators()
         self._refresh_analog_values()
+
+    def _discover_isomon_stream_rates(self):
+        stream_sec = fdds_alg_config.section_by_name('isomon', 'isomon_stream')
+        iso_sec = fdds_alg_config.section_by_name('isomon', 'isomon_iso')
+        if stream_sec is None or iso_sec is None:
+            return
+        for ip, dev in self.manager.devices.items():
+            if dev.role != 'isomon':
+                continue
+            stream_enable_mask = ISOMON_STREAM_ENABLE_WIDE | ISOMON_STREAM_ENABLE_ISO_RESULT
+            agg_count = 1
+            avg_samples = int(ISOMON_ALG_SAMPLE_RATE_HZ)
+            try:
+                hdr = dev.get_alg_config_section(0xFF)
+                device_name = fdds_alg_config.device_for_tag(int(hdr.get('tag', 0))) if hdr else None
+                if device_name != 'isomon':
+                    self._logger.warning(f'ISOMON stream-rate discovery on {ip}: unexpected alg tag, keeping defaults.')
+                    continue
+
+                stream_raw = dev.get_alg_config_section(stream_sec.id)
+                if stream_raw and len(stream_raw.get('body', b'')) >= stream_sec.size:
+                    stream_cfg = stream_sec.unpack(stream_raw['body'])
+                    stream_enable_mask = int(stream_cfg.get('stream_enable', stream_enable_mask))
+                    agg_count = max(1, int(stream_cfg.get('agg_count', agg_count)))
+
+                iso_raw = dev.get_alg_config_section(iso_sec.id)
+                if iso_raw and len(iso_raw.get('body', b'')) >= iso_sec.size:
+                    iso_cfg = iso_sec.unpack(iso_raw['body'])
+                    avg_samples = max(1, int(iso_cfg.get('avg_samples', avg_samples)))
+
+                dev._set_isomon_stream_config(stream_enable_mask, agg_count, avg_samples)
+                self._logger.info(
+                    f'ISOMON stream config {ip}: enable=0x{stream_enable_mask:02X}, agg_count={agg_count}, '
+                    f'avg_samples={avg_samples}, wide_rate_hz={dev.stream_rate_hz[STREAM_WIDE]:.3f}, '
+                    f'iso_rate_hz={dev.stream_rate_hz[STREAM_ISO_RESULT]:.3f} (states={ISOMON_STATE_CYCLE_COUNT})')
+            except Exception as exc:
+                self._logger.warning(f'ISOMON stream-rate discovery failed on {ip}: {exc}')
 
     def _get_digital_channels(self):
         for ip, chans in self.manager.get_digital_channels_all().items():
@@ -2795,16 +2983,53 @@ class Plotter(QWidget):
         if button is not None:
             button.setStyleSheet("background-color: #ffd84d; color: black;")
 
-    def _clear_sampling_indicator_if_complete(self, received_counts: List[int]):
-        if self.sampling_indicator_button is None or self.expected_samples <= 0:
+    def _stream_specs(self) -> List[Tuple[str, str, float]]:
+        specs: List[Tuple[str, str, float]] = []
+        for ip, dev in self.manager.devices.items():
+            for stream_key in dev.active_capture_streams():
+                specs.append((ip, stream_key, dev.stream_rate(stream_key)))
+        if not specs:
+            specs.append(('global', STREAM_DATA, float(PACKET_RATE_HZ)))
+        return specs
+
+    def _recompute_expected_stream_packets(self, pre_ms: int, post_ms: int):
+        self.expected_by_stream = {}
+        for ip, stream_key, rate_hz in self._stream_specs():
+            pre_n = _packets_from_ms_ceil(pre_ms, rate_hz)
+            post_n = _packets_from_ms_ceil(post_ms, rate_hz)
+            self.expected_by_stream[(ip, stream_key)] = pre_n + post_n
+        self.expected_samples = max(self.expected_by_stream.values(), default=0)
+
+    def _clear_sampling_indicator_if_complete(self, received_counts: Dict[Tuple[str, str], int]):
+        if self.sampling_indicator_button is None or not self.expected_by_stream:
             return
-        if received_counts and all(received >= self.expected_samples for received in received_counts):
+        complete = True
+        for key, expected in self.expected_by_stream.items():
+            if expected <= 0:
+                continue
+            if int(received_counts.get(key, 0)) < int(expected):
+                complete = False
+                break
+        if complete:
             self._set_sampling_indicator(None)
 
     def _update_capture_limits(self):
-        """Cap post-trigger packets so pre-trigger + post-trigger fit the sample buffer."""
-        pre = self.pretrigger_spin.value()
-        self.sample_spin.setMaximum(max(0, MAX_CAPTURE_PACKETS - pre))
+        """Cap trigger windows in ms so all active streams fit ring/buffer limits."""
+        specs = self._stream_specs()
+        pre_max_ms = min(int((PTP_TRIGGER_RING_PACKETS * 1000.0) // rate_hz) for _, _, rate_hz in specs)
+        pre_max_ms = max(0, pre_max_ms)
+        self.pretrigger_spin.setRange(0, pre_max_ms)
+        pre_ms = min(self.pretrigger_spin.value(), pre_max_ms)
+        if pre_ms != self.pretrigger_spin.value():
+            self.pretrigger_spin.setValue(pre_ms)
+
+        post_max_ms = []
+        for _ip, _stream_key, rate_hz in specs:
+            pre_packets = _packets_from_ms_ceil(pre_ms, rate_hz)
+            available_packets = max(0, MAX_CAPTURE_PACKETS - pre_packets)
+            post_max_ms.append(int((available_packets * 1000.0) // rate_hz))
+        post_max = max(0, min(post_max_ms) if post_max_ms else MAX_CAPTURE_PACKETS)
+        self.sample_spin.setMaximum(post_max)
 
     def _apply_downsampling(self, *_):
         """Apply the GUI downsampling / clip-to-view settings to both plots.
@@ -2828,13 +3053,9 @@ class Plotter(QWidget):
             plot.setClipToView(clip)
 
     def _start_sampling(self):
-        n = self.sample_spin.value()
-        pretrigger_packets = self.pretrigger_spin.value()
-        if n + pretrigger_packets > MAX_CAPTURE_PACKETS:
-            self._logger.warning(f"Pre-trigger ({pretrigger_packets}) + post-trigger ({n}) packets exceed buffer capacity {MAX_CAPTURE_PACKETS}, clamping post-trigger.")
-            n = max(0, MAX_CAPTURE_PACKETS - pretrigger_packets)
-            self.sample_spin.setValue(n)
-        self.expected_samples = n + pretrigger_packets
+        posttrigger_ms = self.sample_spin.value()
+        pretrigger_ms = self.pretrigger_spin.value()
+        self._recompute_expected_stream_packets(pretrigger_ms, posttrigger_ms)
 
         if ptp_mode.enabled:
             # Immediate software trigger: the click instant becomes t = 0. Pre-trigger
@@ -2842,37 +3063,36 @@ class Plotter(QWidget):
             # trigger packets are captured live, so the record has the same length and
             # time layout (-pretrigger .. 0 .. +post) as 'Start Sampling on trigger'.
             self.manager.ptp_reset(keep_ring=True)
-            ptp_mode.samples_awaited = n
-            ptp_mode.pretrigger_packets = pretrigger_packets
+            ptp_mode.posttrigger_ms = int(posttrigger_ms)
+            ptp_mode.pretrigger_ms = int(pretrigger_ms)
+            # Legacy packet fields kept for compatibility with older code paths.
+            ptp_mode.samples_awaited = _packets_from_ms_ceil(posttrigger_ms, PACKET_RATE_HZ)
+            ptp_mode.pretrigger_packets = _packets_from_ms_ceil(pretrigger_ms, PACKET_RATE_HZ)
             ptp_mode.trigger_sample_num = 0
             ptp_mode.trigger_mode = True
             ptp_mode.immediate_trigger = True
             ptp_mode.waiting_for_trigger = True
-            self._logger.info(f'Started PTP sampling (n={n}, pretrigger_packets={pretrigger_packets})')
+            self._logger.info(f'Started PTP sampling (post_ms={posttrigger_ms}, pre_ms={pretrigger_ms})')
         else:
             leader_id=self.leader_buttons.checkedId()
             leader_ip = self.device_edits[leader_id].text().strip().split(':')[0]
             for i, (ip, dev) in enumerate(self.manager.devices.items()):
                 if ip != leader_ip:
-                    dev.start_sampling(n)
-                    self._logger.info(f'Start on follower {ip} (n={n})')
+                    dev.start_sampling(posttrigger_ms)
+                    self._logger.info(f'Start on follower {ip} (post_ms={posttrigger_ms})')
             if 0 <= leader_id < len(self.manager.devices):
                 time.sleep(0.01)
-                self.manager.devices[leader_ip].start_sampling(n)
-                self._logger.info(f'Start on leader {leader_ip} (n={n})')
+                self.manager.devices[leader_ip].start_sampling(posttrigger_ms)
+                self._logger.info(f'Start on leader {leader_ip} (post_ms={posttrigger_ms})')
             else:
                 for ip, dev in self.manager.devices.items():
-                    dev.start_sampling(n)
-                    self._logger.info(f'Start on {ip} (n={n})')
+                    dev.start_sampling(posttrigger_ms)
+                    self._logger.info(f'Start on {ip} (post_ms={posttrigger_ms})')
 
     def _start_sampling_on_trigger(self):
-        n = self.sample_spin.value()
-        pretrigger_packets = self.pretrigger_spin.value()
-        if n + pretrigger_packets > MAX_CAPTURE_PACKETS:
-            self._logger.warning(f"Pre-trigger ({pretrigger_packets}) + post-trigger ({n}) packets exceed buffer capacity {MAX_CAPTURE_PACKETS}, clamping post-trigger.")
-            n = max(0, MAX_CAPTURE_PACKETS - pretrigger_packets)
-            self.sample_spin.setValue(n)
-        self.expected_samples = n + pretrigger_packets
+        posttrigger_ms = self.sample_spin.value()
+        pretrigger_ms = self.pretrigger_spin.value()
+        self._recompute_expected_stream_packets(pretrigger_ms, posttrigger_ms)
 
         if ptp_mode.enabled:
             # Keep the rolling pre-trigger ring (and the device packet counter, see
@@ -2882,25 +3102,28 @@ class Plotter(QWidget):
 
             ptp_mode.waiting_for_trigger = True
             ptp_mode.trigger_mode = True
-            ptp_mode.samples_awaited = n
-            ptp_mode.pretrigger_packets = pretrigger_packets
+            ptp_mode.posttrigger_ms = int(posttrigger_ms)
+            ptp_mode.pretrigger_ms = int(pretrigger_ms)
+            # Legacy packet fields kept for compatibility with older code paths.
+            ptp_mode.samples_awaited = _packets_from_ms_ceil(posttrigger_ms, PACKET_RATE_HZ)
+            ptp_mode.pretrigger_packets = _packets_from_ms_ceil(pretrigger_ms, PACKET_RATE_HZ)
 
             self.manager.ptp_wait_trigger()
-            self._logger.info(f'Wait trigger PTP sampling (n={n}, pretrigger_packets={pretrigger_packets})')
+            self._logger.info(f'Wait trigger PTP sampling (post_ms={posttrigger_ms}, pre_ms={pretrigger_ms})')
         else:
             leader_id = self.leader_buttons.checkedId()
             leader_ip = self.device_edits[leader_id].text().strip().split(':')[0]
             for i, (ip, dev) in enumerate(self.manager.devices.items()):
                 if ip != leader_ip:
-                    dev.start_sampling(n)
-                    self._logger.info(f'Start on follower {ip} (n={n})')
+                    dev.start_sampling(posttrigger_ms)
+                    self._logger.info(f'Start on follower {ip} (post_ms={posttrigger_ms})')
             if 0 <= leader_id < len(self.manager.devices):
-                self.manager.devices[leader_ip].start_sampling_trigger(n)
-                self._logger.info(f'Trigger on leader {leader_ip} (n={n})')
+                self.manager.devices[leader_ip].start_sampling_trigger(posttrigger_ms)
+                self._logger.info(f'Trigger on leader {leader_ip} (post_ms={posttrigger_ms})')
             else:
                 for ip, dev in self.manager.devices.items():
-                    dev.start_sampling(n)
-                    self._logger.info(f'Start on {ip} (n={n})')
+                    dev.start_sampling(posttrigger_ms)
+                    self._logger.info(f'Start on {ip} (post_ms={posttrigger_ms})')
 
     def _start_new_sampling(self):
         self._set_sampling_indicator(self.start_sampling_btn)
@@ -3515,6 +3738,13 @@ class Plotter(QWidget):
                 dev.buffer.result_fault_latched.clear()
                 dev.buffer.result_parity_errors.clear()
                 dev.buffer.result_crc_error_mask.clear()
+                for dq in dev.buffer.wide_sums: dq.clear()
+                for dq in dev.buffer.wide_present: dq.clear()
+                dev.buffer.wide_agg_counts.clear()
+                dev.buffer.wide_agpio_bits.clear()
+                dev.buffer.iso_time.clear()
+                for ring in dev.buffer.iso_u.values(): ring.clear()
+                for ring in dev.buffer.iso_r.values(): ring.clear()
         self.ax.clear()
         self.curves.clear()
 
@@ -3726,13 +3956,15 @@ class Plotter(QWidget):
             time_scale = PACKET_PERIOD if has_result_meta else SAMPLING_PERIOD
 
             # Align CSV time so the trigger sample is at t = 0 (matches the plot).
-            _tsi = dev.trigger_sample_index()
+            stream_key = STREAM_RESULT if has_result_meta else (STREAM_WIDE if has_wide_meta else STREAM_DATA)
+            _tsi = dev.trigger_sample_index(stream_key)
             time_zero_s = _tsi * SAMPLING_PERIOD if _tsi is not None else 0.0
             # Same window trim as the plot: keep exactly pre+post packets. Trim by
             # integer sample/packet number relative to the trigger so every device
             # yields the same count regardless of PTP float rounding.
-            _pre = dev.pretrigger_packets
-            _post = ptp_mode.samples_awaited
+            _pre = int(dev.pretrigger_packets_by_stream.get(stream_key, 0))
+            _expected = int(dev.capture_expected_by_stream.get(stream_key, 0))
+            _post = max(0, _expected - _pre)
             _trim_window = _tsi is not None and _post > 0
             if has_result_meta:
                 _trig_n = _tsi / SAMPLES_PER_PACKET
@@ -3948,12 +4180,13 @@ class Plotter(QWidget):
             return
         self._plot_revisions = revisions
         lines = []
-        received_counts = []
+        received_counts: Dict[Tuple[str, str], int] = {}
         #for (ip, dev) in self.manager.devices.items():
         for dev_index, (ip, dev) in enumerate(self.manager.devices.items()):
             buf = dev.buffer
             if not buf.time:
                 continue
+            iso_received = None
             with buf.lock:
                 # Data processing
                 if not self._is_ccu_ip(ip):
@@ -3966,25 +4199,31 @@ class Plotter(QWidget):
                     order_perm, self._sort_state[ip] = plot_sort_order(
                         idx0, self._sort_state.get(ip))
                     idx = idx0.astype(float)
-                    tsi = dev.trigger_sample_index()
+                    tsi = dev.trigger_sample_index(STREAM_WIDE if self._is_isomon_ip(ip) else STREAM_DATA)
                     if tsi is not None:
                         # Shift so the trigger sample sits at t = 0 (per-sample, on
                         # the unified buffer rather than per packet).
                         idx -= tsi
                     if order_perm is not None:
                         idx = idx[order_perm]
+                    stream_key = STREAM_WIDE if self._is_isomon_ip(ip) else STREAM_DATA
+                    pre_packets = int(dev.pretrigger_packets_by_stream.get(stream_key, 0))
+                    expected_packets = int(dev.capture_expected_by_stream.get(stream_key, 0))
+                    post_packets = max(0, expected_packets - pre_packets)
                     if tsi is not None:
-                        trim = int(np.searchsorted(idx, -dev.pretrigger_packets * SAMPLES_PER_PACKET, side='left'))
+                        trim = int(np.searchsorted(idx, -pre_packets * SAMPLES_PER_PACKET, side='left'))
                     else:
                         trim = 0
                     # Cut the tail of the extra packet so exactly the requested
                     # post-trigger window is shown (samples_awaited packets).
-                    if tsi is not None and ptp_mode.samples_awaited > 0:
-                        trim_end = int(np.searchsorted(idx, ptp_mode.samples_awaited * SAMPLES_PER_PACKET, side='left'))
+                    if tsi is not None and post_packets > 0:
+                        trim_end = int(np.searchsorted(idx, post_packets * SAMPLES_PER_PACKET, side='left'))
                     else:
                         trim_end = len(idx)
-                    received_full = int(len(idx) // SAMPLES_PER_PACKET)
-                    x = idx[trim:trim_end] * SAMPLING_PERIOD
+                    idx_i64 = idx.astype(np.int64, copy=False)
+                    pkt_bins = np.floor_divide(idx_i64, SAMPLES_PER_PACKET)
+                    received_full = int(np.unique(pkt_bins).size)
+                    x_all = idx[trim:trim_end] * SAMPLING_PERIOD
                     avgs = [0] * dev.channels
                     for ch in range(dev.channels):
                         key = (ip, ch)
@@ -3994,6 +4233,23 @@ class Plotter(QWidget):
                         if order_perm is not None:
                             raw = raw[order_perm]
                         raw = raw[trim:trim_end]
+                        x_ch = x_all
+                        if self._is_isomon_ip(ip):
+                            present = np.asarray(list(buf.wide_present[ch]), dtype=bool)
+                            if order_perm is not None and present.size == len(order_perm):
+                                present = present[order_perm]
+                            present = present[trim:trim_end]
+                            if present.size == raw.size:
+                                raw = raw[present]
+                                x_ch = x_all[present]
+                            if x_ch.size > 1:
+                                # Duplicate x for a channel can still occur; keep
+                                # the last point at each time step.
+                                _, rev_pos = np.unique(x_ch[::-1], return_index=True)
+                                keep = (x_ch.size - 1 - rev_pos)
+                                keep.sort()
+                                x_ch = x_ch[keep]
+                                raw = raw[keep]
                         # Kalibrace z ID paketu
                         gain = 1.0
                         offset = 0.0
@@ -4019,8 +4275,9 @@ class Plotter(QWidget):
                             y = raw * gain
                             y += offset
 
-                        avgs[ch] = np.mean(y[-min(len(y), SAMPLES_PER_PACKET * DEFAULT_AVG_LEN_MS):])
-                        self.curves[key].setData(x[-len(y):], y)
+                        tail = y[-min(len(y), SAMPLES_PER_PACKET * DEFAULT_AVG_LEN_MS):]
+                        avgs[ch] = float(np.nanmean(tail)) if np.any(~np.isnan(tail)) else 0.0
+                        self.curves[key].setData(x_ch, y)
                 
                     # Error calculation: only the most recent packet's worth of
                     # per-sample parity counts is shown, so read just that tail
@@ -4036,6 +4293,13 @@ class Plotter(QWidget):
                             agpio_bits_rows = agpio_bits_rows[order_perm]
                         if agpio_bits_rows.size:
                             agpio_bits_rows = agpio_bits_rows[trim:trim_end]
+                            x_agpio = x_all
+                            if x_agpio.size > 1 and agpio_bits_rows.size == x_agpio.size:
+                                _, rev_pos = np.unique(x_agpio[::-1], return_index=True)
+                                keep = (x_agpio.size - 1 - rev_pos)
+                                keep.sort()
+                                x_agpio = x_agpio[keep]
+                                agpio_bits_rows = agpio_bits_rows[keep]
                             center = (bin(WIDE_AGPIO_DISPLAY_MASK & 0xFF).count('1') - 1) / 2.0
                             offset_step = 0.05
                             series_idx = 0
@@ -4049,27 +4313,30 @@ class Plotter(QWidget):
                                     self.ax_result_curves[curve_key] = self.ax_result.plot(pen=color, name=curve_name)
                                 y_bits = ((agpio_bits_rows >> bit_idx) & 1).astype(float)
                                 y_bits += (series_idx - center) * offset_step
-                                self.ax_result_curves[curve_key].setData(x[-len(y_bits):], y_bits)
+                                self.ax_result_curves[curve_key].setData(x_agpio, y_bits)
                                 series_idx += 1
 
                         # PACKET_ISO_RESULT analog U-series are plotted directly as
                         # floats (no calibration), on the analog pane.
                         iso_time = np.asarray(buf.iso_time, dtype=float)
                         if iso_time.size:
+                            iso_total_len = int(iso_time.size)
+                            x_iso = iso_time * SAMPLING_PERIOD
                             if tsi is not None:
-                                iso_time = iso_time - tsi
-                            if tsi is not None and ptp_mode.samples_awaited > 0:
-                                trim = int(np.searchsorted(iso_time, -dev.pretrigger_packets * SAMPLES_PER_PACKET, side='left'))
-                                trim_end = int(np.searchsorted(iso_time, ptp_mode.samples_awaited * SAMPLES_PER_PACKET, side='left'))
+                                x_iso = x_iso - (tsi * SAMPLING_PERIOD)
+                            if tsi is not None and ptp_mode.posttrigger_ms > 0:
+                                win_lo = -float(ptp_mode.pretrigger_ms) / 1000.0
+                                win_hi = float(ptp_mode.posttrigger_ms) / 1000.0
+                                iso_keep = (x_iso >= win_lo) & (x_iso < win_hi)
                             else:
-                                trim = 0
-                                trim_end = len(iso_time)
-                            x_iso = (iso_time[trim:trim_end] * SAMPLING_PERIOD)
+                                iso_keep = np.ones(iso_total_len, dtype=bool)
+                            x_iso = x_iso[iso_keep]
+                            iso_received = int(len(x_iso))
                             for name in ISO_U_FIELDS:
                                 y_iso = np.asarray(buf.iso_u[name], dtype=float)
-                                if y_iso.size != len(iso_time):
+                                if y_iso.size != iso_total_len:
                                     continue
-                                y_iso = y_iso[trim:trim_end]
+                                y_iso = y_iso[iso_keep]
                                 key = (ip, name)
                                 if key not in self.curves:
                                     pen = pg.mkPen(Plotter.Colors[len(self.curves) % len(Plotter.Colors)], width=2)
@@ -4079,9 +4346,9 @@ class Plotter(QWidget):
                             if ISOMON_ENABLED:
                                 for name in ISO_R_FIELDS:
                                     y_r = np.asarray(buf.iso_r[name], dtype=float)
-                                    if y_r.size != len(iso_time):
+                                    if y_r.size != iso_total_len:
                                         continue
-                                    y_r = y_r[trim:trim_end]
+                                    y_r = y_r[iso_keep]
                                     if name not in self.ax_iso_r_curves:
                                         color = Plotter.Colors[len(self.ax_iso_r_curves) % len(Plotter.Colors)]
                                         self.ax_iso_r_curves[name] = self.ax_iso_r.plot(pen=color, name=name)
@@ -4091,8 +4358,8 @@ class Plotter(QWidget):
                     received = received_full
                     # Count only packets inside the requested window so a missing
                     # packet anywhere (start, middle, end) shows up as a shortfall.
-                    if tsi is not None and ptp_mode.samples_awaited > 0:
-                        received = int((trim_end - trim) // SAMPLES_PER_PACKET)
+                    if tsi is not None and post_packets > 0:
+                        received = int(np.unique(pkt_bins[trim:trim_end]).size)
 
                 # Result processing
                 else:
@@ -4119,18 +4386,21 @@ class Plotter(QWidget):
                         + np.tile(np.arange(SAMPLES_PER_PACKET), received) * SAMPLING_PERIOD
                     )
 
-                    tsi = dev.trigger_sample_index()
+                    tsi = dev.trigger_sample_index(STREAM_RESULT)
                     if tsi is not None:
                         # Same per-sample time-zero shift + pre-trigger window trim
                         # as the node path (tsi is in sample units). Packet-align the
                         # zero (drop trigger's intra-packet offset) so result rows stay
                         # on the whole-ms grid, matching the saved CSV.
                         x = x - round(tsi / SAMPLES_PER_PACKET) * PACKET_PERIOD
-                        trim = int(np.searchsorted(x, -dev.pretrigger_packets * PACKET_PERIOD, side='left'))
+                        pre_packets = int(dev.pretrigger_packets_by_stream.get(STREAM_RESULT, 0))
+                        expected_packets = int(dev.capture_expected_by_stream.get(STREAM_RESULT, 0))
+                        post_packets = max(0, expected_packets - pre_packets)
+                        trim = int(np.searchsorted(x, -pre_packets * PACKET_PERIOD, side='left'))
                         # Cut the tail of the extra packet to exactly post packets;
                         # include the sample that lands exactly on the window edge.
-                        if ptp_mode.samples_awaited > 0:
-                            trim_end = int(np.searchsorted(x, ptp_mode.samples_awaited * PACKET_PERIOD, side='right'))
+                        if post_packets > 0:
+                            trim_end = int(np.searchsorted(x, post_packets * PACKET_PERIOD, side='right'))
                         else:
                             trim_end = x.size
                     else:
@@ -4139,7 +4409,7 @@ class Plotter(QWidget):
                     x = x[trim:trim_end]
                     # Count only result packets inside the window so a missing one
                     # shows up as a shortfall (matches the node statistics).
-                    if tsi is not None and ptp_mode.samples_awaited > 0:
+                    if tsi is not None and post_packets > 0:
                         received = int((trim_end - trim) // SAMPLES_PER_PACKET)
 
                     avgs = [0]  # Dummy for uniform output
@@ -4205,24 +4475,42 @@ class Plotter(QWidget):
                     errs = ','.join(str(int(buf.error[c].tail(1).sum(dtype=np.int64))) for c in range(dev.result_channels))
 
             # Statistics
-            received_counts.append(received)
+            primary_stream = STREAM_RESULT if self._is_ccu_ip(ip) else (STREAM_WIDE if self._is_isomon_ip(ip) else STREAM_DATA)
+            received_counts[(ip, primary_stream)] = int(received)
             avgs = ', '.join(map(lambda v: f'{v:.3f}', avgs))
-            sent = self.last_order.get(ip)
+            sent = self.last_order.get((ip, primary_stream))
             if sent is None:
                 sent = 0
             else:
                 sent += 1
             #received = int(len(x)//SAMPLES_PER_PACKET)
             sent = max(sent, received) # sent is updated in data_ready signal, which can be delayed from receiving buffer on heavy load
-            stat_line = f'{ip}: packets = {received}/{sent}/{self.expected_samples}; errs = {errs}; avg = {avgs}'
+            expected_primary = int(self.expected_by_stream.get((ip, primary_stream), self.expected_samples))
+            stat_line = f'{ip}/{primary_stream}: packets = {received}/{sent}/{expected_primary}; errs = {errs}; avg = {avgs}'
 
             if (received == dev.received_last):
-                if received < self.expected_samples:
+                if received < expected_primary:
                     stat_line = f'<span style="color:red;">{stat_line}</span>'
             lines.append(stat_line)
             dev.received_last = received
 
-        self.error_lbl.setText(f'Statistic (ip: received / sent / expected packets (ms); channels parity errors; channels average per {DEFAULT_AVG_LEN_MS} ms):<br>' + 
+            if self._is_isomon_ip(ip):
+                expected_iso = int(self.expected_by_stream.get((ip, STREAM_ISO_RESULT), 0))
+                if iso_received is None:
+                    iso_received = 0
+                iso_sent = self.last_order.get((ip, STREAM_ISO_RESULT))
+                if iso_sent is None:
+                    iso_sent = 0
+                else:
+                    iso_sent += 1
+                iso_sent = max(int(iso_sent), int(iso_received))
+                received_counts[(ip, STREAM_ISO_RESULT)] = int(iso_received)
+                iso_line = f'{ip}/{STREAM_ISO_RESULT}: packets = {iso_received}/{iso_sent}/{expected_iso}; errs = -; avg = -'
+                if expected_iso > 0 and iso_received < expected_iso:
+                    iso_line = f'<span style="color:red;">{iso_line}</span>'
+                lines.append(iso_line)
+
+        self.error_lbl.setText(f'Statistic (ip/stream: received / sent / expected packets; channels parity errors; channels average per {DEFAULT_AVG_LEN_MS} ms):<br>' + 
                                "<br>".join(lines))
         self.error_lbl.setTextFormat(Qt.RichText)
         self._clear_sampling_indicator_if_complete(received_counts)
@@ -4256,7 +4544,7 @@ class Plotter(QWidget):
         #self._penetrate_firewall()
         #for i, f in enumerate((self._ping_all, self._register_logger_all, self._get_ids, self._get_clock_config, self._register_all, self._reset_counter)):
         # TODO: add self._leader_changed
-        init_fns = (self._ping_all, self._register_logger_all, self._get_ids, self._get_digital_channels, self._get_clock_config, self._get_trigger_config, self._register_all, self._register_ccu, self._reset_counter)
+        init_fns = (self._ping_all, self._register_logger_all, self._get_ids, self._discover_isomon_stream_rates, self._get_digital_channels, self._get_clock_config, self._get_trigger_config, self._register_all, self._register_ccu, self._reset_counter)
         for i, f in enumerate(init_fns):
             QTimer(self).singleShot(i * 100, f)
         # After init, query the current system state, display it and react to it.
@@ -4288,9 +4576,9 @@ def main(argv):
         # would break the running-system status (a checked device with no data).
         ISOMON_ENABLED = bool(getattr(ds, 'ISOMON_ENABLED', False))
         DEFAULT_AVG_LEN_MS = getattr(ds, 'DEFAULT_AVG_LEN_MS', 1000)
-        DEFAULT_PRETRIGGER_PACKETS = getattr(ds, 'DEFAULT_PRETRIGGER_PACKETS', 0)
+        DEFAULT_PRETRIGGER_MS = int(getattr(ds, 'DEFAULT_PRETRIGGER_MS', getattr(ds, 'DEFAULT_PRETRIGGER_PACKETS', 0)))
         # Fall back to DEFAULT_AVG_LEN_MS so behaviour is unchanged when the setting/file is absent.
-        DEFAULT_POSTTRIGGER_PACKETS = getattr(ds, 'DEFAULT_POSTTRIGGER_PACKETS', DEFAULT_AVG_LEN_MS)
+        DEFAULT_POSTTRIGGER_MS = int(getattr(ds, 'DEFAULT_POSTTRIGGER_MS', getattr(ds, 'DEFAULT_POSTTRIGGER_PACKETS', DEFAULT_AVG_LEN_MS)))
         PTP_TRIGGER_RING_PACKETS = getattr(ds, 'PTP_TRIGGER_RING_PACKETS', PTP_TRIGGER_RING_PACKETS)
         TRIGGER_CAPTURE_MARGIN_PACKETS = int(getattr(ds, 'TRIGGER_CAPTURE_MARGIN_PACKETS', TRIGGER_CAPTURE_MARGIN_PACKETS))
         # Sample-buffer length: recompute the derived sizes (used by DeviceBuffer ring
@@ -4335,7 +4623,7 @@ def main(argv):
         gui_log_handler.setLevel(logging.DEBUG)
         logging_.log_printer.add_handler(gui_log_handler)
         logging_.logger.critical(f"Logging to file: {logging_.log_path}") # This has to be in console, so critical
-        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PRETRIGGER_PACKETS={DEFAULT_PRETRIGGER_PACKETS}, DEFAULT_POSTTRIGGER_PACKETS={DEFAULT_POSTTRIGGER_PACKETS}, PTP_TRIGGER_RING_PACKETS={PTP_TRIGGER_RING_PACKETS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}, DATA_SOCKET_RCVBUF_BYTES={DATA_SOCKET_RCVBUF_BYTES}, TRIGGER_CAPTURE_MARGIN_PACKETS={TRIGGER_CAPTURE_MARGIN_PACKETS}, BUFFER_LENGTH_S={BUFFER_LENGTH_S}, FIREWALL_PENETRATION={FIREWALL_PENETRATION}, USE_OPENGL={USE_OPENGL}, GUI_REFRESH_INTERVAL_MS={GUI_REFRESH_INTERVAL_MS}, ISOMON_ENABLED={ISOMON_ENABLED}")
+        logging_.logger.info(f"Application started with settings: DEFAULT_FIRST_IP={DEFAULT_FIRST_IP}, DEFAULT_LEADER={DEFAULT_LEADER}, DEVICES_COUNT={DEVICES_COUNT}, DEFAULT_AVG_LEN_MS={DEFAULT_AVG_LEN_MS}, DEFAULT_PRETRIGGER_MS={DEFAULT_PRETRIGGER_MS}, DEFAULT_POSTTRIGGER_MS={DEFAULT_POSTTRIGGER_MS}, PTP_TRIGGER_RING_PACKETS={PTP_TRIGGER_RING_PACKETS}, DEFAULT_PTP_MODE_ENABLED={ptp_mode.enabled}, SOCKET_BACKEND={SOCKET_BACKEND}, DATA_SOCKET_RCVBUF_BYTES={DATA_SOCKET_RCVBUF_BYTES}, TRIGGER_CAPTURE_MARGIN_PACKETS={TRIGGER_CAPTURE_MARGIN_PACKETS}, BUFFER_LENGTH_S={BUFFER_LENGTH_S}, FIREWALL_PENETRATION={FIREWALL_PENETRATION}, USE_OPENGL={USE_OPENGL}, GUI_REFRESH_INTERVAL_MS={GUI_REFRESH_INTERVAL_MS}, ISOMON_ENABLED={ISOMON_ENABLED}")
         def start_loop():
             loop=asyncio.SelectorEventLoop()
             asyncio.set_event_loop(loop)
@@ -4372,8 +4660,8 @@ def main(argv):
             gui.leader_buttons.button(DEFAULT_LEADER).setChecked(True)
             gui._apply_devices()
             gui._apply_config()
-            gui.sample_spin.setValue(int(DEFAULT_POSTTRIGGER_PACKETS))
-            gui.pretrigger_spin.setValue(int(DEFAULT_PRETRIGGER_PACKETS))
+            gui.sample_spin.setValue(int(DEFAULT_POSTTRIGGER_MS))
+            gui.pretrigger_spin.setValue(int(DEFAULT_PRETRIGGER_MS))
         QTimer(gui).singleShot(500, autoinit)
         #gui.show()
         gui.showMaximized()
