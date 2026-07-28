@@ -36,7 +36,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLineEdit, QLabel, QSpinBox, QCheckBox, QTextEdit,
     QScrollArea, QRadioButton, QButtonGroup, QFileDialog, QMessageBox, QComboBox
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint
 
 # Shared FDDS protocol core (vendored copy of the firmware repo's utils/fdds).
 # Single source of truth for packet/command enums, struct layouts and CRC so the
@@ -193,6 +193,8 @@ ANALOG_VALUE_FONT_STYLE = 'font-family: Consolas, "Courier New", monospace; font
 # Muted style for analog labels with no live data (shows the '--' placeholder greyed
 # out so a stalled channel is not mistaken for a valid last value).
 ANALOG_VALUE_NO_DATA_STYLE = ANALOG_VALUE_FONT_STYLE + ' color: #9e9e9e;'
+ISO_VALUE_WIDTH = 8
+ISO_VALUE_DECIMALS = 3
 
 # Features
 FCN_QT_LOGGING = True  # Enable Qt logging handler
@@ -2019,6 +2021,7 @@ class Plotter(QWidget):
         self.device_fault_indicators: List[List[QPushButton]] = []
         self.device_analog_value_layouts: List[QHBoxLayout] = []
         self.device_analog_value_labels: List[List[QLabel]] = []
+        self._isomon_live_row: int | None = None
 
         for i in range(DeviceManager.MAX_DEVICES):
             lb = QLabel(DEVICE_LABELS[i] if i < len(DEVICE_LABELS) else f'Device {i}')
@@ -2111,6 +2114,13 @@ class Plotter(QWidget):
         self.save_trigger_config_btn = QPushButton('Save trigger config')
         cfg.addWidget(self.save_trigger_config_btn, DeviceManager.MAX_DEVICES, 5)
         self.save_trigger_config_btn.clicked.connect(self._save_trigger_config)
+        self.isomon_iso_row2_lbl = QLabel('')
+        self.isomon_iso_row2_lbl.setStyleSheet(ANALOG_VALUE_NO_DATA_STYLE)
+        self.isomon_iso_row2_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.isomon_iso_row2_lbl.setToolTip('ISOMON PACKET_ISO_RESULT live values (row 2)')
+        self.isomon_iso_row2_lbl.setText(self._format_iso_row(('u2_baseline', 'u1_s3', 'u2_s3', 'r1_via_r4', 'r2_via_r4'), {}, False))
+        self.isomon_iso_row2_lbl.setVisible(False)
+        cfg.addWidget(self.isomon_iso_row2_lbl, DeviceManager.MAX_DEVICES, 7, 1, 3)
 
         btns = QHBoxLayout()
         root.addLayout(btns)
@@ -2465,6 +2475,13 @@ class Plotter(QWidget):
         layout = self.device_analog_value_layouts[row]
         while layout.count():
             item = layout.takeAt(0)
+            child_layout = item.layout()
+            if child_layout is not None:
+                while child_layout.count():
+                    child_item = child_layout.takeAt(0)
+                    child_widget = child_item.widget()
+                    if child_widget is not None:
+                        child_widget.deleteLater()
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
@@ -2481,18 +2498,18 @@ class Plotter(QWidget):
             labels.append(lbl)
 
         if is_isomon:
-            layout.addSpacing(12)
-            iso_pairs = [
-                ('u1_baseline', 'u1_s2', 'u2_s2', 'r1_via_r3', 'r2_via_r3'),
-                ('u2_baseline', 'u1_s3', 'u2_s3', 'r1_via_r4', 'r2_via_r4'),
-            ]
-            for names in iso_pairs:
-                iso_lbl = QLabel()
-                iso_lbl.setStyleSheet(ANALOG_VALUE_NO_DATA_STYLE)
-                iso_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-                iso_lbl.setProperty('iso_fields', names)
-                layout.addWidget(iso_lbl)
-                labels.append(iso_lbl)
+            iso_col = QVBoxLayout()
+            iso_col.setContentsMargins(0, 0, 0, 0)
+            iso_col.setSpacing(0)
+            iso_lbl = QLabel()
+            iso_lbl.setStyleSheet(ANALOG_VALUE_NO_DATA_STYLE)
+            iso_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            iso_fields = ('u1_baseline', 'u1_s2', 'u2_s2', 'r1_via_r3', 'r2_via_r3')
+            iso_lbl.setProperty('iso_fields', iso_fields)
+            iso_lbl.setText(self._format_iso_row(iso_fields, {}, False))
+            iso_col.addWidget(iso_lbl)
+            labels.append(iso_lbl)
+            layout.addLayout(iso_col)
 
         layout.addStretch(1)
         self.device_analog_value_labels[row] = labels
@@ -2511,12 +2528,45 @@ class Plotter(QWidget):
             val_s = f"{'--':>{width}}"
         return f'{val_s} {unit}'
 
+    def _format_iso_value(self, value: float, valid: bool) -> str:
+        if valid and np.isfinite(value):
+            return f'{float(value):>{ISO_VALUE_WIDTH}.{ISO_VALUE_DECIMALS}f}'
+        return f"{'--':>{ISO_VALUE_WIDTH}}"
+
+    def _format_iso_row(self, fields: Tuple[str, ...], iso_values: dict, iso_valid: bool) -> str:
+        return '  '.join(f'{name}:{self._format_iso_value(iso_values.get(name, np.nan), iso_valid)}' for name in fields)
+
+    def _realign_isomon_row2_label(self):
+        if not hasattr(self, 'isomon_iso_row2_lbl'):
+            return
+        row = self._isomon_live_row
+        if row is None or row < 0 or row >= DeviceManager.MAX_DEVICES:
+            self.isomon_iso_row2_lbl.setIndent(0)
+            return
+        dev = self._device_for_row(row)
+        if dev is None:
+            self.isomon_iso_row2_lbl.setIndent(0)
+            return
+        channel_count = int(getattr(dev, 'channels', 0))
+        labels = self.device_analog_value_labels[row]
+        if len(labels) <= channel_count:
+            self.isomon_iso_row2_lbl.setIndent(0)
+            return
+        first_iso_lbl = labels[channel_count]
+        if not first_iso_lbl.isVisible():
+            self.isomon_iso_row2_lbl.setIndent(0)
+            return
+        x1 = first_iso_lbl.mapTo(self, QPoint(0, 0)).x()
+        x2 = self.isomon_iso_row2_lbl.mapTo(self, QPoint(0, 0)).x()
+        self.isomon_iso_row2_lbl.setIndent(max(0, x1 - x2))
+
     def _refresh_analog_values(self):
+        iso_row2_visible = False
         for row in range(DeviceManager.MAX_DEVICES):
             dev = self._device_for_row(row)
             channel_count = int(getattr(dev, 'channels', 0)) if dev is not None else 0
             is_isomon = bool(dev and self._is_isomon_ip(getattr(dev, 'ip', '')))
-            expected_labels = channel_count + (2 if is_isomon else 0)
+            expected_labels = channel_count + (1 if is_isomon else 0)
             if len(self.device_analog_value_labels[row]) != expected_labels:
                 self._rebuild_analog_value_row(row, channel_count)
             if channel_count == 0:
@@ -2538,16 +2588,25 @@ class Plotter(QWidget):
                     fields = lbl.property('iso_fields')
                     if not fields:
                         continue
-                    parts = []
-                    for name in fields:
-                        v = iso_values.get(name, np.nan)
-                        if iso_valid and np.isfinite(v):
-                            parts.append(f'{name}:{float(v):.3f}')
-                        else:
-                            parts.append(f'{name}:--')
-                    lbl.setText('   '.join(parts))
+                    lbl.setText(self._format_iso_row(tuple(fields), iso_values, iso_valid))
                     lbl.setStyleSheet(ANALOG_VALUE_FONT_STYLE if iso_valid else ANALOG_VALUE_NO_DATA_STYLE)
                     lbl.setToolTip('ISOMON PACKET_ISO_RESULT live values')
+
+                row2_fields = ('u2_baseline', 'u1_s3', 'u2_s3', 'r1_via_r4', 'r2_via_r4')
+                self.isomon_iso_row2_lbl.setText(self._format_iso_row(row2_fields, iso_values, iso_valid))
+                self.isomon_iso_row2_lbl.setStyleSheet(ANALOG_VALUE_FONT_STYLE if iso_valid else ANALOG_VALUE_NO_DATA_STYLE)
+                self.isomon_iso_row2_lbl.setVisible(True)
+                self._isomon_live_row = row
+                iso_row2_visible = True
+
+        if hasattr(self, 'isomon_iso_row2_lbl') and not iso_row2_visible:
+            self.isomon_iso_row2_lbl.clear()
+            self._isomon_live_row = None
+            self.isomon_iso_row2_lbl.setVisible(False)
+        elif iso_row2_visible:
+            # First alignment now, second one after Qt finalises geometry for this pass.
+            self._realign_isomon_row2_label()
+            QTimer.singleShot(0, self._realign_isomon_row2_label)
 
     def _arm_grey_check(self):
         """Arm the deferred grey-out: over the next two GUI refreshes, grey the
