@@ -512,8 +512,11 @@ class DeviceBuffer:
         self.wide_agpio_bits = deque(maxlen=BUFFER_SIZE)  # AGPIO logical-level snapshot per row
         # PACKET_ISO_RESULT series (Isomon): time-indexed float values.
         self.iso_time = NumpyRing(BUFFER_SIZE, np.int64)
+        self.iso_ptp = NumpyRing(BUFFER_SIZE, np.int64)
         self.iso_u = {name: NumpyRing(BUFFER_SIZE, np.float32) for name in ISO_U_FIELDS}
         self.iso_r = {name: NumpyRing(BUFFER_SIZE, np.float32) for name in ISO_R_FIELDS}
+        self.iso_fault_state = NumpyRing(BUFFER_SIZE, np.int32)
+        self.iso_fault_latched = NumpyRing(BUFFER_SIZE, np.int32)
         # Monotonic change counter bumped on every append; lets the plot skip a
         # redraw when nothing new has arrived (e.g. a finished trigger/new-sampling
         # capture that already holds all the data it wanted).
@@ -582,13 +585,16 @@ class DeviceBuffer:
             self.wide_agpio_bits.extend(agpio_bits_list)
             self.revision += 1
 
-    def extend_iso_result(self, t:int, u_vals:dict, r_vals:dict):
+    def extend_iso_result(self, t:int, ptp_ns:int, u_vals:dict, r_vals:dict, fault_state:int, fault_latched:int):
         with self.lock:
             self.iso_time.extend([int(t)])
+            self.iso_ptp.extend([int(ptp_ns)])
             for name in ISO_U_FIELDS:
                 self.iso_u[name].extend([float(u_vals.get(name, np.nan))])
             for name in ISO_R_FIELDS:
                 self.iso_r[name].extend([float(r_vals.get(name, np.nan))])
+            self.iso_fault_state.extend([int(fault_state)])
+            self.iso_fault_latched.extend([int(fault_latched)])
             self.revision += 1
 
 
@@ -1908,7 +1914,15 @@ class Device:
                 r_vals = {k: iso[k] for k in ISO_R_FIELDS}
                 self._update_live_values_from_iso_result_packet(data)
 
-                self.loop.call_soon_threadsafe(self.buffer.extend_iso_result, t_idx, u_vals, r_vals)
+                self.loop.call_soon_threadsafe(
+                    self.buffer.extend_iso_result,
+                    t_idx,
+                    ptp_total,
+                    u_vals,
+                    r_vals,
+                    int(iso['fault_state']),
+                    int(iso['fault_latched']),
+                )
                 return (STREAM_ISO_RESULT, order)
             case self.PKT_TYPE_ID:
                 self._logger.info(f"Dev {self.ip} ID packet received on data socket.")
@@ -3954,8 +3968,11 @@ class Plotter(QWidget):
                 dev.buffer.wide_agg_counts.clear()
                 dev.buffer.wide_agpio_bits.clear()
                 dev.buffer.iso_time.clear()
+                dev.buffer.iso_ptp.clear()
                 for ring in dev.buffer.iso_u.values(): ring.clear()
                 for ring in dev.buffer.iso_r.values(): ring.clear()
+                dev.buffer.iso_fault_state.clear()
+                dev.buffer.iso_fault_latched.clear()
         self.ax.clear()
         self.curves.clear()
 
@@ -4158,6 +4175,12 @@ class Plotter(QWidget):
                 wide_agg_counts = list(dev.buffer.wide_agg_counts)
                 wide_sums = [list(s) for s in dev.buffer.wide_sums]
                 wide_present = [list(p) for p in dev.buffer.wide_present]
+                iso_time_a = np.asarray(dev.buffer.iso_time, dtype=np.int64)
+                iso_ptp_a = np.asarray(dev.buffer.iso_ptp, dtype=np.int64)
+                iso_u_a = {name: np.asarray(dev.buffer.iso_u[name], dtype=np.float32) for name in ISO_U_FIELDS}
+                iso_r_a = {name: np.asarray(dev.buffer.iso_r[name], dtype=np.float32) for name in ISO_R_FIELDS}
+                iso_fault_state_a = np.asarray(dev.buffer.iso_fault_state, dtype=np.int32)
+                iso_fault_latched_a = np.asarray(dev.buffer.iso_fault_latched, dtype=np.int32)
 
             # CCU devices carry per-result-packet metadata; nodes leave these empty.
             has_result_meta = bool(result_crc_error_mask)
@@ -4345,6 +4368,73 @@ class Plotter(QWidget):
 
             if strict and os.path.getsize(fname) == 0:
                 raise RuntimeError(f"Soubor {fname} je prázdný.")
+
+            # PACKET_ISO_RESULT export into a dedicated CSV file.
+            iso_lengths = [
+                int(iso_time_a.size),
+                int(iso_ptp_a.size),
+                *(int(v.size) for v in iso_u_a.values()),
+                *(int(v.size) for v in iso_r_a.values()),
+                int(iso_fault_state_a.size),
+                int(iso_fault_latched_a.size),
+            ]
+            iso_row_count = min(iso_lengths) if iso_lengths else 0
+            if iso_row_count > 0:
+                iso_time_a = iso_time_a[:iso_row_count]
+                iso_ptp_a = iso_ptp_a[:iso_row_count]
+                iso_u_a = {k: v[:iso_row_count] for k, v in iso_u_a.items()}
+                iso_r_a = {k: v[:iso_row_count] for k, v in iso_r_a.items()}
+                iso_fault_state_a = iso_fault_state_a[:iso_row_count]
+                iso_fault_latched_a = iso_fault_latched_a[:iso_row_count]
+
+                iso_tsi = dev.trigger_sample_index(STREAM_ISO_RESULT)
+                pre_iso_packets = int(dev.pretrigger_packets_by_stream.get(STREAM_ISO_RESULT, 0))
+                expected_iso_packets = int(dev.capture_expected_by_stream.get(STREAM_ISO_RESULT, 0))
+                # expected_iso_packets for ISO includes trigger packet explicitly.
+                post_iso_packets = max(0, expected_iso_packets - pre_iso_packets - 1)
+
+                if iso_tsi is not None:
+                    iso_time_shift_s = iso_time_a.astype(np.float64) * SAMPLING_PERIOD - (float(iso_tsi) * SAMPLING_PERIOD)
+                else:
+                    iso_time_shift_s = iso_time_a.astype(np.float64) * SAMPLING_PERIOD
+
+                if iso_tsi is not None and post_iso_packets > 0 and iso_row_count > 0:
+                    trig_pos = int(np.argmin(np.abs(iso_time_a.astype(np.float64) - float(iso_tsi))))
+                    i0 = max(0, trig_pos - pre_iso_packets)
+                    i1 = min(iso_row_count, trig_pos + post_iso_packets + 1)
+                    iso_keep = np.zeros(iso_row_count, dtype=bool)
+                    iso_keep[i0:i1] = True
+                else:
+                    iso_keep = np.ones(iso_row_count, dtype=bool)
+
+                iso_time_list = iso_time_shift_s[iso_keep].tolist()
+                iso_ptp_list = iso_ptp_a[iso_keep].tolist()
+                iso_u_lists = {k: v[iso_keep].tolist() for k, v in iso_u_a.items()}
+                iso_r_lists = {k: v[iso_keep].tolist() for k, v in iso_r_a.items()}
+                iso_fault_state_list = iso_fault_state_a[iso_keep].tolist()
+                iso_fault_latched_list = iso_fault_latched_a[iso_keep].tolist()
+
+                iso_name = f"{base}_dev{idx}_iso_result.csv"
+                iso_tmp_name = iso_name + ".tmp"
+                with open(iso_tmp_name, 'w', newline='') as f_iso:
+                    w_iso = csv.writer(f_iso)
+                    iso_header = ['time', 'ptp_ns', *ISO_U_FIELDS, *ISO_R_FIELDS, 'fault_state', 'fault_latched']
+                    w_iso.writerow(iso_header)
+                    for i in range(len(iso_time_list)):
+                        row = ['%.6f' % iso_time_list[i], int(iso_ptp_list[i])]
+                        row.extend(float(iso_u_lists[name][i]) for name in ISO_U_FIELDS)
+                        row.extend(float(iso_r_lists[name][i]) for name in ISO_R_FIELDS)
+                        row.append(int(iso_fault_state_list[i]))
+                        row.append(int(iso_fault_latched_list[i]))
+                        w_iso.writerow(row)
+                    f_iso.flush()
+                    os.fsync(f_iso.fileno())
+
+                os.replace(iso_tmp_name, iso_name)
+                files.append(iso_name)
+
+                if strict and os.path.getsize(iso_name) == 0:
+                    raise RuntimeError(f"Soubor {iso_name} je prázdný.")
 
         #png_data = f"{base}_data.png"
         #exporter_data = pyqtgraph.exporters.ImageExporter(self.ax)
