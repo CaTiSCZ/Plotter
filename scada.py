@@ -4018,6 +4018,27 @@ class Plotter(QWidget):
         #    "Saved files:\n" + "\n".join(files)
         #)
 
+    def _identity_from_loaded_id(self, dev: Device) -> dict:
+        """Extract FW version and HW board IDs from already-loaded device info."""
+        info = getattr(dev, 'info', None) or {}
+        return {
+            'fw': {
+                'id':    int(info.get('fw_id', 0)),
+                'major': int(info.get('fw_ver_major', 0)),
+                'minor': int(info.get('fw_ver_minor', 0)),
+            },
+            'hw_digital': {
+                'id':    int(info.get('hw_id', 0)),
+                'major': int(info.get('hw_ver_major', 0)),
+                'minor': int(info.get('hw_ver_minor', 0)),
+            },
+            'hw_analog': {
+                'id':    int(info.get('adc_hw_id', 0)),
+                'major': int(info.get('adc_ver_major', 0)),
+                'minor': int(info.get('adc_ver_minor', 0)),
+            },
+        }
+
     def _calibration_from_loaded_id(self, dev: Device) -> dict:
         """Build calibration snapshot from data currently loaded in SCADA."""
         info = getattr(dev, 'info', None)
@@ -4117,9 +4138,11 @@ class Plotter(QWidget):
             for ip, dev in self.manager.devices.items():
                 cal = self._calibration_from_loaded_id(dev)
                 alg = self._read_alg_config_snapshot(dev)
+                identity = self._identity_from_loaded_id(dev)
                 devices_out.append({
                     'ip': ip,
                     'cmd_port': int(dev.cmd_port),
+                    'identity': identity,
                     'calibration': cal,
                     'alg_config': alg,
                 })
