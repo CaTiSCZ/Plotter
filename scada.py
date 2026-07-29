@@ -190,7 +190,9 @@ SYSTEM_STATUS_COLOR_IDLE  = '#cfcfcf'   # IDLE / stopped (neutral)
 TRIGGER_FLASH_MS = 250
 TRIGGER_FLASH_STYLE = 'background-color: #2196f3; color: white'
 SAMPLING_INDICATOR_STYLE_ACTIVE = 'background-color: #35d24a; color: black'
+SAMPLING_INDICATOR_STYLE_WAIT_PRETRIGGER = 'background-color: #9ad8ff; color: black'
 SAMPLING_INDICATOR_STYLE_RENDER = 'background-color: #ffd84d; color: black'
+SAMPLING_PRETRIGGER_WAIT_POLL_MS = 100
 
 FAULT_INDICATOR_SIZE = 20
 FAULT_INDICATOR_COLORS = {
@@ -2218,6 +2220,7 @@ class Plotter(QWidget):
         self.expected_by_stream: Dict[Tuple[str, str], int] = {}
         self.sampling_indicator_button = None
         self._sampling_start_pending = False
+        self._sampling_wait_for_pretrigger = False
         self._sampling_phase_armed = False
         self._sampling_posttrigger_ms = 0
         ptp_mode.device_manager = manager
@@ -2565,6 +2568,10 @@ class Plotter(QWidget):
         self._sampling_phase_timer = QTimer(self)
         self._sampling_phase_timer.setSingleShot(True)
         self._sampling_phase_timer.timeout.connect(self._on_sampling_phase_timeout)
+
+        self._sampling_pretrigger_wait_timer = QTimer(self)
+        self._sampling_pretrigger_wait_timer.setSingleShot(True)
+        self._sampling_pretrigger_wait_timer.timeout.connect(self._retry_start_sampling_after_pretrigger_wait)
 
         self.data_ready.connect(self._check_order)
         self.trigger_received.connect(self._flash_device_trigger)
@@ -3082,8 +3089,10 @@ class Plotter(QWidget):
         self.sampling_indicator_button = button
         if button is None:
             self._sampling_phase_timer.stop()
+            self._sampling_pretrigger_wait_timer.stop()
             self._sampling_phase_armed = False
             self._sampling_start_pending = False
+            self._sampling_wait_for_pretrigger = False
             self._sampling_posttrigger_ms = 0
             return
         button.setStyleSheet(style or SAMPLING_INDICATOR_STYLE_RENDER)
@@ -3101,6 +3110,8 @@ class Plotter(QWidget):
             return
         if self._sampling_phase_armed:
             return
+        if self._sampling_wait_for_pretrigger:
+            return
         if self._sampling_start_pending:
             return
         delay_ms = max(0, int(self._sampling_posttrigger_ms))
@@ -3111,6 +3122,35 @@ class Plotter(QWidget):
                 return
         self._sampling_phase_armed = True
         self._sampling_phase_timer.start(delay_ms)
+
+    def _ptp_pretrigger_ready(self, pretrigger_ms: int) -> bool:
+        if pretrigger_ms <= 0:
+            return True
+        for _ip, dev in self.manager.devices.items():
+            for stream_key in dev.active_capture_streams():
+                needed = _packets_from_ms_ceil(pretrigger_ms, dev.stream_rate(stream_key))
+                if needed <= 0:
+                    continue
+                ring = dev.input_packet_rings.get(stream_key)
+                if ring is None:
+                    return False
+                # For streams such as WIDE, the ring can hold multiple packets with
+                # the same order value (e.g. split channels). Pre-trigger windows are
+                # sized in packet-order steps, so readiness must use unique orders.
+                try:
+                    available = len({dev.header_struct.unpack(pkt[:4])[1] for pkt in ring if len(pkt) >= 4})
+                except Exception:
+                    available = 0
+                if available < needed:
+                    return False
+        return True
+
+    def _retry_start_sampling_after_pretrigger_wait(self):
+        if not self._sampling_wait_for_pretrigger:
+            return
+        if self.sampling_indicator_button is None:
+            return
+        self._start_sampling()
 
     def _stream_specs(self) -> List[Tuple[str, str, float]]:
         specs: List[Tuple[str, str, float]] = []
@@ -3200,13 +3240,24 @@ class Plotter(QWidget):
             plot.setClipToView(clip)
 
     def _start_sampling(self):
-        self._sampling_start_pending = False
         posttrigger_ms = self.sample_spin.value()
         pretrigger_ms = self.pretrigger_spin.value()
         self._sampling_posttrigger_ms = int(posttrigger_ms)
         self._recompute_expected_stream_packets(pretrigger_ms, posttrigger_ms)
 
         if ptp_mode.enabled:
+            if not self._ptp_pretrigger_ready(pretrigger_ms):
+                self._sampling_start_pending = True
+                self._sampling_wait_for_pretrigger = True
+                self._set_sampling_indicator(self.start_sampling_btn, SAMPLING_INDICATOR_STYLE_WAIT_PRETRIGGER)
+                if not self._sampling_pretrigger_wait_timer.isActive():
+                    self._sampling_pretrigger_wait_timer.start(SAMPLING_PRETRIGGER_WAIT_POLL_MS)
+                return
+            if self._sampling_wait_for_pretrigger:
+                self._logger.info('PTP pretrigger ring filled, starting immediate sampling')
+            self._sampling_wait_for_pretrigger = False
+            self._sampling_start_pending = False
+            self._set_sampling_indicator(self.start_sampling_btn, SAMPLING_INDICATOR_STYLE_ACTIVE)
             # Immediate software trigger: the click instant becomes t = 0. Pre-trigger
             # packets are replayed from the continuously buffered input ring and post-
             # trigger packets are captured live, so the record has the same length and
@@ -3223,6 +3274,8 @@ class Plotter(QWidget):
             ptp_mode.waiting_for_trigger = True
             self._logger.info(f'Started PTP sampling (post_ms={posttrigger_ms}, pre_ms={pretrigger_ms})')
         else:
+            self._sampling_wait_for_pretrigger = False
+            self._sampling_start_pending = False
             leader_id=self.leader_buttons.checkedId()
             leader_ip = self.device_edits[leader_id].text().strip().split(':')[0]
             for i, (ip, dev) in enumerate(self.manager.devices.items()):
