@@ -189,6 +189,8 @@ SYSTEM_STATUS_COLOR_IDLE  = '#cfcfcf'   # IDLE / stopped (neutral)
 # Brief blue flash on the device label when a trigger packet arrives from it
 TRIGGER_FLASH_MS = 250
 TRIGGER_FLASH_STYLE = 'background-color: #2196f3; color: white'
+SAMPLING_INDICATOR_STYLE_ACTIVE = 'background-color: #35d24a; color: black'
+SAMPLING_INDICATOR_STYLE_RENDER = 'background-color: #ffd84d; color: black'
 
 FAULT_INDICATOR_SIZE = 20
 FAULT_INDICATOR_COLORS = {
@@ -2216,6 +2218,8 @@ class Plotter(QWidget):
         self.expected_by_stream: Dict[Tuple[str, str], int] = {}
         self.sampling_indicator_button = None
         self._sampling_start_pending = False
+        self._sampling_phase_armed = False
+        self._sampling_posttrigger_ms = 0
         ptp_mode.device_manager = manager
 
         self.setWindowTitle(APPLICATION_TITLE)
@@ -2557,6 +2561,10 @@ class Plotter(QWidget):
         self.timer.setInterval(GUI_REFRESH_INTERVAL_MS)
         self.timer.timeout.connect(self._update_plot)
         self.timer.start()
+
+        self._sampling_phase_timer = QTimer(self)
+        self._sampling_phase_timer.setSingleShot(True)
+        self._sampling_phase_timer.timeout.connect(self._on_sampling_phase_timeout)
 
         self.data_ready.connect(self._check_order)
         self.trigger_received.connect(self._flash_device_trigger)
@@ -3067,13 +3075,42 @@ class Plotter(QWidget):
         except:
             self._logger.warning('Bad logger receiver address')
 
-    def _set_sampling_indicator(self, button: QPushButton | None):
+    def _set_sampling_indicator(self, button: QPushButton | None, style: str | None = None):
         for b in (self.start_sampling_btn, self.start_sampling_trigger_btn):
             b.setStyleSheet("")
 
         self.sampling_indicator_button = button
-        if button is not None:
-            button.setStyleSheet("background-color: #ffd84d; color: black;")
+        if button is None:
+            self._sampling_phase_timer.stop()
+            self._sampling_phase_armed = False
+            self._sampling_start_pending = False
+            self._sampling_posttrigger_ms = 0
+            return
+        button.setStyleSheet(style or SAMPLING_INDICATOR_STYLE_RENDER)
+
+    def _on_sampling_phase_timeout(self):
+        self._sampling_phase_armed = False
+        if self.sampling_indicator_button is None:
+            return
+        if self._sampling_start_pending:
+            return
+        self.sampling_indicator_button.setStyleSheet(SAMPLING_INDICATOR_STYLE_RENDER)
+
+    def _arm_sampling_phase_timer_if_needed(self):
+        if self.sampling_indicator_button is None:
+            return
+        if self._sampling_phase_armed:
+            return
+        if self._sampling_start_pending:
+            return
+        delay_ms = max(0, int(self._sampling_posttrigger_ms))
+        if ptp_mode.enabled:
+            if ptp_mode.trigger_mode and ptp_mode.waiting_for_trigger:
+                return
+            if not any(dev.capture_active for dev in self.manager.devices.values()):
+                return
+        self._sampling_phase_armed = True
+        self._sampling_phase_timer.start(delay_ms)
 
     def _stream_specs(self) -> List[Tuple[str, str, float]]:
         specs: List[Tuple[str, str, float]] = []
@@ -3166,6 +3203,7 @@ class Plotter(QWidget):
         self._sampling_start_pending = False
         posttrigger_ms = self.sample_spin.value()
         pretrigger_ms = self.pretrigger_spin.value()
+        self._sampling_posttrigger_ms = int(posttrigger_ms)
         self._recompute_expected_stream_packets(pretrigger_ms, posttrigger_ms)
 
         if ptp_mode.enabled:
@@ -3204,6 +3242,7 @@ class Plotter(QWidget):
         self._sampling_start_pending = False
         posttrigger_ms = self.sample_spin.value()
         pretrigger_ms = self.pretrigger_spin.value()
+        self._sampling_posttrigger_ms = int(posttrigger_ms)
         self._recompute_expected_stream_packets(pretrigger_ms, posttrigger_ms)
 
         if ptp_mode.enabled:
@@ -3239,7 +3278,9 @@ class Plotter(QWidget):
 
     def _start_new_sampling(self):
         self._sampling_start_pending = True
-        self._set_sampling_indicator(self.start_sampling_btn)
+        self._sampling_phase_timer.stop()
+        self._sampling_phase_armed = False
+        self._set_sampling_indicator(self.start_sampling_btn, SAMPLING_INDICATOR_STYLE_ACTIVE)
         # In PTP mode keep the device packet counter running so the pre-trigger ring
         # stays continuous with the live stream; only the legacy (non-PTP) path resets.
         if not ptp_mode.enabled:
@@ -3249,7 +3290,9 @@ class Plotter(QWidget):
 
     def _start_new_sampling_on_trigger(self):
         self._sampling_start_pending = True
-        self._set_sampling_indicator(self.start_sampling_trigger_btn)
+        self._sampling_phase_timer.stop()
+        self._sampling_phase_armed = False
+        self._set_sampling_indicator(self.start_sampling_trigger_btn, SAMPLING_INDICATOR_STYLE_ACTIVE)
         # In PTP mode keep the device packet counter running so the pre-trigger ring
         # stays continuous with the live stream; only the legacy (non-PTP) path resets.
         if not ptp_mode.enabled:
@@ -4285,6 +4328,7 @@ class Plotter(QWidget):
             for ip, dev in self.manager.devices.items():
                 if self._device_data_fresh(dev):
                     self._set_device_status_color(ip, SYSTEM_STATUS_COLOR_OK)
+        self._arm_sampling_phase_timer_if_needed()
         # Skip the (expensive) full redraw when no device buffer has changed since the
         # last frame -- e.g. a trigger / "start new sampling" capture is complete and
         # already holds all the data it asked for, even though the system keeps running
