@@ -4723,12 +4723,15 @@ class Plotter(QWidget):
                 expected_iso = int(self.expected_by_stream.get((ip, STREAM_ISO_RESULT), 0))
                 if iso_received is None:
                     iso_received = 0
-                iso_sent = self.last_order.get((ip, STREAM_ISO_RESULT))
-                if iso_sent is None:
-                    iso_sent = 0
+                iso_first = dev.first_order_by_stream.get(STREAM_ISO_RESULT)
+                iso_last = dev.last_order_by_stream.get(STREAM_ISO_RESULT)
+                if iso_first is None or iso_last is None:
+                    iso_sent = int(iso_received)
                 else:
-                    iso_sent += 1
-                iso_sent = max(int(iso_sent), int(iso_received))
+                    # Sent in current capture window is the order span actually
+                    # observed for this stream (inclusive), not cumulative runtime.
+                    iso_sent = int(_signed_u16_delta(int(iso_last), int(iso_first)) + 1)
+                    iso_sent = max(int(iso_sent), int(iso_received))
                 received_counts[(ip, STREAM_ISO_RESULT)] = int(iso_received)
                 iso_line = f'{ip}/{STREAM_ISO_RESULT}: packets = {iso_received}/{iso_sent}/{expected_iso}; errs = -; avg = -'
                 if expected_iso > 0 and iso_received < expected_iso:
