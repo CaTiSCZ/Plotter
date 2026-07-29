@@ -3962,6 +3962,8 @@ class Plotter(QWidget):
         #if hasattr(self, 'ax_result'):
         self.ax_result.clear()
         self.ax_result_curves.clear()
+        self.ax_iso_r.clear()
+        self.ax_iso_r_curves.clear()
 
         self._sort_state.clear()
         self._update_plot(force=True)
