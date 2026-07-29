@@ -4157,6 +4157,7 @@ class Plotter(QWidget):
                 wide_agpio_bits = list(dev.buffer.wide_agpio_bits)
                 wide_agg_counts = list(dev.buffer.wide_agg_counts)
                 wide_sums = [list(s) for s in dev.buffer.wide_sums]
+                wide_present = [list(p) for p in dev.buffer.wide_present]
 
             # CCU devices carry per-result-packet metadata; nodes leave these empty.
             has_result_meta = bool(result_crc_error_mask)
@@ -4197,6 +4198,7 @@ class Plotter(QWidget):
             if has_wide_meta:
                 lengths += [len(wide_agpio_bits), len(wide_agg_counts)]
                 lengths += [len(s) for s in wide_sums]
+                lengths += [len(p) for p in wide_present]
             row_count = min(lengths)
 
             if strict and row_count == 0:
@@ -4213,6 +4215,7 @@ class Plotter(QWidget):
                 wide_agpio_bits = wide_agpio_bits[:row_count]
                 wide_agg_counts = wide_agg_counts[:row_count]
                 wide_sums = [s[:row_count] for s in wide_sums]
+                wide_present = [p[:row_count] for p in wide_present]
             if _trim_window:
                 keep = (times_a >= _n_lo) & (times_a < _n_hi)
             else:
@@ -4276,21 +4279,53 @@ class Plotter(QWidget):
                     if has_wide_meta:
                         # For WIDE data, export only integer sums as chX columns,
                         # then append agg_count and agpio_bits metadata.
+                        # Some FW variants send POS/NEG in separate packets with the
+                        # same logical timestamp/PTP time. Merge those rows so one CSV
+                        # row always contains all channel values for that sample step.
                         wide_sums_arr = [np.array(s) for s in wide_sums]
+                        wide_present_arr = [np.array(p, dtype=bool) for p in wide_present]
                         wide_sums_kept = [s[keep].tolist() for s in wide_sums_arr]
+                        wide_present_kept = [p[keep].tolist() for p in wide_present_arr]
                         wide_agg_counts_kept = np.array(wide_agg_counts)[keep].tolist()
                         wide_agpio_bits_kept = np.array(wide_agpio_bits)[keep].tolist()
+                        times_kept = times_a[keep].tolist()
                         
                         if t_shift_list:
+                            # Merge split-channel rows by logical sample key.
+                            merged_rows = []
+                            merged_index = {}
+                            for i in range(len(t_shift_list)):
+                                key = (int(times_kept[i]), int(ptp_list[i]))
+                                row_idx = merged_index.get(key)
+                                if row_idx is None:
+                                    row_idx = len(merged_rows)
+                                    merged_index[key] = row_idx
+                                    merged_rows.append({
+                                        'time': float(t_shift_list[i]),
+                                        'ptp': int(ptp_list[i]),
+                                        'ch': [0] * len(wide_sums_kept),
+                                        'present': [False] * len(wide_sums_kept),
+                                        'agg': int(wide_agg_counts_kept[i]),
+                                        'agpio': int(wide_agpio_bits_kept[i]),
+                                    })
+
+                                row = merged_rows[row_idx]
+                                row['agg'] = max(int(row['agg']), int(wide_agg_counts_kept[i]))
+                                row['agpio'] = int(wide_agpio_bits_kept[i])
+                                for ch_idx in range(len(wide_sums_kept)):
+                                    present = bool(wide_present_kept[ch_idx][i]) if ch_idx < len(wide_present_kept) else True
+                                    if present:
+                                        row['ch'][ch_idx] = int(wide_sums_kept[ch_idx][i])
+                                        row['present'][ch_idx] = True
+
                             # Template: time, ptp_ns, ch0, ch1, ..., agg_count, agpio_bits
                             tmpl = '%.6f,' + ','.join(['%d'] * (len(wide_sums) + 3))
                             rows = []
-                            for i in range(len(t_shift_list)):
-                                row = [t_shift_list[i], ptp_list[i]]
-                                for s_idx in range(len(wide_sums_kept)):
-                                    row.append(wide_sums_kept[s_idx][i])
-                                row.append(wide_agg_counts_kept[i])
-                                row.append(wide_agpio_bits_kept[i])
+                            for merged in merged_rows:
+                                row = [merged['time'], merged['ptp']]
+                                row.extend(merged['ch'])
+                                row.append(merged['agg'])
+                                row.append(merged['agpio'])
                                 rows.append(row)
                             lines = [tmpl % tuple(row) for row in rows]
                             f.write('\r\n'.join(lines))
