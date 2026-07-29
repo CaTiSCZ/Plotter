@@ -809,6 +809,7 @@ class Device:
         self.last_order_by_stream = {k: None for k in STREAM_KEYS}
         self.packet_index_by_stream = {k: 0 for k in STREAM_KEYS}
         self.trigger_order_by_stream = {k: None for k in STREAM_KEYS}
+        self.trigger_time_index_by_stream = {k: None for k in STREAM_KEYS}
         self.trigger_sample_num = 0
         self.pretrigger_packets_by_stream = {k: 0 for k in STREAM_KEYS}
         self.capture_expected_by_stream = {k: 0 for k in STREAM_KEYS}
@@ -832,6 +833,29 @@ class Device:
         self._iso_first_ptp_ns = None
         self.iso_live_valid = False
         self.iso_live_values = {name: np.nan for name in (*ISO_U_FIELDS, *ISO_R_FIELDS)}
+        self._unknown_pkt_types_logged = set()
+        
+    def _set_input_ring_maxlen(self, stream_key: str, maxlen: int):
+        maxlen = max(1, int(maxlen))
+        ring = self.input_packet_rings.get(stream_key)
+        if ring is None or ring.maxlen == maxlen:
+            return
+        self.input_packet_rings[stream_key] = deque(ring, maxlen=maxlen)
+        
+    def _refresh_isomon_ring_sizes(self):
+        if not (self.role == 'isomon' or self.is_isomon):
+            return
+        wide_packet_factor = max(1, int(bool(self.wide_channel_mask & WIDE_CH_POS)) + int(bool(self.wide_channel_mask & WIDE_CH_NEG)))
+        self._set_input_ring_maxlen(STREAM_WIDE, int(PTP_TRIGGER_RING_PACKETS) * wide_packet_factor)
+
+    def _latest_order_in_ring(self, stream_key: str) -> int | None:
+        ring = self.input_packet_rings.get(stream_key)
+        if not ring:
+            return None
+        try:
+            return int(self.header_struct.unpack(ring[-1][:4])[1])
+        except Exception:
+            return None
 
     def _parse_iso_result_packet(self, data: bytes):
         """Parse PACKET_ISO_RESULT payload prefix and return dict or None."""
@@ -951,9 +975,11 @@ class Device:
         self.stream_enable_mask = int(stream_enable_mask) & 0xFF
         agg = max(1, int(agg_count))
         avg = max(1, int(avg_samples))
+        self._refresh_isomon_ring_sizes()
         self.stream_rate_hz[STREAM_WIDE] = float(PACKET_RATE_HZ) / float(agg)
-        iso_period_us = float(ISOMON_STATE_CYCLE_COUNT) * (ISOMON_ALG_SAMPLE_RATE_HZ / float(avg))
-        self.stream_rate_hz[STREAM_ISO_RESULT] = (1_000_000.0 / iso_period_us) if iso_period_us > 0 else float(PACKET_RATE_HZ)
+        # One ISO result is produced after averaging `avg` base-rate samples for
+        # each state in the FW state cycle.
+        self.stream_rate_hz[STREAM_ISO_RESULT] = float(ISOMON_ALG_SAMPLE_RATE_HZ) / (float(ISOMON_STATE_CYCLE_COUNT) * float(avg))
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None, port:int|None = None):
         pkt = struct.pack('<I', code) + payload
@@ -1257,6 +1283,20 @@ class Device:
         self._update_analog_values_from_raw_last(raw_last)
         # WIDE packets don't have explicit fault state; leave last_fault_state/latched unchanged
         self.live_revision += 1
+        
+    def _update_live_values_from_iso_result_packet(self, data: bytes):
+        iso = self._parse_iso_result_packet(data)
+        if iso is None:
+            return
+        u_vals = {k: iso[k] for k in ISO_U_FIELDS}
+        r_vals = {k: iso[k] for k in ISO_R_FIELDS}
+        self.iso_live_values.update(u_vals)
+        self.iso_live_values.update(r_vals)
+        self.iso_live_valid = True
+        self.last_fault_state = int(iso['fault_state'])
+        self.last_fault_latched = int(iso['fault_latched'])
+        self.last_fault_valid = True
+        self.live_revision += 1
 
     def reset_device(self):
         return self._send_cmd(14, struct.pack('<B', 0xFE))
@@ -1267,10 +1307,16 @@ class Device:
         self.ptp_triggered = True
         self.trigger_sample_num = ptp_mode.trigger_sample_num
         for stream_key in self.active_capture_streams():
-            self.trigger_order_by_stream[stream_key] = trigger_order
-            if trigger_order is not None:
+            stream_trigger_order = trigger_order
+            if stream_key == STREAM_ISO_RESULT:
+                # ISOMON ISO_RESULT uses its own packet-order space, independent
+                # of WIDE order. Anchor flush/trim to the latest ISO order seen
+                # at trigger time instead of reusing the WIDE trigger order.
+                stream_trigger_order = self._latest_order_in_ring(STREAM_ISO_RESULT)
+            self.trigger_order_by_stream[stream_key] = stream_trigger_order
+            if stream_trigger_order is not None:
                 pre = int(self.pretrigger_packets_by_stream.get(stream_key, 0))
-                flush_info = self.flush_input_packet_ring(stream_key, trigger_order, pre)
+                flush_info = self.flush_input_packet_ring(stream_key, stream_trigger_order, pre)
                 self.last_flush_info_by_stream[stream_key] = flush_info
                 if flush_info is not None:
                     self._logger.info(
@@ -1279,7 +1325,7 @@ class Device:
                         f"pre_sel_pkt={flush_info['pre_selected_packets']}, "
                         f"trig_sel={flush_info['trigger_selected']}, post_sel={flush_info['post_selected']}, "
                         f"pre_first={flush_info['pre_first_order']}, pre_last={flush_info['pre_last_order']}, "
-                        f"trigger_order={trigger_order}"
+                        f"trigger_order={stream_trigger_order}"
                     )
                     if flush_info['pre_selected_unique'] < flush_info['pre_requested']:
                         self._logger.warning(
@@ -1294,6 +1340,14 @@ class Device:
         pre-/post-trigger packets were actually captured."""
         if stream_key is None:
             stream_key = self.active_capture_streams()[0] if self.active_capture_streams() else STREAM_DATA
+        explicit_tsi = self.trigger_time_index_by_stream.get(stream_key)
+        if explicit_tsi is not None:
+            return int(explicit_tsi)
+        if stream_key == STREAM_ISO_RESULT:
+            # ISO packets do not have 1 ms packet cadence, so deriving sample index
+            # from packet-order deltas is invalid. Use explicit trigger time index
+            # captured from ISO timeline when available.
+            return None
         trigger_order = self.trigger_order_by_stream.get(stream_key)
         first_order = self.first_order_by_stream.get(stream_key)
         if trigger_order is None or first_order is None:
@@ -1322,6 +1376,7 @@ class Device:
         self.packet_index_by_stream = {k: 0 for k in STREAM_KEYS}
         self._iso_first_ptp_ns = None
         self.trigger_order_by_stream = {k: None for k in STREAM_KEYS}
+        self.trigger_time_index_by_stream = {k: None for k in STREAM_KEYS}
         self.trigger_sample_num = 0
         self.pretrigger_packets_by_stream = {k: 0 for k in STREAM_KEYS}
     
@@ -1334,6 +1389,7 @@ class Device:
         self.first_order_by_stream = {k: None for k in STREAM_KEYS}
         self.last_order_by_stream = {k: None for k in STREAM_KEYS}
         self.packet_index_by_stream = {k: 0 for k in STREAM_KEYS}
+        self.trigger_time_index_by_stream = {k: None for k in STREAM_KEYS}
         self._iso_first_ptp_ns = None
     
     def flush_input_packet_ring(self, stream_key: str, trigger_order:int, pretrigger_packets:int):
@@ -1558,6 +1614,10 @@ class Device:
             return True
 
         if self._capture_limit_reached(stream_key):
+            if live_update_cb is not None:
+                data = _verify_crc(pkt)
+                if data not in (None, False):
+                    live_update_cb(data)
             return True
         return False
 
@@ -1698,6 +1758,7 @@ class Device:
                     return
 
                 self.wide_channel_mask = int(channel_mask)
+                self._refresh_isomon_ring_sizes()
 
                 if agg_count == 0:
                     self._logger.warning(f"Dev {self.ip} returned WIDE packet with agg_count=0.")
@@ -1810,7 +1871,7 @@ class Device:
                 return (STREAM_WIDE, order)
             case self.PKT_TYPE_ISO_RESULT:
                 self.last_data_time = time.monotonic()
-                if self._ptp_gate_packet(STREAM_ISO_RESULT, pkt, order):
+                if self._ptp_gate_packet(STREAM_ISO_RESULT, pkt, order, self._update_live_values_from_iso_result_packet):
                     return
                 data = _verify_crc(pkt)
                 if data is None:
@@ -1834,22 +1895,27 @@ class Device:
                 if self._iso_first_ptp_ns is None:
                     self._iso_first_ptp_ns = ptp_total
                 t_idx = int(round((ptp_total - self._iso_first_ptp_ns) / NS_PER_SAMPLE))
+                if (self.trigger_time_index_by_stream.get(STREAM_ISO_RESULT) is None
+                        and self.trigger_order_by_stream.get(STREAM_ISO_RESULT) is not None
+                        and order == self.trigger_order_by_stream.get(STREAM_ISO_RESULT)):
+                    self.trigger_time_index_by_stream[STREAM_ISO_RESULT] = int(t_idx)
 
                 u_vals = {k: iso[k] for k in ISO_U_FIELDS}
                 r_vals = {k: iso[k] for k in ISO_R_FIELDS}
-                self.iso_live_values.update(u_vals)
-                self.iso_live_values.update(r_vals)
-                self.iso_live_valid = True
-                self.last_fault_state = int(iso['fault_state'])
-                self.last_fault_latched = int(iso['fault_latched'])
-                self.last_fault_valid = True
-                self.live_revision += 1
+                self._update_live_values_from_iso_result_packet(data)
 
                 self.loop.call_soon_threadsafe(self.buffer.extend_iso_result, t_idx, u_vals, r_vals)
                 return (STREAM_ISO_RESULT, order)
             case self.PKT_TYPE_ID:
                 self._logger.info(f"Dev {self.ip} ID packet received on data socket.")
                 self._parse_id(pkt)
+                return
+            case _:
+                if (self.role == 'isomon' or self.is_isomon) and typ not in self._unknown_pkt_types_logged:
+                    self._unknown_pkt_types_logged.add(int(typ))
+                    self._logger.warning(
+                        f"Dev {self.ip} unhandled packet type on data socket: type={int(typ)}, order={int(order)}, len={len(pkt)}"
+                    )
                 return
 
 # Manager of multiple devices
@@ -1983,7 +2049,10 @@ class DeviceManager:
                 pre_n = _packets_from_ms_ceil(ptp_mode.pretrigger_ms, rate_hz)
                 post_n = _packets_from_ms_ceil(ptp_mode.posttrigger_ms, rate_hz)
                 pre_packets[stream_key] = pre_n
-                expected_packets[stream_key] = pre_n + post_n
+                exp_n = pre_n + post_n
+                if stream_key == STREAM_ISO_RESULT and (pre_n > 0 or post_n > 0):
+                    exp_n += 1
+                expected_packets[stream_key] = exp_n
                 limits[stream_key] = pre_n + post_n + extra
             dev.begin_capture(limits, pre_packets, expected_packets)
             dev.ptp_trigger(trigger_order)
@@ -2146,6 +2215,7 @@ class Plotter(QWidget):
         self.expected_samples = 0
         self.expected_by_stream: Dict[Tuple[str, str], int] = {}
         self.sampling_indicator_button = None
+        self._sampling_start_pending = False
         ptp_mode.device_manager = manager
 
         self.setWindowTitle(APPLICATION_TITLE)
@@ -2748,19 +2818,26 @@ class Plotter(QWidget):
                     lbl.setToolTip(f'Channel {ch_idx}: no live data')
 
             if is_isomon:
+                iso_stream_enabled = bool(int(getattr(dev, 'stream_enable_mask', 0)) & ISOMON_STREAM_ENABLE_ISO_RESULT)
                 iso_valid = bool(getattr(dev, 'iso_live_valid', False))
                 iso_values = getattr(dev, 'iso_live_values', {}) or {}
+                iso_tooltip = 'ISOMON PACKET_ISO_RESULT live values'
+                if not iso_stream_enabled:
+                    iso_tooltip = 'ISOMON PACKET_ISO_RESULT stream is disabled in FW (isomon_iso.enable in section 0x21 is 0)'
+                elif not iso_valid:
+                    iso_tooltip = 'ISOMON PACKET_ISO_RESULT stream enabled, waiting for first packet'
                 for lbl in self.device_analog_value_labels[row][channel_count:]:
                     fields = lbl.property('iso_fields')
                     if not fields:
                         continue
                     lbl.setText(self._format_iso_row(tuple(fields), iso_values, iso_valid))
                     lbl.setStyleSheet(ANALOG_VALUE_FONT_STYLE if iso_valid else ANALOG_VALUE_NO_DATA_STYLE)
-                    lbl.setToolTip('ISOMON PACKET_ISO_RESULT live values')
+                    lbl.setToolTip(iso_tooltip)
 
                 row2_fields = ('u2_baseline', 'u1_s3', 'u2_s3', 'r1_via_r4', 'r2_via_r4')
                 self.isomon_iso_row2_lbl.setText(self._format_iso_row(row2_fields, iso_values, iso_valid))
                 self.isomon_iso_row2_lbl.setStyleSheet(ANALOG_VALUE_FONT_STYLE if iso_valid else ANALOG_VALUE_NO_DATA_STYLE)
+                self.isomon_iso_row2_lbl.setToolTip(iso_tooltip)
                 self.isomon_iso_row2_lbl.setVisible(True)
                 self._isomon_live_row = row
                 iso_row2_visible = True
@@ -2895,6 +2972,7 @@ class Plotter(QWidget):
             stream_enable_mask = ISOMON_STREAM_ENABLE_WIDE | ISOMON_STREAM_ENABLE_ISO_RESULT
             agg_count = 1
             avg_samples = int(ISOMON_ALG_SAMPLE_RATE_HZ)
+            iso_enable = True
             try:
                 hdr = dev.get_alg_config_section(0xFF)
                 device_name = fdds_alg_config.device_for_tag(int(hdr.get('tag', 0))) if hdr else None
@@ -2912,12 +2990,26 @@ class Plotter(QWidget):
                 if iso_raw and len(iso_raw.get('body', b'')) >= iso_sec.size:
                     iso_cfg = iso_sec.unpack(iso_raw['body'])
                     avg_samples = max(1, int(iso_cfg.get('avg_samples', avg_samples)))
+                    iso_enable = bool(int(iso_cfg.get('enable', 1)))
+
+                # FW contract: WIDE channel layout comes from section 0x20, while
+                # ISO_RESULT enable is controlled by isomon_iso.enable in section
+                # 0x21. Keep a unified local mask for downstream stream handling.
+                if iso_enable:
+                    stream_enable_mask |= ISOMON_STREAM_ENABLE_ISO_RESULT
+                else:
+                    stream_enable_mask &= ~ISOMON_STREAM_ENABLE_ISO_RESULT
 
                 dev._set_isomon_stream_config(stream_enable_mask, agg_count, avg_samples)
                 self._logger.info(
-                    f'ISOMON stream config {ip}: enable=0x{stream_enable_mask:02X}, agg_count={agg_count}, '
-                    f'avg_samples={avg_samples}, wide_rate_hz={dev.stream_rate_hz[STREAM_WIDE]:.3f}, '
+                    f'ISOMON stream config {ip}: enable=0x{stream_enable_mask:02X}, iso_enable={int(iso_enable)}, '
+                    f'agg_count={agg_count}, avg_samples={avg_samples}, wide_rate_hz={dev.stream_rate_hz[STREAM_WIDE]:.3f}, '
                     f'iso_rate_hz={dev.stream_rate_hz[STREAM_ISO_RESULT]:.3f} (states={ISOMON_STATE_CYCLE_COUNT})')
+                if (stream_enable_mask & ISOMON_STREAM_ENABLE_ISO_RESULT) == 0:
+                    self._logger.warning(
+                        f'ISOMON ISO_RESULT stream is disabled on {ip} (enable=0x{stream_enable_mask:02X}). '
+                        f'Live ISO values will stay grey and ISO plots/counters remain empty until FW isomon_iso.enable (section 0x21) is set to 1.'
+                    )
             except Exception as exc:
                 self._logger.warning(f'ISOMON stream-rate discovery failed on {ip}: {exc}')
 
@@ -2997,11 +3089,29 @@ class Plotter(QWidget):
         for ip, stream_key, rate_hz in self._stream_specs():
             pre_n = _packets_from_ms_ceil(pre_ms, rate_hz)
             post_n = _packets_from_ms_ceil(post_ms, rate_hz)
-            self.expected_by_stream[(ip, stream_key)] = pre_n + post_n
+            exp_n = pre_n + post_n
+            if stream_key == STREAM_ISO_RESULT and (pre_n > 0 or post_n > 0):
+                # ISO_RESULT plotting keeps the trigger packet explicitly in the
+                # displayed packet window, so expected count must include it.
+                exp_n += 1
+            self.expected_by_stream[(ip, stream_key)] = exp_n
         self.expected_samples = max(self.expected_by_stream.values(), default=0)
 
     def _clear_sampling_indicator_if_complete(self, received_counts: Dict[Tuple[str, str], int]):
         if self.sampling_indicator_button is None or not self.expected_by_stream:
+            return
+        if self._sampling_start_pending:
+            # Button was just pressed and we are between clear_plot() and the
+            # delayed start callback. Do not clear highlight in this prep phase.
+            return
+        if ptp_mode.enabled and ptp_mode.trigger_mode and ptp_mode.waiting_for_trigger:
+            # Armed and waiting for trigger: capture_active is still False, so do
+            # not clear the start button highlight yet.
+            return
+        if ptp_mode.enabled and all(not dev.capture_active for dev in self.manager.devices.values()):
+            # Capture finished according to stream counters/limits in the receiver
+            # loop; prefer this ground truth over plot-window statistics.
+            self._set_sampling_indicator(None)
             return
         complete = True
         for key, expected in self.expected_by_stream.items():
@@ -3053,6 +3163,7 @@ class Plotter(QWidget):
             plot.setClipToView(clip)
 
     def _start_sampling(self):
+        self._sampling_start_pending = False
         posttrigger_ms = self.sample_spin.value()
         pretrigger_ms = self.pretrigger_spin.value()
         self._recompute_expected_stream_packets(pretrigger_ms, posttrigger_ms)
@@ -3090,6 +3201,7 @@ class Plotter(QWidget):
                     self._logger.info(f'Start on {ip} (post_ms={posttrigger_ms})')
 
     def _start_sampling_on_trigger(self):
+        self._sampling_start_pending = False
         posttrigger_ms = self.sample_spin.value()
         pretrigger_ms = self.pretrigger_spin.value()
         self._recompute_expected_stream_packets(pretrigger_ms, posttrigger_ms)
@@ -3126,6 +3238,7 @@ class Plotter(QWidget):
                     self._logger.info(f'Start on {ip} (post_ms={posttrigger_ms})')
 
     def _start_new_sampling(self):
+        self._sampling_start_pending = True
         self._set_sampling_indicator(self.start_sampling_btn)
         # In PTP mode keep the device packet counter running so the pre-trigger ring
         # stays continuous with the live stream; only the legacy (non-PTP) path resets.
@@ -3135,6 +3248,7 @@ class Plotter(QWidget):
         QTimer(self).singleShot(100, self._start_sampling)
 
     def _start_new_sampling_on_trigger(self):
+        self._sampling_start_pending = True
         self._set_sampling_indicator(self.start_sampling_trigger_btn)
         # In PTP mode keep the device packet counter running so the pre-trigger ring
         # stays continuous with the live stream; only the legacy (non-PTP) path resets.
@@ -3144,6 +3258,7 @@ class Plotter(QWidget):
         QTimer(self).singleShot(100, self._start_sampling_on_trigger)
 
     def _stop_sampling(self):
+        self._sampling_start_pending = False
         self.manager.broadcast('stop_sampling')
         self._set_sampling_indicator(None)
         self._logger.info('Stopped all sampling')
@@ -4322,12 +4437,25 @@ class Plotter(QWidget):
                         if iso_time.size:
                             iso_total_len = int(iso_time.size)
                             x_iso = iso_time * SAMPLING_PERIOD
-                            if tsi is not None:
-                                x_iso = x_iso - (tsi * SAMPLING_PERIOD)
-                            if tsi is not None and ptp_mode.posttrigger_ms > 0:
-                                win_lo = -float(ptp_mode.pretrigger_ms) / 1000.0
-                                win_hi = float(ptp_mode.posttrigger_ms) / 1000.0
-                                iso_keep = (x_iso >= win_lo) & (x_iso < win_hi)
+                            iso_tsi = dev.trigger_sample_index(STREAM_ISO_RESULT)
+                            pre_iso_packets = int(dev.pretrigger_packets_by_stream.get(STREAM_ISO_RESULT, 0))
+                            expected_iso_packets = int(dev.capture_expected_by_stream.get(STREAM_ISO_RESULT, 0))
+                            # expected_iso_packets for ISO already includes the trigger
+                            # packet, so derive post packets after trigger by removing
+                            # both pre and trigger contributions.
+                            post_iso_packets = max(0, expected_iso_packets - pre_iso_packets - 1)
+                            if iso_tsi is not None:
+                                x_iso = x_iso - (iso_tsi * SAMPLING_PERIOD)
+                            if iso_tsi is not None and post_iso_packets > 0 and iso_total_len > 0:
+                                # Keep a packet-count window around the trigger packet
+                                # (pre packets before, post packets from trigger onward).
+                                # This avoids boundary loss from float rounding/jitter and
+                                # intentionally prefers one extra packet over one missing.
+                                trig_pos = int(np.argmin(np.abs(iso_time - float(iso_tsi))))
+                                i0 = max(0, trig_pos - pre_iso_packets)
+                                i1 = min(iso_total_len, trig_pos + post_iso_packets + 1)
+                                iso_keep = np.zeros(iso_total_len, dtype=bool)
+                                iso_keep[i0:i1] = True
                             else:
                                 iso_keep = np.ones(iso_total_len, dtype=bool)
                             x_iso = x_iso[iso_keep]
