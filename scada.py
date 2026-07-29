@@ -58,7 +58,7 @@ from fdds.crc import crc16_ccitt
 from fdds import alg_config as fdds_alg_config
 
 APPLICATION_NAME = 'Eaton FDDS SCADA'
-APPLICATION_VERSION = '1.14.3'
+APPLICATION_VERSION = '1.15.0'
 APPLICATION_TITLE = f"{APPLICATION_NAME} v{APPLICATION_VERSION}"
 
 # Constants (protocol-level values sourced from the shared fdds core)
