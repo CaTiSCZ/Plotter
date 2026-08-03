@@ -1035,6 +1035,32 @@ class Device:
     def get_id(self)->dict|None:
         return self._parse_id(self._send_cmd(1) or b'')
 
+    def get_fw_info(self) -> dict | None:
+        """CMD_GET_FW_ID -> parsed fw_info fields, or None on comm/format errors."""
+        res = self._send_cmd_with_ack(int(CMD.GET_FW_ID))
+        if res is None:
+            self._logger.warning(f"Dev {self.ip} failed to get FW info (no/invalid ACK).")
+            return None
+        _state, extra = res
+        if len(extra) < STRUCT.FW_INFO.size:
+            self._logger.warning(f"Dev {self.ip} FW info reply too short ({len(extra)}).")
+            return None
+        fields = STRUCT.FW_INFO.unpack(extra[:STRUCT.FW_INFO.size])
+        (fw_ver_id, fw_ver_major, fw_ver_minor,
+         build_number, _build_cfg_raw, build_time_raw, built_by_raw,
+         _variant_id, _boot_bank, _reserved,
+         _uptime_ms, _reset_reason) = fields
+        build_time = build_time_raw.split(b'\x00', 1)[0].decode('utf-8', errors='replace')
+        built_by = built_by_raw.split(b'\x00', 1)[0].decode('utf-8', errors='replace')
+        return {
+            'fw_id': int(fw_ver_id),
+            'fw_ver_major': int(fw_ver_major),
+            'fw_ver_minor': int(fw_ver_minor),
+            'build_number': int(build_number),
+            'build_time': build_time,
+            'built_by': built_by,
+        }
+
     @staticmethod
     def _parse_alg_get(extra: bytes) -> dict | None:
         """Parse CMD_GET_ALG_CONFIG ACK payload: tag, schema, section, body."""
@@ -4019,25 +4045,60 @@ class Plotter(QWidget):
         #)
 
     def _identity_from_loaded_id(self, dev: Device) -> dict:
-        """Extract FW version and HW board IDs from already-loaded device info."""
+        """Extract FW/HW identity and FW build metadata for calibration export."""
         info = getattr(dev, 'info', None) or {}
-        return {
-            'fw': {
-                'id':    int(info.get('fw_id', 0)),
-                'major': int(info.get('fw_ver_major', 0)),
-                'minor': int(info.get('fw_ver_minor', 0)),
-            },
-            'hw_digital': {
-                'id':    int(info.get('hw_id', 0)),
-                'major': int(info.get('hw_ver_major', 0)),
-                'minor': int(info.get('hw_ver_minor', 0)),
-            },
-            'hw_analog': {
-                'id':    int(info.get('adc_hw_id', 0)),
-                'major': int(info.get('adc_ver_major', 0)),
-                'minor': int(info.get('adc_ver_minor', 0)),
-            },
-        }
+        fw_info = dev.get_fw_info() or {}
+        identity = {}
+
+        fw = {}
+        fw_id = fw_info.get('fw_id', info.get('fw_id'))
+        fw_major = fw_info.get('fw_ver_major', info.get('fw_ver_major'))
+        fw_minor = fw_info.get('fw_ver_minor', info.get('fw_ver_minor'))
+        build_number = fw_info.get('build_number')
+        build_date = fw_info.get('build_time')
+        build_author = fw_info.get('built_by')
+        if fw_id is not None:
+            fw['id'] = int(fw_id)
+        if fw_major is not None:
+            fw['major'] = int(fw_major)
+        if fw_minor is not None:
+            fw['minor'] = int(fw_minor)
+        if build_number is not None:
+            fw['build_number'] = int(build_number)
+        if build_date:
+            fw['build_date'] = str(build_date)
+        if build_author:
+            fw['build_author'] = str(build_author)
+        if fw:
+            identity['fw'] = fw
+
+        hw_digital = {}
+        hw_id = info.get('hw_id')
+        hw_major = info.get('hw_ver_major')
+        hw_minor = info.get('hw_ver_minor')
+        if hw_id is not None:
+            hw_digital['id'] = int(hw_id)
+        if hw_major is not None:
+            hw_digital['major'] = int(hw_major)
+        if hw_minor is not None:
+            hw_digital['minor'] = int(hw_minor)
+        if hw_digital:
+            identity['hw_digital'] = hw_digital
+
+        hw_analog = {}
+        adc_hw_id = info.get('adc_hw_id')
+        adc_major = info.get('adc_ver_major')
+        adc_minor = info.get('adc_ver_minor')
+        if adc_hw_id is not None:
+            hw_analog['id'] = int(adc_hw_id)
+        if adc_major is not None:
+            hw_analog['major'] = int(adc_major)
+        if adc_minor is not None:
+            hw_analog['minor'] = int(adc_minor)
+        if hw_analog:
+            identity['hw_analog'] = hw_analog
+
+        return identity
 
     def _calibration_from_loaded_id(self, dev: Device) -> dict:
         """Build calibration snapshot from data currently loaded in SCADA."""
