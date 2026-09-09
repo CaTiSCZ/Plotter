@@ -1,19 +1,4 @@
 {
-    "launch": {
-        "configurations": [
-            {
-                "name": "scada",
-                "type": "debugpy",
-                "request": "launch",
-                "program": "scada.py",
-                "env": { "USED_VSCODE_COMMAND_PICKARGS": "0" },
-                //"args": ["${command:pickArgs}"], // "${command:pickArgs}"
-                //"args": ["DEBUG"],
-                "console": "integratedTerminal",
-                "justMyCode": false
-            }
-        ]
-    },
     "files.associations": {
         "algorithm": "cpp",
         "atomic": "cpp",
