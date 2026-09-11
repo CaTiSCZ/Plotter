@@ -38,6 +38,7 @@ from PyQt5.QtWidgets import (
     QScrollArea, QRadioButton, QButtonGroup, QFileDialog, QMessageBox, QComboBox
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint
+from PyQt5.QtGui import QFont, QFontMetrics
 
 # Shared FDDS protocol core (vendored copy of the firmware repo's utils/fdds).
 # Single source of truth for packet/command enums, struct layouts and CRC so the
@@ -217,7 +218,7 @@ ANALOG_VALUE_FONT_STYLE = 'font-family: Consolas, "Courier New", monospace; font
 # Muted style for analog labels with no live data (shows the '--' placeholder greyed
 # out so a stalled channel is not mistaken for a valid last value).
 ANALOG_VALUE_NO_DATA_STYLE = ANALOG_VALUE_FONT_STYLE + ' color: #9e9e9e;'
-ISO_VALUE_WIDTH = 8
+ISO_VALUE_WIDTH = 9  # -4.3: sign + four integer digits + decimal point + three decimals
 ISO_VALUE_DECIMALS = 3
 
 # Stream keys used across capture gating, order tracking and statistics.
@@ -2481,8 +2482,9 @@ class Plotter(QWidget):
         self.isomon_debug_chk.toggled.connect(self._toggle_isomon_debug_panel)
 
         # ISOMON HW debug panel: 3 columns x 2 rows -- col1=algorithm enable/AGPIO0,
-        # col2=AGPIO1/AGPIO2, col3=AGPIO3/AGPIO4. Hidden until 'Debug' is checked.
-        debug_panel = QWidget()
+        # col2=AGPIO1/AGPIO2, col3=AGPIO3/AGPIO4. It is positioned beside the
+        # live view instead of joining the grid, so it cannot resize grid columns.
+        debug_panel = QWidget(self)
         debug_grid = QGridLayout(debug_panel)
         debug_grid.setContentsMargins(0, 0, 0, 0)
         debug_grid.setSpacing(4)
@@ -2501,7 +2503,6 @@ class Plotter(QWidget):
             btn.setStyleSheet(self._debug_btn_style(None))
         self.isomon_debug_panel = debug_panel
         self._isomon_alg_enable_state: bool | None = None
-        cfg.addWidget(debug_panel, ISOMON_DEVICE_INDEX, 10, 2, 3, alignment=Qt.AlignLeft | Qt.AlignVCenter)
         debug_panel.setVisible(False)
 
         self._isomon_debug_alg_timer = QTimer(self)
@@ -2752,6 +2753,10 @@ class Plotter(QWidget):
         self.manager.shutdown()
         super().closeEvent(event)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._position_isomon_debug_panel)
+
     def _toggle_log(self, checked: bool):
         """Show or hide the log pane. When hidden the graph reclaims the space."""
         self.log_scroll.setVisible(checked)
@@ -2929,6 +2934,7 @@ class Plotter(QWidget):
             iso_fields = ('u1_baseline', 'u1_s2', 'u2_s2', 'r1_via_r3', 'r2_via_r3')
             iso_lbl.setProperty('iso_fields', iso_fields)
             iso_lbl.setText(self._format_iso_row(iso_fields, {}, False))
+            iso_lbl.setFixedWidth(self._iso_row_fixed_width(iso_lbl, iso_fields))
             iso_col.addWidget(iso_lbl)
             labels.append(iso_lbl)
             layout.addLayout(iso_col)
@@ -2950,13 +2956,34 @@ class Plotter(QWidget):
             val_s = f"{'--':>{width}}"
         return f'{val_s} {unit}'
 
-    def _format_iso_value(self, value: float, valid: bool) -> str:
+    def _format_iso_value(self, field: str, value: float, valid: bool) -> str:
+        is_resistance = field.startswith('r')
         if valid and np.isfinite(value):
-            return f'{float(value):>{ISO_VALUE_WIDTH}.{ISO_VALUE_DECIMALS}f}'
-        return f"{'--':>{ISO_VALUE_WIDTH}}"
+            scaled_value = float(value)
+            prefix = ' '
+            if is_resistance and abs(scaled_value) > 10_000:
+                scaled_value /= 1_000
+                prefix = 'k'
+            value_s = f'{scaled_value:>{ISO_VALUE_WIDTH}.{ISO_VALUE_DECIMALS}f}'
+        else:
+            value_s = f"{'--':>{ISO_VALUE_WIDTH}}"
+            prefix = ' '
+        return f'{value_s} {prefix}Ω' if is_resistance else value_s
 
     def _format_iso_row(self, fields: Tuple[str, ...], iso_values: dict, iso_valid: bool) -> str:
-        return '  '.join(f'{name}:{self._format_iso_value(iso_values.get(name, np.nan), iso_valid)}' for name in fields)
+        return '  '.join(
+            f'{name}:{self._format_iso_value(name, iso_values.get(name, np.nan), iso_valid)}'
+            for name in fields
+        )
+
+    def _iso_row_fixed_width(self, label: QLabel, fields: Tuple[str, ...]) -> int:
+        samples = ({field: -9_999.999 for field in fields},
+                   {field: -9_999_999.0 for field in fields})
+        font = QFont('Consolas')
+        font.setPixelSize(16)
+        metrics = QFontMetrics(font)
+        return max(metrics.horizontalAdvance(self._format_iso_row(fields, sample, True))
+                   for sample in samples) + 4
 
     def _realign_isomon_row2_label(self):
         if not hasattr(self, 'isomon_iso_row2_lbl'):
@@ -2980,7 +3007,32 @@ class Plotter(QWidget):
             return
         x1 = first_iso_lbl.mapTo(self, QPoint(0, 0)).x()
         x2 = self.isomon_iso_row2_lbl.mapTo(self, QPoint(0, 0)).x()
-        self.isomon_iso_row2_lbl.setIndent(max(0, x1 - x2))
+        indent = max(0, x1 - x2)
+        self.isomon_iso_row2_lbl.setIndent(indent)
+        fields = ('u2_baseline', 'u1_s3', 'u2_s3', 'r1_via_r4', 'r2_via_r4')
+        self.isomon_iso_row2_lbl.setFixedWidth(
+            self._iso_row_fixed_width(self.isomon_iso_row2_lbl, fields) + indent)
+        self._position_isomon_debug_panel()
+
+    def _position_isomon_debug_panel(self):
+        if not self.isomon_debug_panel.isVisible():
+            return
+        self.isomon_debug_panel.adjustSize()
+        row = self._isomon_live_row
+        if row is not None and 0 <= row < DeviceManager.MAX_DEVICES and self.isomon_iso_row2_lbl.isVisible():
+            channel_count = int(getattr(self._device_for_row(row), 'channels', 0))
+            labels = self.device_analog_value_labels[row]
+            if len(labels) > channel_count:
+                first_iso_lbl = labels[channel_count]
+                pos = first_iso_lbl.mapTo(self, QPoint(0, 0))
+                right = self.isomon_iso_row2_lbl.mapTo(
+                    self, QPoint(self.isomon_iso_row2_lbl.width(), 0)).x()
+                self.isomon_debug_panel.move(right + 8, pos.y())
+                self.isomon_debug_panel.raise_()
+                return
+        pos = self.isomon_debug_chk.mapTo(self, QPoint(self.isomon_debug_chk.width() + 8, 0))
+        self.isomon_debug_panel.move(pos)
+        self.isomon_debug_panel.raise_()
 
     def _refresh_analog_values(self):
         iso_row2_visible = False
@@ -3022,6 +3074,8 @@ class Plotter(QWidget):
 
                 row2_fields = ('u2_baseline', 'u1_s3', 'u2_s3', 'r1_via_r4', 'r2_via_r4')
                 self.isomon_iso_row2_lbl.setText(self._format_iso_row(row2_fields, iso_values, iso_valid))
+                self.isomon_iso_row2_lbl.setFixedWidth(
+                    self._iso_row_fixed_width(self.isomon_iso_row2_lbl, row2_fields))
                 self.isomon_iso_row2_lbl.setStyleSheet(ANALOG_VALUE_FONT_STYLE if iso_valid else ANALOG_VALUE_NO_DATA_STYLE)
                 self.isomon_iso_row2_lbl.setToolTip(iso_tooltip)
                 self.isomon_iso_row2_lbl.setVisible(True)
@@ -4128,6 +4182,8 @@ class Plotter(QWidget):
     def _toggle_isomon_debug_panel(self, checked: bool):
         self.isomon_debug_panel.setVisible(checked)
         if checked:
+            self._position_isomon_debug_panel()
+            QTimer.singleShot(0, self._position_isomon_debug_panel)
             self._poll_isomon_alg_enable()
             self._refresh_isomon_debug_pins()
             self._isomon_debug_alg_timer.start()
