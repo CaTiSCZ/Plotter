@@ -202,6 +202,17 @@ FAULT_INDICATOR_COLORS = {
     (1, 1): '#c0392b',
 }
 FAULT_INDICATOR_UNKNOWN = '#bdbdbd'
+
+# ISOMON HW debug panel: algorithm enable + AGPIO0..4 read/toggle via CMD_GPIO_DIAG.
+# AGPIO0..4 map to GPIO port E, pins 7..11 (see FW App/system/hw_profile.cpp
+# hw_profile_agpio()); only AGPIO1 (S2)/AGPIO2 (S3) are driven by the isomon_iso
+# algorithm, the rest are sampled as inputs, but all 5 are addressable for debug.
+ISOMON_AGPIO_PORT = 4          # GPIO port E (0=A,1=B,...)
+ISOMON_AGPIO_PINS = (7, 8, 9, 10, 11)  # AGPIO0..AGPIO4
+DEBUG_BTN_COLOR_ON = '#2e7d32'
+DEBUG_BTN_COLOR_OFF = '#c0392b'
+DEBUG_BTN_COLOR_UNKNOWN = FAULT_INDICATOR_UNKNOWN
+DEBUG_ALG_POLL_INTERVAL_MS = 2000
 ANALOG_VALUE_FONT_STYLE = 'font-family: Consolas, "Courier New", monospace; font-size: 16px; font-weight: 600;'
 # Muted style for analog labels with no live data (shows the '--' placeholder greyed
 # out so a stalled channel is not mistaken for a valid last value).
@@ -827,6 +838,8 @@ class Device:
         self.last_fault_state = 0
         self.last_fault_latched = 0
         self.last_fault_valid = False
+        self.last_agpio_bits = 0    # ISOMON AGPIO0..4 live level snapshot (bits 0-4)
+        self.last_agpio_valid = False
         # Bumped on every incoming packet that refreshes the live fault/analog values,
         # even when nothing is appended to the plot buffer (e.g. PTP mode waiting for a
         # trigger). Lets the GUI refresh the indicators/labels independently of
@@ -1077,6 +1090,86 @@ class Device:
         _state, extra = res
         return self._parse_alg_get(extra)
 
+    def set_alg_config_section(self, section_id: int, data: bytes, save: bool = False) -> dict | None:
+        """Update one section of the live (RAM) algorithm parameters.
+
+        Returns {'applied': bool, 'saved': bool}, or None on communication failure.
+        """
+        payload = bytes([section_id & 0xFF]) + bytes(data)
+        if save:
+            payload += bytes([0xAC])
+        res = self._send_cmd_with_ack(int(CMD.SET_ALG_CONFIG), payload)
+        if res is None:
+            return None
+        _state, extra = res
+        applied = bool(extra[0]) if len(extra) >= 1 else False
+        saved = bool(extra[1]) if len(extra) >= 2 else False
+        return {'applied': applied, 'saved': saved}
+
+    def get_isomon_alg_iso_enable(self) -> bool | None:
+        """Read isomon_iso.enable (ALG_SEC_ISOMON_ISO) -> bool, or None on failure."""
+        iso_sec = fdds_alg_config.section_by_name('isomon', 'isomon_iso')
+        if iso_sec is None:
+            return None
+        raw = self.get_alg_config_section(iso_sec.id)
+        if not raw or len(raw.get('body', b'')) < iso_sec.size:
+            return None
+        cfg = iso_sec.unpack(raw['body'])
+        return bool(int(cfg.get('enable', 0)))
+
+    def set_isomon_alg_iso_enable(self, enable: bool) -> bool | None:
+        """Set isomon_iso.enable (ALG_SEC_ISOMON_ISO), preserving other fields (RAM only)."""
+        iso_sec = fdds_alg_config.section_by_name('isomon', 'isomon_iso')
+        if iso_sec is None:
+            return None
+        raw = self.get_alg_config_section(iso_sec.id)
+        if not raw or len(raw.get('body', b'')) < iso_sec.size:
+            return None
+        cfg = iso_sec.unpack(raw['body'])
+        cfg['enable'] = 1 if enable else 0
+        res = self.set_alg_config_section(iso_sec.id, iso_sec.pack(cfg), save=False)
+        return bool(res and res.get('applied')) if res is not None else None
+
+    def _gpio_diag_request(self, payload: bytes) -> dict | None:
+        """Send a CMD_GPIO_DIAG request and parse the 10-byte ACK payload."""
+        res = self._send_cmd_with_ack(int(CMD.GPIO_DIAG), payload)
+        if res is None:
+            return None
+        _state, extra = res
+        if len(extra) < 10 or extra[0] != 1:
+            return None
+        return {
+            'port': extra[1], 'pin': extra[2], 'mode': extra[3], 'pull': extra[4],
+            'otype': extra[5], 'af': extra[6], 'speed': extra[7],
+            'level': extra[8], 'odr': extra[9],
+        }
+
+    def gpio_read(self, port: int, pin: int) -> dict | None:
+        """Read all live settings of a DGPIO/AGPIO/TEST pin via CMD_GPIO_DIAG."""
+        return self._gpio_diag_request(struct.pack('<BBB', 0, port, pin))
+
+    def gpio_configure(self, port: int, pin: int, mode: int, pull: int = 0,
+                       otype: int = 0, af: int = 0, level: int = 0) -> dict | None:
+        """Configure a DGPIO/AGPIO/TEST pin via CMD_GPIO_DIAG."""
+        return self._gpio_diag_request(struct.pack('<BBBBBBBB', 1, port, pin,
+            mode & 0xFF, pull & 0xFF, otype & 0xFF, af & 0xFF, 1 if level else 0))
+
+    def gpio_diag_agpio(self, agpio_idx: int, value: int | None = None) -> int | None:
+        """Read (value=None) or drive (push-pull, pull-down) an ISOMON AGPIO0..4 pin.
+
+        Returns the pin's live input level (0/1) after the operation, or None on
+        failure / out-of-range index.
+        """
+        if not (0 <= agpio_idx < len(ISOMON_AGPIO_PINS)):
+            return None
+        pin = ISOMON_AGPIO_PINS[agpio_idx]
+        if value is None:
+            info = self.gpio_read(ISOMON_AGPIO_PORT, pin)
+        else:
+            info = self.gpio_configure(ISOMON_AGPIO_PORT, pin, mode=1, pull=2, otype=0,
+                                       af=0, level=1 if value else 0)
+        return info['level'] if info else None
+
     def set_id(self, new_id:int):
         payload = struct.pack('<B', new_id)
         return self._send_cmd(13, payload)
@@ -1265,7 +1358,8 @@ class Device:
 
     def _update_live_values_from_wide_packet(self, data: bytes,
                                              records: List[dict] | None = None,
-                                             agg_count: int | None = None):
+                                             agg_count: int | None = None,
+                                             agpio_bits: int | None = None):
         """Update live values (analog + fault) from WIDE packet.
 
         Accepts either fully parsed `records`+`agg_count` (normal WIDE path) or
@@ -1275,7 +1369,7 @@ class Device:
             if len(data) < STRUCT.WIDE_HEADER.size:
                 return
             try:
-                _, _, _, _, agg_count_h, records_per_channel, channel_mask, _ = \
+                _, _, _, _, agg_count_h, records_per_channel, channel_mask, agpio_bits = \
                     STRUCT.WIDE_HEADER.unpack(data[:STRUCT.WIDE_HEADER.size])
             except struct.error:
                 return
@@ -1318,6 +1412,9 @@ class Device:
         
         self._update_analog_values_from_raw_last(raw_last)
         # WIDE packets don't have explicit fault state; leave last_fault_state/latched unchanged
+        if agpio_bits is not None:
+            self.last_agpio_bits = int(agpio_bits) & 0x1F
+            self.last_agpio_valid = True
         self.live_revision += 1
         
     def _update_live_values_from_iso_result_packet(self, data: bytes):
@@ -1901,7 +1998,7 @@ class Device:
                     agg_counts_list.append(agg_count)
                     agpio_bits_list.append(agpio_bits)
 
-                self._update_live_values_from_wide_packet(data, records, agg_count)
+                self._update_live_values_from_wide_packet(data, records, agg_count, agpio_bits)
                 self.loop.call_soon_threadsafe(self.buffer.extend_wide, time_list, samples_list, ptp_list,
                                                wide_sums_list, wide_present_list, agg_counts_list, agpio_bits_list)
                 return (STREAM_WIDE, order)
@@ -2377,6 +2474,40 @@ class Plotter(QWidget):
         self.save_trigger_config_btn = QPushButton('Save trigger config')
         cfg.addWidget(self.save_trigger_config_btn, DeviceManager.MAX_DEVICES, 5)
         self.save_trigger_config_btn.clicked.connect(self._save_trigger_config)
+
+        self.isomon_debug_chk = QCheckBox('Debug')
+        self.isomon_debug_chk.setToolTip('Show ISOMON HW debug controls (algorithm enable + AGPIO0..4)')
+        cfg.addWidget(self.isomon_debug_chk, DeviceManager.MAX_DEVICES, 6)
+        self.isomon_debug_chk.toggled.connect(self._toggle_isomon_debug_panel)
+
+        # ISOMON HW debug panel: 3 columns x 2 rows -- col1=algorithm enable/AGPIO0,
+        # col2=AGPIO1/AGPIO2, col3=AGPIO3/AGPIO4. Hidden until 'Debug' is checked.
+        debug_panel = QWidget()
+        debug_grid = QGridLayout(debug_panel)
+        debug_grid.setContentsMargins(0, 0, 0, 0)
+        debug_grid.setSpacing(4)
+        self.isomon_alg_enable_btn = QPushButton('ALG')
+        self.isomon_alg_enable_btn.setCursor(Qt.PointingHandCursor)
+        self.isomon_alg_enable_btn.clicked.connect(self._toggle_isomon_alg_enable)
+        debug_grid.addWidget(self.isomon_alg_enable_btn, 0, 0)
+        self.isomon_agpio_btns: List[QPushButton] = []
+        for idx, (r, c) in enumerate([(1, 0), (0, 1), (1, 1), (0, 2), (1, 2)]):
+            btn = QPushButton(f'AGPIO{idx}')
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda _checked=False, i=idx: self._toggle_isomon_agpio(i))
+            debug_grid.addWidget(btn, r, c)
+            self.isomon_agpio_btns.append(btn)
+        for btn in [self.isomon_alg_enable_btn] + self.isomon_agpio_btns:
+            btn.setStyleSheet(self._debug_btn_style(None))
+        self.isomon_debug_panel = debug_panel
+        self._isomon_alg_enable_state: bool | None = None
+        cfg.addWidget(debug_panel, ISOMON_DEVICE_INDEX, 10, 2, 3, alignment=Qt.AlignLeft | Qt.AlignVCenter)
+        debug_panel.setVisible(False)
+
+        self._isomon_debug_alg_timer = QTimer(self)
+        self._isomon_debug_alg_timer.setInterval(DEBUG_ALG_POLL_INTERVAL_MS)
+        self._isomon_debug_alg_timer.timeout.connect(self._poll_isomon_alg_enable)
+
         self.isomon_iso_row2_lbl = QLabel('')
         self.isomon_iso_row2_lbl.setStyleSheet(ANALOG_VALUE_NO_DATA_STYLE)
         self.isomon_iso_row2_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -3978,6 +4109,95 @@ class Plotter(QWidget):
                 holdoff_ns = self.device_trigger_holdoff[row].value() * 1000
                 dev.set_trigger_config(config_byte=config_byte, holdoff_ns=holdoff_ns, save=True)
 
+    def _debug_btn_style(self, state: bool | None) -> str:
+        """Red/green/gray colouring for the ISOMON debug buttons, matching the
+        digital fault-output indicator convention (gray = unknown state)."""
+        if state is None:
+            color, text_color = DEBUG_BTN_COLOR_UNKNOWN, 'black'
+        elif state:
+            color, text_color = DEBUG_BTN_COLOR_ON, 'white'
+        else:
+            color, text_color = DEBUG_BTN_COLOR_OFF, 'white'
+        return (
+            'QPushButton {'
+            f'background-color: {color}; color: {text_color}; border: 1px solid #555; '
+            'min-width: 56px; padding: 2px 4px;'
+            '}'
+        )
+
+    def _toggle_isomon_debug_panel(self, checked: bool):
+        self.isomon_debug_panel.setVisible(checked)
+        if checked:
+            self._poll_isomon_alg_enable()
+            self._refresh_isomon_debug_pins()
+            self._isomon_debug_alg_timer.start()
+        else:
+            self._isomon_debug_alg_timer.stop()
+
+    def _poll_isomon_alg_enable(self):
+        """Query isomon_iso.enable (CMD_GET_ALG_CONFIG) and colour the ALG button."""
+        dev = self._system_isomon()
+        state = dev.get_isomon_alg_iso_enable() if dev is not None else None
+        self._isomon_alg_enable_state = state
+        self.isomon_alg_enable_btn.setStyleSheet(self._debug_btn_style(state))
+        if dev is None:
+            tip = 'ISOMON device not applied yet.'
+        elif state is None:
+            tip = 'ISOMON isolation-monitoring algorithm: unknown state (read failed).'
+        else:
+            tip = f"ISOMON isolation-monitoring algorithm (ALG_SEC_ISOMON_ISO): {'enabled' if state else 'disabled'}. Click to toggle."
+        self.isomon_alg_enable_btn.setToolTip(tip)
+
+    def _toggle_isomon_alg_enable(self):
+        dev = self._system_isomon()
+        if dev is None:
+            self._logger.warning('ISOMON debug: no ISOMON device applied.')
+            return
+        current = dev.get_isomon_alg_iso_enable()
+        if current is None:
+            self._logger.warning(f'ISOMON debug: failed to read algorithm enable state on {dev.ip}.')
+            self._poll_isomon_alg_enable()
+            return
+        ok = dev.set_isomon_alg_iso_enable(not current)
+        if not ok:
+            self._logger.warning(f'ISOMON debug: failed to set algorithm enable={not current} on {dev.ip}.')
+        else:
+            self._logger.info(f'ISOMON debug: algorithm enable set to {not current} on {dev.ip}.')
+        self._poll_isomon_alg_enable()
+
+    def _refresh_isomon_debug_pins(self):
+        """Colour the AGPIO0..4 buttons from the live WIDE-packet agpio_bits snapshot
+        (no CMD round-trip needed; the level is already streamed with every packet)."""
+        if not self.isomon_debug_panel.isVisible():
+            return
+        dev = self._system_isomon()
+        for idx, btn in enumerate(self.isomon_agpio_btns):
+            if dev is not None and dev.last_agpio_valid:
+                level = bool((dev.last_agpio_bits >> idx) & 1)
+                btn.setStyleSheet(self._debug_btn_style(level))
+                btn.setToolTip(f'ISOMON AGPIO{idx}: level={int(level)} (live). Click to toggle.')
+            else:
+                btn.setStyleSheet(self._debug_btn_style(None))
+                btn.setToolTip(f'ISOMON AGPIO{idx}: no live data yet. Click to toggle.')
+
+    def _toggle_isomon_agpio(self, idx: int):
+        dev = self._system_isomon()
+        if dev is None:
+            self._logger.warning('ISOMON debug: no ISOMON device applied.')
+            return
+        current = (dev.last_agpio_bits >> idx) & 1 if dev.last_agpio_valid else dev.gpio_diag_agpio(idx)
+        if current is None:
+            self._logger.warning(f'ISOMON debug: failed to read AGPIO{idx} on {dev.ip}.')
+            return
+        new_level = dev.gpio_diag_agpio(idx, value=0 if current else 1)
+        if new_level is None:
+            self._logger.warning(f'ISOMON debug: failed to set AGPIO{idx} on {dev.ip}.')
+            return
+        dev.last_agpio_bits = (dev.last_agpio_bits & ~(1 << idx)) | ((new_level & 1) << idx)
+        dev.last_agpio_valid = True
+        self._refresh_isomon_debug_pins()
+        self._logger.info(f'ISOMON debug: AGPIO{idx} set to {new_level} on {dev.ip}.')
+
     def clear_plot(self):
         for dev in self.manager.devices.values():
             with dev.buffer.lock:
@@ -4588,6 +4808,7 @@ class Plotter(QWidget):
             self._live_revisions = live_revisions
             self._refresh_fault_indicators()
             self._refresh_analog_values()
+            self._refresh_isomon_debug_pins()
         if self._system_status_ok:
             for ip, dev in self.manager.devices.items():
                 if self._device_data_fresh(dev):
