@@ -502,10 +502,10 @@ class DeviceBuffer:
         self._logger = logging.getLogger(__class__.__name__ if logger.application_logger is None else f'{logger.application_logger}.{__class__.__name__}')
         self.lock = threading.Lock()
         # Per-sample columns backed by preallocated numpy ring buffers. signal[0] is
-        # the per-sample time index (int64, large range); signal[1..] are the int16
-        # ADC/bit samples; error[*] are the small per-channel parity-error counts.
+        # the per-sample time index (int64); channel samples need int32 because WIDE
+        # ISOMON values are aggregated/scaled and can exceed the raw ADC int16 range.
         self.time   = NumpyRing(BUFFER_SIZE, np.int64)
-        self.signal = [NumpyRing(BUFFER_SIZE, np.int64)] + [NumpyRing(BUFFER_SIZE, np.int16) for _ in range(channels)]
+        self.signal = [NumpyRing(BUFFER_SIZE, np.int64)] + [NumpyRing(BUFFER_SIZE, np.int32) for _ in range(channels)]
         self.error  = [NumpyRing(BUFFER_SIZE, np.int16) for _ in range(channels)]
         # PTP timestamp per row in integer nanoseconds (mirrors the packet PTP time)
         self.ptp    = NumpyRing(BUFFER_SIZE, np.int64)
@@ -613,6 +613,19 @@ class DeviceBuffer:
 def _is_sorted(a) -> bool:
     """True if the 1-D array is non-decreasing (a[i] <= a[i+1] for all i)."""
     return a.size < 2 or bool(np.all(a[1:] >= a[:-1]))
+
+
+def _capture_window_bounds(trigger_index, pre_packets, post_packets, result_rows=False):
+    if trigger_index is None:
+        return 0, 0, None
+    if result_rows:
+        trigger_packet = trigger_index / SAMPLES_PER_PACKET
+        return (trigger_packet - pre_packets,
+                trigger_packet + post_packets,
+                round(trigger_packet) * PACKET_PERIOD)
+    return (trigger_index - pre_packets * SAMPLES_PER_PACKET,
+            trigger_index + post_packets * SAMPLES_PER_PACKET,
+            None)
 
 
 def plot_sort_order(idx0, state, margin=PLOT_SORT_MARGIN_SAMPLES):
@@ -4563,14 +4576,11 @@ class Plotter(QWidget):
             _expected = int(dev.capture_expected_by_stream.get(stream_key, 0))
             _post = max(0, _expected - _pre)
             _trim_window = _tsi is not None and _post > 0
-            if has_result_meta:
-                _trig_n = _tsi / SAMPLES_PER_PACKET
-                _n_lo, _n_hi = _trig_n - _pre, _trig_n + _post
-                # Result rows sit on the 1 ms packet grid; zero on the trigger packet
-                # so times stay whole ms (the trigger's intra-packet offset is dropped).
-                time_zero_s = round(_trig_n) * PACKET_PERIOD
-            else:
-                _n_lo, _n_hi = _tsi - _pre * SAMPLES_PER_PACKET, _tsi + _post * SAMPLES_PER_PACKET
+            _n_lo, _n_hi, result_time_zero_s = _capture_window_bounds(
+                _tsi, _pre, _post, result_rows=has_result_meta)
+            if result_time_zero_s is not None:
+                # Result rows sit on the 1 ms packet grid; zero on the trigger packet.
+                time_zero_s = result_time_zero_s
 
             if strict and len(times_a) == 0:
                 raise RuntimeError(f"Zařízení {ip} nemá žádná data k uložení.")

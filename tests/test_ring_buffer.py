@@ -126,6 +126,41 @@ def test_numpyring_vs_deque():
     check("tail(k) == asarray[-k:] (incl. wrap)", tail_ok)
 
 
+def test_wide_buffer_range():
+    print("test_wide_buffer_range")
+    buf = DeviceBuffer(channels=2)
+    samples = [[129024, 142709, 240478], [-167520, -153985, -259142]]
+    times = [0, 200, 400]
+    ptp = [1_000_000_000, 1_001_000_000, 1_002_000_000]
+    buf.extend_wide(
+        times,
+        samples,
+        ptp,
+        [(v, w) for v, w in zip(samples[0], samples[1])],
+        [(True, True)] * len(times),
+        [1] * len(times),
+        [0] * len(times),
+    )
+    check("WIDE samples retain values outside int16 range",
+          np.array_equal(np.asarray(buf.signal[1]), samples[0])
+          and np.array_equal(np.asarray(buf.signal[2]), samples[1]))
+    aligned_lengths = [len(buf.time), len(buf.ptp), *(len(signal) for signal in buf.signal)]
+    aligned_lengths += [len(column) for column in buf.wide_sums]
+    aligned_lengths += [len(column) for column in buf.wide_present]
+    aligned_lengths += [len(buf.wide_agg_counts), len(buf.wide_agpio_bits)]
+    check("WIDE append keeps all export columns aligned",
+          aligned_lengths == [len(times)] * len(aligned_lengths))
+def test_capture_window_bounds():
+    print("test_capture_window_bounds")
+    check("missing trigger disables trimming without arithmetic",
+          scada._capture_window_bounds(None, 50, 450) == (0, 0, None))
+    check("sample window bounds",
+          scada._capture_window_bounds(10_000, 50, 450) == (0, 100_000, None))
+    check("result window bounds and zero time",
+          scada._capture_window_bounds(10_000, 50, 450, result_rows=True)
+          == (0.0, 500.0, 0.05))
+
+
 # --- shared plot/CSV consumer pipeline replicas --------------------------------
 def node_plot_pipeline(buf, channels, pretrigger_packets, samples_awaited, tsi):
     """Replicates the _update_plot node path math against a buffer."""
@@ -434,6 +469,8 @@ def test_plot_sort_order():
 
 def main():
     test_numpyring_vs_deque()
+    test_wide_buffer_range()
+    test_capture_window_bounds()
     test_node_capture("in_order", list(range(10)))
     # Out-of-order: a pre-trigger packet replayed late around the trigger boundary.
     test_node_capture("out_of_order", [0, 1, 3, 2, 4, 5, 6, 7, 8, 9])
