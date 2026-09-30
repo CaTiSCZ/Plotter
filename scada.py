@@ -2695,7 +2695,7 @@ class Plotter(QWidget):
         self.ax_iso_r = self.plot_widget.addPlot(title='ISOMON resistance result')
         self.ax_iso_r.showGrid(x=True, y=True, alpha=0.3)
         self.ax_iso_r.setLabel('bottom', 'Time', units='s')
-        self.ax_iso_r.setLabel('left', 'Resistance')
+        self.ax_iso_r.setLabel('left', 'Resistance', units='Ω')
         self.ax_iso_r.addLegend()
         self.ax_iso_r.setXLink(self.ax)
         self.ax_iso_r_curves: Dict[str, pg.PlotDataItem] = {}
