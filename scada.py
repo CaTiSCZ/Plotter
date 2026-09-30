@@ -2974,7 +2974,10 @@ class Plotter(QWidget):
         if valid and np.isfinite(value):
             scaled_value = float(value)
             prefix = ' '
-            if is_resistance and abs(scaled_value) > 10_000:
+            if is_resistance and abs(scaled_value) > 10_000_000:
+                scaled_value /= 1_000_000
+                prefix = 'M'
+            elif is_resistance and abs(scaled_value) > 10_000:
                 scaled_value /= 1_000
                 prefix = 'k'
             value_s = f'{scaled_value:>{ISO_VALUE_WIDTH}.{ISO_VALUE_DECIMALS}f}'
