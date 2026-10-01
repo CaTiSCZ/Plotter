@@ -144,6 +144,8 @@ Example descriptor:
 
 Important object names include `remote_control_enabled`, `remote_control_addr_port`, `remote_control_token`, `receiver_addr_port`, `measurement_number`, `apply_device_list`, `apply_config`, `start_system`, `stop_system`, `system_status`, `pretrigger_ms`, `posttrigger_ms`, `start_sampling`, `start_sampling_on_trigger`, `save_measurement`, `save_calibration`, `force_trigger`, `reset_counter`, `reset_latched_faults`, `reset_devices`, `downsample_mode`, `downsample_factor`, `clip_to_view`, `statistics`, `log_visible`, and `log_output`. The token widget reports only a masked value and a `configured` boolean. Device-row controls use names such as `device_0_enabled`, `device_0_address`, `device_0_leader`, `device_0_clock`, `device_0_trigger`, and `device_0_trigger_holdoff_us`; ISOMON controls use `isomon_*` names.
 
+The `downsample_mode`, `downsample_factor`, and `clip_to_view` controls are grouped at the right side of the statistics row directly below the plots, rather than with the upper measurement actions.
+
 Some Qt widgets do not have an explicit object name. Their IDs are generated from their current widget hierarchy. Treat every returned ID as opaque, use it exactly as returned, and rediscover it after application upgrades or UI changes. Labels, plots, and other read-only widgets have an empty `capabilities` list. Text widgets are truncated to the most recent 16 KiB in the snapshot.
 
 ### `GET /api/v1/screenshot`

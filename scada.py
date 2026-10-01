@@ -39,7 +39,7 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLineEdit, QLabel, QSpinBox, QDoubleSpinBox, QCheckBox, QTextEdit,
     QPlainTextEdit, QSlider, QScrollArea, QRadioButton, QButtonGroup,
-    QFileDialog, QMessageBox, QComboBox, QAbstractButton
+    QFileDialog, QMessageBox, QComboBox, QAbstractButton, QSizePolicy
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint, QObject, QBuffer, QIODevice
 from PyQt5.QtGui import QFont, QFontMetrics, QTextDocument
@@ -2686,8 +2686,8 @@ class Plotter(QWidget):
         # factor spinbox is the fixed decimation factor, or 0 to let pyqtgraph pick
         # it automatically from the visible pixel width (auto=True).
         downsample_lbl = QLabel('Downsample:')
-        downsample_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        btns.addWidget(downsample_lbl)
+        downsample_lbl.setObjectName('downsample_label')
+        downsample_lbl.setAlignment(Qt.AlignRight | Qt.AlignTop)
         self.downsample_mode_combo = QComboBox()
         self.downsample_mode_combo.setObjectName('downsample_mode')
         self.downsample_mode_combo.addItems(['Off', 'Subsample', 'Mean', 'Peak'])
@@ -2695,18 +2695,15 @@ class Plotter(QWidget):
         self.downsample_mode_combo.setToolTip(
             'Off: draw every point. Subsample: every Nth point (fast, can miss spikes). '
             'Mean: average each group. Peak: min/max envelope (preserves spikes).')
-        btns.addWidget(self.downsample_mode_combo)
         self.downsample_factor_spin = QSpinBox()
         self.downsample_factor_spin.setObjectName('downsample_factor')
         self.downsample_factor_spin.setRange(0, 100000)
         self.downsample_factor_spin.setValue(0)
         self.downsample_factor_spin.setToolTip('Decimation factor; 0 = auto (chosen from the visible pixel width).')
-        btns.addWidget(self.downsample_factor_spin)
         self.clip_to_view_chk = QCheckBox('Clip to view')
         self.clip_to_view_chk.setObjectName('clip_to_view')
         self.clip_to_view_chk.setChecked(True)
         self.clip_to_view_chk.setToolTip('Only draw the part of each curve inside the visible x-range (huge win when zoomed in).')
-        btns.addWidget(self.clip_to_view_chk)
 
         # System monitoring state
         self._system_poll_count = 0
@@ -2792,7 +2789,15 @@ class Plotter(QWidget):
         self.error_lbl = QLabel()
         self.error_lbl.setObjectName('statistics')
         self.error_lbl.setStyleSheet('font-family: monospace')
-        root.addWidget(self.error_lbl)
+        self.error_lbl.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.error_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        statistics_row = QHBoxLayout()
+        statistics_row.addWidget(self.error_lbl, 1, Qt.AlignTop)
+        statistics_row.addWidget(downsample_lbl, 0, Qt.AlignTop)
+        statistics_row.addWidget(self.downsample_mode_combo, 0, Qt.AlignTop)
+        statistics_row.addWidget(self.downsample_factor_spin, 0, Qt.AlignTop)
+        statistics_row.addWidget(self.clip_to_view_chk, 0, Qt.AlignTop)
+        root.addLayout(statistics_row)
 
         # Collapsible log pane: a toggle button lets the user hide the log so it
         # doesn't take up graph area during normal operation.

@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 import scada
-from PyQt5.QtWidgets import QApplication, QPushButton
+from PyQt5.QtWidgets import QApplication, QPushButton, QLabel
 from remote_control import RemoteControlServer
 
 
@@ -117,6 +117,22 @@ class RemoteControlGuiTests(unittest.TestCase):
         ]
         self.assertTrue(all(index >= 0 for index in button_indices))
         self.assertEqual(button_indices, sorted(button_indices))
+        self.assertEqual(button_row.indexOf(self.plotter.downsample_mode_combo), -1)
+        statistics_row = self.plotter.layout().itemAt(3).layout()
+        self.assertEqual(statistics_row.indexOf(self.plotter.error_lbl), 0)
+        plot_control_widgets = (
+            self.plotter.findChild(QLabel, 'downsample_label'),
+            self.plotter.downsample_mode_combo,
+            self.plotter.downsample_factor_spin,
+            self.plotter.clip_to_view_chk,
+        )
+        control_positions = [statistics_row.indexOf(widget) for widget in plot_control_widgets]
+        self.assertTrue(all(index > 0 for index in control_positions))
+        self.assertEqual(control_positions, sorted(control_positions))
+        statistics_top = statistics_row.itemAt(0).geometry().top()
+        control_tops = [statistics_row.itemAt(index).geometry().top()
+                for index in control_positions]
+        self.assertTrue(all(top == statistics_top for top in control_tops))
         self.assertFalse(hasattr(self.plotter, 'remote_control_apply'))
         self.assertFalse(hasattr(self.plotter, 'remote_control_status'))
 
