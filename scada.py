@@ -3506,6 +3506,9 @@ class Plotter(QWidget):
         row1_fields = tuple(first_iso_lbl.property('iso_fields'))
         row2_fields = ('u2_baseline', 'u1_s3', 'u2_s3', 'r1_via_r4', 'r2_via_r4')
         available_width = max(0, self.width() - self.layout().contentsMargins().right() - x1)
+        if self.isomon_debug_panel.isVisible():
+            self.isomon_debug_panel.adjustSize()
+            available_width = max(0, available_width - self.isomon_debug_panel.width() - 8)
         font_size = next((size for size in range(16, 7, -1)
                           if max(self._iso_row_fixed_width(first_iso_lbl, row1_fields, size),
                                  self._iso_row_fixed_width(self.isomon_iso_row2_lbl, row2_fields, size)) <= available_width), 8)
@@ -4690,13 +4693,14 @@ class Plotter(QWidget):
     def _toggle_isomon_debug_panel(self, checked: bool):
         self.isomon_debug_panel.setVisible(checked)
         if checked:
-            self._position_isomon_debug_panel()
-            QTimer.singleShot(0, self._position_isomon_debug_panel)
+            self._realign_isomon_row2_label()
+            QTimer.singleShot(0, self._realign_isomon_row2_label)
             self._poll_isomon_alg_enable()
             self._refresh_isomon_debug_pins()
             self._isomon_debug_alg_timer.start()
         else:
             self._isomon_debug_alg_timer.stop()
+            self._realign_isomon_row2_label()
 
     def _poll_isomon_alg_enable(self):
         """Query isomon_iso.enable (CMD_GET_ALG_CONFIG) and colour the ALG button."""

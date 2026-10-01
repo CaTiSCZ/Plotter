@@ -5,6 +5,7 @@ import os
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from urllib.request import Request, urlopen
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
@@ -140,6 +141,22 @@ class RemoteControlGuiTests(unittest.TestCase):
                     self.assertIn(expected_font, label.styleSheet())
                 else:
                     self.assertNotIn(expected_font, label.styleSheet())
+
+        with patch.object(self.plotter, '_poll_isomon_alg_enable'), \
+             patch.object(self.plotter, '_refresh_isomon_debug_pins'):
+            self.plotter.isomon_debug_chk.setChecked(True)
+        for width in (1920, 3800, 1920):
+            self.plotter.resize(width, 800)
+            self.plotter.show()
+            self.plotter._realign_isomon_row2_label()
+            self.app.processEvents()
+            debug_panel = self.plotter.isomon_debug_panel
+            self.assertLessEqual(debug_panel.geometry().right(), self.plotter.width() - 10)
+            self.assertGreater(debug_panel.x(), second_row.mapTo(
+                self.plotter, second_row.rect().topRight()).x())
+            for label in (first_row, second_row):
+                self.assertGreaterEqual(label.width() - label.indent(),
+                                        label.fontMetrics().horizontalAdvance(label.text()))
 
     def test_remote_control_layout_uses_two_top_rows(self):
         config_grid = self.plotter.layout().itemAt(0).layout()
