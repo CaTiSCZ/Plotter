@@ -93,6 +93,28 @@ class RemoteControlGuiTests(unittest.TestCase):
         self.assertFalse(hasattr(self.plotter, 'remote_control_apply'))
         self.assertFalse(hasattr(self.plotter, 'remote_control_status'))
 
+    def test_startup_remote_values_are_displayed_in_gui(self):
+        previous_enabled = scada.REMOTE_CONTROL_ENABLED
+        previous_address = scada.REMOTE_CONTROL_ADDR_PORT
+        manager = scada.DeviceManager()
+        plotter = None
+        try:
+            scada.REMOTE_CONTROL_ENABLED = True
+            scada.REMOTE_CONTROL_ADDR_PORT = '127.0.0.1:0'
+            plotter = scada.Plotter(manager)
+            self.assertTrue(plotter.remote_control_enabled.isChecked())
+            self.assertEqual(plotter.remote_control_addr.text(), '127.0.0.1:0')
+            self.assertFalse(plotter.remote_control_addr.isEnabled())
+            self.assertTrue(plotter._remote_server.running)
+        finally:
+            if plotter is not None:
+                plotter._remote_stop()
+                plotter.close()
+            else:
+                manager.shutdown()
+            scada.REMOTE_CONTROL_ENABLED = previous_enabled
+            scada.REMOTE_CONTROL_ADDR_PORT = previous_address
+
     def test_screenshot_endpoint_returns_full_window_png(self):
         self.plotter.resize(960, 640)
         self.plotter.show()

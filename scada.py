@@ -16,6 +16,7 @@ Features:
   - UDP I/O via selector-based asyncio loop (Windows compatible)
 """
 from __future__ import annotations
+import argparse
 import json
 import base64
 import logging
@@ -2856,7 +2857,9 @@ class Plotter(QWidget):
                 self.remote_control_enabled.blockSignals(True)
                 self.remote_control_enabled.setChecked(False)
                 self.remote_control_enabled.blockSignals(False)
-            self.remote_control_addr.setEnabled(True)
+                self.remote_control_addr.setEnabled(True)
+            else:
+                self.remote_control_addr.setEnabled(False)
 
     def closeEvent(self, event):
         self.remote_control_enabled.blockSignals(True)
@@ -5728,7 +5731,29 @@ class Plotter(QWidget):
         # After init, query the current system state, display it and react to it.
         QTimer(self).singleShot(len(init_fns) * 100, self._system_refresh_state)
 
+def _parse_cli_args(argv):
+    parser = argparse.ArgumentParser(description='Eaton FDDS SCADA')
+    parser.add_argument(
+        '--remote_control',
+        metavar='ADDR:PORT',
+        help='enable the remote-control HTTP API and bind it to ADDR:PORT, overriding default_settings.py',
+    )
+    options, remaining = parser.parse_known_args(argv[1:])
+    return options, [argv[0], *remaining]
+
+
+def _remote_control_startup_settings(settings, cli_address=None):
+    enabled = bool(getattr(settings, 'REMOTE_CONTROL_ENABLED', False))
+    address = str(getattr(settings, 'REMOTE_CONTROL_ADDR_PORT', REMOTE_CONTROL_ADDR_PORT))
+    token = str(getattr(settings, 'REMOTE_CONTROL_TOKEN', '') or '')
+    if cli_address is not None:
+        enabled = True
+        address = cli_address
+    return enabled, address, token
+
+
 def main(argv):
+    cli_options, qt_argv = _parse_cli_args(argv)
     with ExitStack() as stack:
         stack.enter_context(logging_:=logger.Logging())
 
@@ -5754,9 +5779,8 @@ def main(argv):
         # ISOMON is disabled by default: until it actually streams data, enabling it
         # would break the running-system status (a checked device with no data).
         ISOMON_ENABLED = bool(getattr(ds, 'ISOMON_ENABLED', False))
-        REMOTE_CONTROL_ENABLED = bool(getattr(ds, 'REMOTE_CONTROL_ENABLED', False))
-        REMOTE_CONTROL_ADDR_PORT = str(getattr(ds, 'REMOTE_CONTROL_ADDR_PORT', REMOTE_CONTROL_ADDR_PORT))
-        REMOTE_CONTROL_TOKEN = str(getattr(ds, 'REMOTE_CONTROL_TOKEN', '') or '')
+        REMOTE_CONTROL_ENABLED, REMOTE_CONTROL_ADDR_PORT, REMOTE_CONTROL_TOKEN = _remote_control_startup_settings(
+            ds, cli_options.remote_control)
         DEFAULT_AVG_LEN_MS = getattr(ds, 'DEFAULT_AVG_LEN_MS', 1000)
         DEFAULT_PRETRIGGER_MS = int(getattr(ds, 'DEFAULT_PRETRIGGER_MS', getattr(ds, 'DEFAULT_PRETRIGGER_PACKETS', 0)))
         # Fall back to DEFAULT_AVG_LEN_MS so behaviour is unchanged when the setting/file is absent.
@@ -5796,7 +5820,7 @@ def main(argv):
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling,True)
         QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps,True)
-        app=QApplication(argv)
+        app=QApplication(qt_argv)
         manager=DeviceManager(socket_backend=SOCKET_BACKEND, data_rcvbuf=DATA_SOCKET_RCVBUF_BYTES)
         gui=Plotter(manager)
         gui_log_handler = logger.CallbackHandler(sink_text=gui.log_signal.emit)
@@ -5820,7 +5844,7 @@ def main(argv):
         loop_thread.start()
         def autoinit():
             gui._update_defaults(DEFAULT_FIRST_IP + ':')
-            debug = len(argv) > 1 and argv[1] == "DEBUG"
+            debug = len(qt_argv) > 1 and qt_argv[1] == "DEBUG"
             for i, checkbox in enumerate(gui.device_checks):
                 if debug:
                     checkbox.setChecked(i in (0,))

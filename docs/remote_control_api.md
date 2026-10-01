@@ -12,6 +12,20 @@ The top-right configuration rows contain **Remote Control** with its **Enabled**
 
 At startup, `REMOTE_CONTROL_ENABLED` and `REMOTE_CONTROL_ADDR_PORT` are loaded from `default_settings.py`. Runtime GUI changes are temporary and are not written back to that file. The default bind is `127.0.0.1:8765`. `GET /api/v1/status` reports the active address while the listener is running. Port `0` asks the operating system for an available port; use the actual port returned by the status endpoint.
 
+The command line can explicitly enable the interface and override the bind address, regardless of `REMOTE_CONTROL_ENABLED` or `REMOTE_CONTROL_ADDR_PORT` in settings:
+
+```powershell
+python scada.py --remote_control 127.0.0.1:8765
+```
+
+For LAN binding, configure `REMOTE_CONTROL_TOKEN` in `default_settings.py` as usual:
+
+```powershell
+python scada.py --remote_control 192.168.1.25:8765
+```
+
+The selected address is shown in the GUI's Web addr:port field and the Enabled checkbox is checked. Other application arguments such as `DEBUG` are preserved.
+
 Base URL examples:
 
 ```text
