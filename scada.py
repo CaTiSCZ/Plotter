@@ -17,6 +17,7 @@ Features:
 """
 from __future__ import annotations
 import json
+import base64
 import logging
 import logger
 import importlib
@@ -39,7 +40,7 @@ from PyQt5.QtWidgets import (
     QPlainTextEdit, QSlider, QScrollArea, QRadioButton, QButtonGroup,
     QFileDialog, QMessageBox, QComboBox, QAbstractButton
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint, QObject
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint, QObject, QBuffer, QIODevice
 from PyQt5.QtGui import QFont, QFontMetrics, QTextDocument
 
 # Shared FDDS protocol core (vendored copy of the firmware repo's utils/fdds).
@@ -2967,6 +2968,27 @@ class Plotter(QWidget):
                 'captured_at': captured_at,
                 'widgets': [self._remote_widget_snapshot(widget_id, widget)
                             for widget_id, widget in registry.items()],
+            }
+        if operation == 'screenshot':
+            pixmap = self.grab()
+            buffer = QBuffer()
+            if not buffer.open(QIODevice.WriteOnly) or not pixmap.save(buffer, 'PNG'):
+                buffer.close()
+                raise RuntimeError('Could not capture the SCADA window as PNG')
+            png_bytes = bytes(buffer.data())
+            buffer.close()
+            if not png_bytes:
+                raise RuntimeError('SCADA window screenshot was empty')
+            return {
+                'captured_at': captured_at,
+                'mime_type': 'image/png',
+                'encoding': 'base64',
+                'width': pixmap.width(),
+                'height': pixmap.height(),
+                'logical_width': round(pixmap.width() / pixmap.devicePixelRatio()),
+                'logical_height': round(pixmap.height() / pixmap.devicePixelRatio()),
+                'device_pixel_ratio': pixmap.devicePixelRatio(),
+                'data': base64.b64encode(png_bytes).decode('ascii'),
             }
         if operation == 'status':
             return {

@@ -78,6 +78,10 @@ class RemoteControlServerTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(self.calls[-1][0], expected)
 
+        status, _ = self.request("/api/v1/screenshot")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.calls[-1][0], "screenshot")
+
     def test_plot_point_limit_is_validated(self):
         status, payload = self.request("/api/v1/plots?points=5001")
         self.assertEqual(status, 400)

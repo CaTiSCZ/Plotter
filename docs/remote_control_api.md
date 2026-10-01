@@ -102,6 +102,18 @@ Important object names include `remote_control_enabled`, `remote_control_addr_po
 
 Some Qt widgets do not have an explicit object name. Their IDs are generated from their current widget hierarchy. Treat every returned ID as opaque, use it exactly as returned, and rediscover it after application upgrades or UI changes. Labels, plots, and other read-only widgets have an empty `capabilities` list. Text widgets are truncated to the most recent 16 KiB in the snapshot.
 
+### `GET /api/v1/screenshot`
+
+Captures the complete visible client area of the main SCADA window, including its controls, plots, statistics and log pane. The capture runs on the GUI thread. The JSON `data` object contains `mime_type: "image/png"`, `encoding: "base64"`, physical PNG pixel `width`/`height`, Qt `logical_width`/`logical_height`, `device_pixel_ratio`, `captured_at`, and base64 `data`. Physical dimensions match the decoded PNG header; logical dimensions account for HiDPI scaling. Decode the data field to obtain the PNG file bytes. The screenshot covers the SCADA window only, not the desktop or operating-system title bar.
+
+```python
+import base64
+
+result = get("/api/v1/screenshot")["data"]
+with open("scada-window.png", "wb") as image_file:
+  image_file.write(base64.b64decode(result["data"]))
+```
+
 ### `GET /api/v1/live`
 
 Returns the latest per-device live snapshot: last DATA age, fault words and validity, analog values and validity. This is a point-in-time view, not a packet stream. Poll at a moderate rate (for example 2-10 Hz).

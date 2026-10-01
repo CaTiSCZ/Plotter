@@ -1,5 +1,6 @@
 """Offscreen integration test for the HTTP-to-Qt GUI bridge."""
 import json
+import base64
 import os
 import threading
 import time
@@ -91,6 +92,28 @@ class RemoteControlGuiTests(unittest.TestCase):
         self.assertEqual(config_grid.itemAtPosition(1, 8).widget().text(), 'Web addr:port')
         self.assertFalse(hasattr(self.plotter, 'remote_control_apply'))
         self.assertFalse(hasattr(self.plotter, 'remote_control_status'))
+
+    def test_screenshot_endpoint_returns_full_window_png(self):
+        self.plotter.resize(960, 640)
+        self.plotter.show()
+        self.app.processEvents()
+        expected_width = self.plotter.width()
+        expected_height = self.plotter.height()
+        status, response = self._request_on_gui_event_loop('/api/v1/screenshot')
+        self.assertEqual(status, 200)
+        image = response['data']
+        self.assertEqual(image['mime_type'], 'image/png')
+        self.assertEqual(image['encoding'], 'base64')
+        png = base64.b64decode(image['data'], validate=True)
+        self.assertTrue(png.startswith(b'\x89PNG\r\n\x1a\n'))
+        png_width = int.from_bytes(png[16:20], 'big')
+        png_height = int.from_bytes(png[20:24], 'big')
+        self.assertEqual(image['width'], png_width)
+        self.assertEqual(image['height'], png_height)
+        self.assertEqual(image['logical_width'], expected_width)
+        self.assertEqual(image['logical_height'], expected_height)
+        self.assertGreaterEqual(image['device_pixel_ratio'], 1)
+        self.assertGreater(len(png), 1000)
 
     def test_measurement_routes_and_log_route_are_exposed(self):
         status, live = self._request_on_gui_event_loop('/api/v1/live')

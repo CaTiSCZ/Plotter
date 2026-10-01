@@ -141,6 +141,8 @@ class RemoteControlServer:
                         path = parsed.path
                         if method == "GET" and path == f"{API_PREFIX}/ui/state":
                             operation, arguments = "ui_state", {}
+                        elif method == "GET" and path == f"{API_PREFIX}/screenshot":
+                            operation, arguments = "screenshot", {}
                         elif method == "GET" and path == f"{API_PREFIX}/statistics":
                             operation, arguments = "statistics", {}
                         elif method == "GET" and path == f"{API_PREFIX}/live":
