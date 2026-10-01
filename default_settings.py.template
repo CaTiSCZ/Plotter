@@ -17,4 +17,4 @@ FIREWALL_KEEPALIVE_TIMEOUT_S = 25 ## firewall idle-close timeout (s); SCADA re-p
 USE_OPENGL = False ## render plot curves with OpenGL (GPU); can be much faster for very large traces but requires a working OpenGL driver (PyOpenGL). Leave False to use the default CPU painter.
 REMOTE_CONTROL_ENABLED = False ## start the optional HTTP control interface on application launch
 REMOTE_CONTROL_ADDR_PORT = '127.0.0.1:8765' ## IPv4 bind address and port; can be changed from the GUI without restarting SCADA
-REMOTE_CONTROL_TOKEN = '' ## bearer token; required for non-loopback binds and used for every API request when configured
+REMOTE_CONTROL_TOKEN = '' ## bearer token; required for non-loopback binds and used for every API request when configured (may also be overridden with --remote_control_token)

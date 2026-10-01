@@ -2516,6 +2516,12 @@ class Plotter(QWidget):
         self.remote_control_addr.setPlaceholderText('127.0.0.1:8765')
         self.remote_control_addr.setEnabled(not REMOTE_CONTROL_ENABLED)
         cfg.addWidget(self.remote_control_addr, 1, 9)
+        cfg.addWidget(QLabel('Token'), 1, 10)
+        self.remote_control_token = QLineEdit(REMOTE_CONTROL_TOKEN)
+        self.remote_control_token.setObjectName('remote_control_token')
+        self.remote_control_token.setMaxLength(1024)
+        self.remote_control_token.setToolTip('Bearer token for HTTP API authentication; changes apply when editing is finished.')
+        cfg.addWidget(self.remote_control_token, 1, 11)
 
         cfg.addWidget(QLabel('Receiver addr:port'), 2, 8)
         self.receiver_edit = QLineEdit(f'0.0.0.0:{DEFAULT_DATA_PORT}')
@@ -2845,12 +2851,14 @@ class Plotter(QWidget):
 
         self._remote_bridge = RemoteControlBridge(self._remote_dispatch_gui, self)
         self._remote_shutdown_pending = False
+        self._remote_token = REMOTE_CONTROL_TOKEN
         self._remote_server = RemoteControlServer(
             self._remote_bridge.dispatch,
-            token=REMOTE_CONTROL_TOKEN,
+            token=self._remote_token,
             logger=self._logger,
         )
         self.remote_control_enabled.toggled.connect(self._remote_toggle)
+        self.remote_control_token.editingFinished.connect(self._remote_update_token)
         self.remote_control_addr.setEnabled(not self.remote_control_enabled.isChecked())
         if REMOTE_CONTROL_ENABLED:
             if not self._remote_start(self.remote_control_addr.text()):
@@ -2898,6 +2906,20 @@ class Plotter(QWidget):
         else:
             self._remote_stop()
             self.remote_control_addr.setEnabled(True)
+
+    def _remote_update_token(self):
+        new_token = self.remote_control_token.text()
+        try:
+            self._remote_server.set_token(new_token)
+        except ValueError as exc:
+            self.remote_control_token.setText(self._remote_token)
+            self.remote_control_token.setToolTip(str(exc))
+            self._logger.error(f'Remote Control token update rejected: {exc}')
+            return False
+        self._remote_token = new_token
+        self.remote_control_token.setToolTip('Bearer token for HTTP API authentication; current value is active.')
+        self._logger.info('Remote Control bearer token updated.')
+        return True
 
     def _remote_widget_registry(self):
         registry = {'window': self}
@@ -2950,7 +2972,11 @@ class Plotter(QWidget):
         if isinstance(widget, QAbstractButton):
             state.update(text=widget.text(), checkable=widget.isCheckable(), checked=widget.isChecked())
         elif isinstance(widget, QLineEdit):
-            state.update(text=widget.text(), read_only=widget.isReadOnly(), placeholder=widget.placeholderText())
+            if widget is self.remote_control_token:
+                state.update(text='********' if self._remote_token else '',
+                             configured=bool(self._remote_token), read_only=widget.isReadOnly())
+            else:
+                state.update(text=widget.text(), read_only=widget.isReadOnly(), placeholder=widget.placeholderText())
         elif isinstance(widget, QComboBox):
             state.update(current_index=widget.currentIndex(), current_text=widget.currentText(),
                          items=[widget.itemText(i) for i in range(min(widget.count(), 256))])
@@ -3173,6 +3199,8 @@ class Plotter(QWidget):
             if not isinstance(value, str) or len(value) > 4096:
                 raise APIError(400, 'invalid_value', 'text must be a string of at most 4096 characters')
             widget.setText(value)
+            if widget is self.remote_control_token and not self._remote_update_token():
+                raise APIError(409, 'token_update_rejected', 'The token change violates the active bind security requirements')
         elif action == 'set_value' and action in capabilities:
             value = arguments.get('value')
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -5738,17 +5766,24 @@ def _parse_cli_args(argv):
         metavar='ADDR:PORT',
         help='enable the remote-control HTTP API and bind it to ADDR:PORT, overriding default_settings.py',
     )
+    parser.add_argument(
+        '--remote_control_token',
+        metavar='TOKEN',
+        help='set or replace the HTTP API bearer token, overriding REMOTE_CONTROL_TOKEN in default_settings.py',
+    )
     options, remaining = parser.parse_known_args(argv[1:])
     return options, [argv[0], *remaining]
 
 
-def _remote_control_startup_settings(settings, cli_address=None):
+def _remote_control_startup_settings(settings, cli_address=None, cli_token=None):
     enabled = bool(getattr(settings, 'REMOTE_CONTROL_ENABLED', False))
     address = str(getattr(settings, 'REMOTE_CONTROL_ADDR_PORT', REMOTE_CONTROL_ADDR_PORT))
     token = str(getattr(settings, 'REMOTE_CONTROL_TOKEN', '') or '')
     if cli_address is not None:
         enabled = True
         address = cli_address
+    if cli_token is not None:
+        token = cli_token
     return enabled, address, token
 
 
@@ -5780,7 +5815,7 @@ def main(argv):
         # would break the running-system status (a checked device with no data).
         ISOMON_ENABLED = bool(getattr(ds, 'ISOMON_ENABLED', False))
         REMOTE_CONTROL_ENABLED, REMOTE_CONTROL_ADDR_PORT, REMOTE_CONTROL_TOKEN = _remote_control_startup_settings(
-            ds, cli_options.remote_control)
+            ds, cli_options.remote_control, cli_options.remote_control_token)
         DEFAULT_AVG_LEN_MS = getattr(ds, 'DEFAULT_AVG_LEN_MS', 1000)
         DEFAULT_PRETRIGGER_MS = int(getattr(ds, 'DEFAULT_PRETRIGGER_MS', getattr(ds, 'DEFAULT_PRETRIGGER_PACKETS', 0)))
         # Fall back to DEFAULT_AVG_LEN_MS so behaviour is unchanged when the setting/file is absent.

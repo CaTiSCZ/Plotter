@@ -36,6 +36,8 @@ class RemoteControlServer:
         self._logger = logger or logging.getLogger(__name__)
         self._server = None
         self._thread = None
+        self._auth_state = None
+        self._auth_lock = threading.Lock()
         self._lock = threading.RLock()
 
     @staticmethod
@@ -59,6 +61,18 @@ class RemoteControlServer:
         with self._lock:
             return self._server is not None
 
+    def set_token(self, token: str):
+        token = str(token or '')
+        with self._lock:
+            if self._server is not None:
+                host = self._server.server_address[0]
+                if not self._is_loopback_or_unspecified(host) and not token:
+                    raise ValueError('A bearer token is required for non-loopback binds')
+            self._token = token
+            if self._auth_state is not None:
+                with self._auth_lock:
+                    self._auth_state['token'] = token
+
     def start(self, address: str):
         host, separator, port_text = str(address).strip().rpartition(":")
         if not separator or not host or not port_text.isdigit():
@@ -78,7 +92,7 @@ class RemoteControlServer:
             if self._server is not None:
                 raise RuntimeError("HTTP server is already running")
             dispatcher = self._dispatcher
-            token = self._token
+            auth_state = {'token': self._token}
             logger = self._logger
             request_slots = threading.BoundedSemaphore(8)
 
@@ -103,10 +117,12 @@ class RemoteControlServer:
                     self.wfile.write(body)
 
                 def _authorized(self):
-                    if not token:
+                    with self_outer._auth_lock:
+                        expected_token = auth_state['token']
+                    if not expected_token:
                         return True
                     scheme, _, supplied = self.headers.get("Authorization", "").partition(" ")
-                    return scheme.lower() == "bearer" and hmac.compare_digest(supplied, token)
+                    return scheme.lower() == "bearer" and hmac.compare_digest(supplied, expected_token)
 
                 def _read_json(self):
                     raw_length = self.headers.get("Content-Length", "0")
@@ -229,6 +245,7 @@ class RemoteControlServer:
                 def do_POST(self):
                     self._handle_request("POST")
 
+            self_outer = self
             server = ThreadingHTTPServer((host, port), Handler)
             server.daemon_threads = True
             server_thread = threading.Thread(
@@ -239,6 +256,7 @@ class RemoteControlServer:
             )
             self._server = server
             self._thread = server_thread
+            self._auth_state = auth_state
             server_thread.start()
             return self.address
 
@@ -249,6 +267,7 @@ class RemoteControlServer:
                 return
             self._server = None
             self._thread = None
+            self._auth_state = None
         server.shutdown()
         server.server_close()
         if thread is not threading.current_thread():

@@ -62,6 +62,14 @@ class RemoteControlServerTests(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "unauthorized")
         self.assertEqual(self.calls, [])
 
+    def test_token_can_be_changed_while_server_is_running(self):
+        self.server.set_token('replacement-token')
+        status, payload = self.request('/api/v1/status', token='test-token')
+        self.assertEqual(status, 401)
+        self.assertEqual(payload['error']['code'], 'unauthorized')
+        status, payload = self.request('/api/v1/status', token='replacement-token')
+        self.assertEqual(status, 200)
+
     def test_log_tail_is_validated(self):
         status, payload = self.request("/api/v1/log?tail=1001")
         self.assertEqual(status, 400)

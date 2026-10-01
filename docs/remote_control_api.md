@@ -12,19 +12,18 @@ The top-right configuration rows contain **Remote Control** with its **Enabled**
 
 At startup, `REMOTE_CONTROL_ENABLED` and `REMOTE_CONTROL_ADDR_PORT` are loaded from `default_settings.py`. Runtime GUI changes are temporary and are not written back to that file. The default bind is `127.0.0.1:8765`. `GET /api/v1/status` reports the active address while the listener is running. Port `0` asks the operating system for an available port; use the actual port returned by the status endpoint.
 
-The command line can explicitly enable the interface and override the bind address, regardless of `REMOTE_CONTROL_ENABLED` or `REMOTE_CONTROL_ADDR_PORT` in settings:
+The command line can explicitly enable the interface and override the bind address, regardless of `REMOTE_CONTROL_ENABLED` or `REMOTE_CONTROL_ADDR_PORT` in settings. A second optional argument overrides the configured bearer token:
 
 ```powershell
 python scada.py --remote_control 127.0.0.1:8765
+python scada.py --remote_control 192.168.1.25:8765 --remote_control_token "choose-a-secret"
 ```
 
-For LAN binding, configure `REMOTE_CONTROL_TOKEN` in `default_settings.py` as usual:
+The token is also shown in the GUI's **Token** field, immediately to the right of **Web addr:port**. Editing the field and pressing Enter or moving focus applies the new token immediately, including while the listener is running. If the active listener is bound beyond loopback, clearing the token is rejected. The token field is editable through the widget API, but its value is redacted in `/api/v1/ui/state`. The full-window screenshot naturally displays whatever is visible in the GUI.
 
-```powershell
-python scada.py --remote_control 192.168.1.25:8765
-```
+Command-line tokens can be visible in process listings and shell history; for persistent or shared setups prefer a protected `REMOTE_CONTROL_TOKEN` setting. LAN binding still requires a non-empty token, whether it comes from settings or CLI.
 
-The selected address is shown in the GUI's Web addr:port field and the Enabled checkbox is checked. Other application arguments such as `DEBUG` are preserved.
+The selected address and token are shown in the GUI and the Enabled checkbox is checked when `--remote_control` is supplied. Other application arguments such as `DEBUG` are preserved. Supplying only `--remote_control_token` replaces the configured token without forcing the interface on.
 
 Base URL examples:
 
@@ -39,7 +38,7 @@ Only IPv4 bind addresses are supported. Binding to a non-loopback address, inclu
 Authorization: Bearer <REMOTE_CONTROL_TOKEN>
 ```
 
-The listener uses plain HTTP; bearer credentials and responses are not encrypted. Use a trusted isolated network or a VPN and firewall rules for LAN access. Do not expose the port to an untrusted network. The token is never included in API responses.
+The listener uses plain HTTP; bearer credentials and responses are not encrypted. Use a trusted isolated network or a VPN and firewall rules for LAN access. Do not expose the port to an untrusted network. The token is redacted from normal API state responses; the screenshot endpoint captures the token exactly as displayed in the GUI.
 
 All responses set `Cache-Control: no-store`. There is no CORS support. Requests are not persisted across application restarts.
 
@@ -112,7 +111,7 @@ Example descriptor:
 }
 ```
 
-Important object names include `remote_control_enabled`, `remote_control_addr_port`, `receiver_addr_port`, `measurement_number`, `apply_device_list`, `apply_config`, `start_system`, `stop_system`, `system_status`, `pretrigger_ms`, `posttrigger_ms`, `start_sampling`, `start_sampling_on_trigger`, `save_measurement`, `save_calibration`, `force_trigger`, `reset_counter`, `reset_latched_faults`, `reset_devices`, `downsample_mode`, `downsample_factor`, `clip_to_view`, `statistics`, `log_visible`, and `log_output`. Device-row controls use names such as `device_0_enabled`, `device_0_address`, `device_0_leader`, `device_0_clock`, `device_0_trigger`, and `device_0_trigger_holdoff_us`; ISOMON controls use `isomon_*` names.
+Important object names include `remote_control_enabled`, `remote_control_addr_port`, `remote_control_token`, `receiver_addr_port`, `measurement_number`, `apply_device_list`, `apply_config`, `start_system`, `stop_system`, `system_status`, `pretrigger_ms`, `posttrigger_ms`, `start_sampling`, `start_sampling_on_trigger`, `save_measurement`, `save_calibration`, `force_trigger`, `reset_counter`, `reset_latched_faults`, `reset_devices`, `downsample_mode`, `downsample_factor`, `clip_to_view`, `statistics`, `log_visible`, and `log_output`. The token widget reports only a masked value and a `configured` boolean. Device-row controls use names such as `device_0_enabled`, `device_0_address`, `device_0_leader`, `device_0_clock`, `device_0_trigger`, and `device_0_trigger_holdoff_us`; ISOMON controls use `isomon_*` names.
 
 Some Qt widgets do not have an explicit object name. Their IDs are generated from their current widget hierarchy. Treat every returned ID as opaque, use it exactly as returned, and rediscover it after application upgrades or UI changes. Labels, plots, and other read-only widgets have an empty `capabilities` list. Text widgets are truncated to the most recent 16 KiB in the snapshot.
 

@@ -72,6 +72,8 @@ class RemoteControlGuiTests(unittest.TestCase):
         widgets = {widget['id']: widget for widget in snapshot['data']['widgets']}
         self.assertIn('remote_control_enabled', widgets)
         self.assertIn('remote_control_addr_port', widgets)
+        self.assertIn('remote_control_token', widgets)
+        self.assertTrue(widgets['remote_control_token']['configured'] is False)
         self.assertFalse(widgets['remote_control_addr_port']['enabled'])
         self.assertIn('statistics', widgets)
         self.assertIn('log_output', widgets)
@@ -83,29 +85,46 @@ class RemoteControlGuiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(updated['data']['value'], 123)
         self.assertEqual(self.plotter.sample_spin.value(), 123)
+        status, token = self._request_on_gui_event_loop(
+            '/api/v1/widgets/remote_control_token', method='POST',
+            body={'action': 'set_text', 'text': 'api-token'})
+        self.assertEqual(status, 200)
+        self.assertEqual(token['data']['text'], '********')
+        self.assertEqual(self.plotter._remote_server._token, 'api-token')
 
     def test_remote_control_layout_uses_two_top_rows(self):
         config_grid = self.plotter.layout().itemAt(0).layout()
         self.assertEqual(config_grid.getItemPosition(config_grid.indexOf(self.plotter.remote_control_enabled))[:2], (0, 9))
         self.assertEqual(config_grid.getItemPosition(config_grid.indexOf(self.plotter.remote_control_addr))[:2], (1, 9))
+        self.assertEqual(config_grid.getItemPosition(config_grid.indexOf(self.plotter.remote_control_token))[:2], (1, 11))
         self.assertEqual(config_grid.itemAtPosition(0, 8).widget().text(), 'Remote Control')
         self.assertEqual(config_grid.itemAtPosition(1, 8).widget().text(), 'Web addr:port')
+        self.assertEqual(config_grid.itemAtPosition(1, 10).widget().text(), 'Token')
         self.assertFalse(hasattr(self.plotter, 'remote_control_apply'))
         self.assertFalse(hasattr(self.plotter, 'remote_control_status'))
 
     def test_startup_remote_values_are_displayed_in_gui(self):
         previous_enabled = scada.REMOTE_CONTROL_ENABLED
         previous_address = scada.REMOTE_CONTROL_ADDR_PORT
+        previous_token = scada.REMOTE_CONTROL_TOKEN
         manager = scada.DeviceManager()
         plotter = None
         try:
             scada.REMOTE_CONTROL_ENABLED = True
             scada.REMOTE_CONTROL_ADDR_PORT = '127.0.0.1:0'
+            scada.REMOTE_CONTROL_TOKEN = 'startup-token'
             plotter = scada.Plotter(manager)
             self.assertTrue(plotter.remote_control_enabled.isChecked())
             self.assertEqual(plotter.remote_control_addr.text(), '127.0.0.1:0')
+            self.assertEqual(plotter.remote_control_token.text(), 'startup-token')
             self.assertFalse(plotter.remote_control_addr.isEnabled())
             self.assertTrue(plotter._remote_server.running)
+            plotter.remote_control_token.setText('runtime-token')
+            self.assertTrue(plotter._remote_update_token())
+            self.assertEqual(plotter._remote_server._token, 'runtime-token')
+            token_snapshot = plotter._remote_widget_snapshot(
+                'remote_control_token', plotter.remote_control_token)
+            self.assertEqual(token_snapshot['text'], '********')
         finally:
             if plotter is not None:
                 plotter._remote_stop()
@@ -114,6 +133,7 @@ class RemoteControlGuiTests(unittest.TestCase):
                 manager.shutdown()
             scada.REMOTE_CONTROL_ENABLED = previous_enabled
             scada.REMOTE_CONTROL_ADDR_PORT = previous_address
+            scada.REMOTE_CONTROL_TOKEN = previous_token
 
     def test_screenshot_endpoint_returns_full_window_png(self):
         self.plotter.resize(960, 640)
