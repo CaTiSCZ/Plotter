@@ -154,6 +154,10 @@ Stops sampling on applied devices using the GUI's sampling-stop workflow. The re
 
 Saves the current measurement using the GUI measurement number and existing `RICE_mereni/NNNN_devX.csv` naming. On success, the measurement number increments and the response contains the written file paths. Saving an empty capture or an invalid measurement number returns an error instead of opening a modal dialog.
 
+### `POST /api/v1/application/shutdown`
+
+Requests a graceful shutdown of the entire SCADA application. The endpoint returns `200` with `{"accepted": true, "delay_ms": 500}` first, then closes the main window through its normal Qt close handler and calls `QApplication.quit()`. The normal close handler stops the HTTP listener and shuts down the UDP/device manager. The short delay allows the HTTP response to reach the caller. This is a destructive process-level action; use it only after debugging is complete. The request uses the same bearer-token requirements as every other API call.
+
 ## Widget Actions
 
 ### `POST /api/v1/widgets/{widget_id}`

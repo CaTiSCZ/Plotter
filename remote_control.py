@@ -173,6 +173,8 @@ class RemoteControlServer:
                             operation, arguments = "measurement_stop", {}
                         elif method == "POST" and path == f"{API_PREFIX}/measurement/save":
                             operation, arguments = "measurement_save", {}
+                        elif method == "POST" and path == f"{API_PREFIX}/application/shutdown":
+                            operation, arguments = "application_shutdown", {}
                         elif method == "POST" and path == f"{API_PREFIX}/plots/view":
                             operation, arguments = "plots_view", self._read_json()
                         elif method == "POST" and path.startswith(f"{API_PREFIX}/widgets/"):

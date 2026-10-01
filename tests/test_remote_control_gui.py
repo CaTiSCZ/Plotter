@@ -115,6 +115,20 @@ class RemoteControlGuiTests(unittest.TestCase):
         self.assertGreaterEqual(image['device_pixel_ratio'], 1)
         self.assertGreater(len(png), 1000)
 
+    def test_shutdown_endpoint_acknowledges_then_closes_window(self):
+        self.plotter.show()
+        self.app.processEvents()
+        status, response = self._request_on_gui_event_loop('/api/v1/application/shutdown', method='POST')
+        self.assertEqual(status, 200)
+        self.assertTrue(response['data']['accepted'])
+        self.assertEqual(response['data']['delay_ms'], 500)
+
+        deadline = time.monotonic() + 2
+        while self.plotter.isVisible() and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.assertFalse(self.plotter.isVisible())
+
     def test_measurement_routes_and_log_route_are_exposed(self):
         status, live = self._request_on_gui_event_loop('/api/v1/live')
         self.assertEqual(status, 200)

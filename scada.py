@@ -2843,6 +2843,7 @@ class Plotter(QWidget):
         self.manager.set_trigger_signal(self.trigger_received)
 
         self._remote_bridge = RemoteControlBridge(self._remote_dispatch_gui, self)
+        self._remote_shutdown_pending = False
         self._remote_server = RemoteControlServer(
             self._remote_bridge.dispatch,
             token=REMOTE_CONTROL_TOKEN,
@@ -3027,6 +3028,11 @@ class Plotter(QWidget):
             return {'accepted': True}
         if operation == 'measurement_save':
             return {'files': self._save_measurement(show_dialog=False)}
+        if operation == 'application_shutdown':
+            if not self._remote_shutdown_pending:
+                self._remote_shutdown_pending = True
+                QTimer.singleShot(500, self._remote_shutdown_application)
+            return {'accepted': True, 'delay_ms': 500}
         if operation == 'statistics':
             document = QTextDocument()
             document.setHtml(self.error_lbl.text())
@@ -3058,6 +3064,12 @@ class Plotter(QWidget):
         if operation == 'widget_action':
             return self._remote_apply_widget_action(arguments)
         raise APIError(404, 'unknown_operation', f'Unknown operation: {operation}')
+
+    def _remote_shutdown_application(self):
+        self.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def _remote_plot_snapshot(self, point_limit):
         plot_items = {

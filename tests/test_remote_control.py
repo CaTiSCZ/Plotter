@@ -72,6 +72,7 @@ class RemoteControlServerTests(unittest.TestCase):
             ("/api/v1/measurement/start", "measurement_start"),
             ("/api/v1/measurement/stop", "measurement_stop"),
             ("/api/v1/measurement/save", "measurement_save"),
+            ("/api/v1/application/shutdown", "application_shutdown"),
             ("/api/v1/plots/view", "plots_view"),
         ):
             status, _ = self.request(path, method="POST", body={})
