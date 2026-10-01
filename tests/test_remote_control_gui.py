@@ -113,6 +113,34 @@ class RemoteControlGuiTests(unittest.TestCase):
             self.assertEqual(field.width(), device_address.width())
         self.assertEqual(config_grid.getItemPosition(config_grid.indexOf(isomon_values))[3], 3)
 
+    def test_isomon_live_values_fit_fhd_and_restore_full_font(self):
+        ip = '127.0.0.2'
+        self.plotter.device_edits[scada.ISOMON_DEVICE_INDEX].setText(f'{ip}:10578')
+        self.manager.add_device(ip)
+        device = self.manager.devices[ip]
+        device.is_isomon = True
+        device.iso_live_valid = True
+        device.iso_live_values = {field: -9_999_999.0 for field in (
+            'u1_baseline', 'u2_baseline', 'u1_s2', 'u2_s2', 'u1_s3', 'u2_s3',
+            'r1_via_r3', 'r2_via_r3', 'r1_via_r4', 'r2_via_r4')}
+        self.plotter._refresh_analog_values()
+        first_row = self.plotter.device_analog_value_labels[scada.ISOMON_DEVICE_INDEX][2]
+        second_row = self.plotter.isomon_iso_row2_lbl
+
+        for width, expected_font in ((1920, '16px'), (3800, '16px'), (1920, '16px')):
+            self.plotter.resize(width, 800)
+            self.plotter.show()
+            self.app.processEvents()
+            self.assertLessEqual(self.plotter.width(), width)
+            for label in (first_row, second_row):
+                self.assertLessEqual(label.mapTo(self.plotter, label.rect().topRight()).x(), width - 10)
+                self.assertGreaterEqual(label.width() - label.indent(),
+                                        label.fontMetrics().horizontalAdvance(label.text()))
+                if width == 3800:
+                    self.assertIn(expected_font, label.styleSheet())
+                else:
+                    self.assertNotIn(expected_font, label.styleSheet())
+
     def test_remote_control_layout_uses_two_top_rows(self):
         config_grid = self.plotter.layout().itemAt(0).layout()
         self.assertEqual(config_grid.getItemPosition(config_grid.indexOf(self.plotter.remote_control_enabled))[:2], (0, 9))
