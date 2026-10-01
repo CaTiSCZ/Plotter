@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 import scada
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QPushButton
 from remote_control import RemoteControlServer
 
 
@@ -96,10 +96,27 @@ class RemoteControlGuiTests(unittest.TestCase):
         config_grid = self.plotter.layout().itemAt(0).layout()
         self.assertEqual(config_grid.getItemPosition(config_grid.indexOf(self.plotter.remote_control_enabled))[:2], (0, 9))
         self.assertEqual(config_grid.getItemPosition(config_grid.indexOf(self.plotter.remote_control_addr))[:2], (1, 9))
-        self.assertEqual(config_grid.getItemPosition(config_grid.indexOf(self.plotter.remote_control_token))[:2], (1, 11))
+        token_position = config_grid.getItemPosition(config_grid.indexOf(self.plotter.remote_control_token))
+        self.assertEqual(token_position[:2], (2, 9))
+        self.assertEqual(token_position[3], 3)
         self.assertEqual(config_grid.itemAtPosition(0, 8).widget().text(), 'Remote Control')
         self.assertEqual(config_grid.itemAtPosition(1, 8).widget().text(), 'Web addr:port')
-        self.assertEqual(config_grid.itemAtPosition(1, 10).widget().text(), 'Token')
+        self.assertEqual(config_grid.itemAtPosition(2, 8).widget().text(), 'Token')
+        self.assertEqual(config_grid.itemAtPosition(3, 8).widget().text(), 'Receiver addr:port')
+        self.assertEqual(config_grid.itemAtPosition(4, 8).widget().text(), 'Measurement number')
+        self.assertEqual(config_grid.indexOf(self.plotter.save_calibration_btn), -1)
+        button_row = self.plotter.layout().itemAt(1).layout()
+        action_order = (
+            'start_sampling', 'start_sampling_on_trigger', 'force_trigger',
+            'save_measurement', 'save_calibration', 'reset_counter',
+            'reset_latched_faults', 'reset_devices',
+        )
+        button_indices = [
+            button_row.indexOf(self.plotter.findChild(QPushButton, name))
+            for name in action_order
+        ]
+        self.assertTrue(all(index >= 0 for index in button_indices))
+        self.assertEqual(button_indices, sorted(button_indices))
         self.assertFalse(hasattr(self.plotter, 'remote_control_apply'))
         self.assertFalse(hasattr(self.plotter, 'remote_control_status'))
 

@@ -2516,27 +2516,22 @@ class Plotter(QWidget):
         self.remote_control_addr.setPlaceholderText('127.0.0.1:8765')
         self.remote_control_addr.setEnabled(not REMOTE_CONTROL_ENABLED)
         cfg.addWidget(self.remote_control_addr, 1, 9)
-        cfg.addWidget(QLabel('Token'), 1, 10)
+        cfg.addWidget(QLabel('Token'), 2, 8)
         self.remote_control_token = QLineEdit(REMOTE_CONTROL_TOKEN)
         self.remote_control_token.setObjectName('remote_control_token')
         self.remote_control_token.setMaxLength(1024)
         self.remote_control_token.setToolTip('Bearer token for HTTP API authentication; changes apply when editing is finished.')
-        cfg.addWidget(self.remote_control_token, 1, 11)
+        cfg.addWidget(self.remote_control_token, 2, 9, 1, 3)
 
-        cfg.addWidget(QLabel('Receiver addr:port'), 2, 8)
+        cfg.addWidget(QLabel('Receiver addr:port'), 3, 8)
         self.receiver_edit = QLineEdit(f'0.0.0.0:{DEFAULT_DATA_PORT}')
         self.receiver_edit.setObjectName('receiver_addr_port')
-        cfg.addWidget(self.receiver_edit, 2, 9)
+        cfg.addWidget(self.receiver_edit, 3, 9)
 
-        cfg.addWidget(QLabel('Measurement number'), 3, 8)
+        cfg.addWidget(QLabel('Measurement number'), 4, 8)
         self.measurement_number_edit = QLineEdit(f'0')
         self.measurement_number_edit.setObjectName('measurement_number')
-        cfg.addWidget(self.measurement_number_edit, 3, 9)
-
-        self.save_calibration_btn = QPushButton('Save calibration')
-        self.save_calibration_btn.setObjectName('save_calibration')
-        cfg.addWidget(self.save_calibration_btn, 4, 9)
-        self.save_calibration_btn.clicked.connect(self._save_calibration_bundle)
+        cfg.addWidget(self.measurement_number_edit, 4, 9)
 
         self.apply_btn = QPushButton('Apply Device List')
         self.apply_btn.setObjectName('apply_device_list')
@@ -2667,8 +2662,9 @@ class Plotter(QWidget):
         self.start_sampling_trigger_btn.clicked.connect(self._start_new_sampling_on_trigger)
         btns.addWidget(self.start_sampling_trigger_btn)
 
-        for label, object_name, fn in (('Save Measurement', 'save_measurement', self.save_measurement),
-                  ('Force trigger', 'force_trigger', self._force_trigger),
+        for label, object_name, fn in (('Force trigger', 'force_trigger', self._force_trigger),
+              ('Save Measurement', 'save_measurement', self.save_measurement),
+              ('Save calibration', 'save_calibration', self._save_calibration_bundle),
                           #('Stop Sampling'                  , self._stop_sampling                   ),
                           ('Reset Counter', 'reset_counter', self._reset_counter),
                           ('Reset Latched Faults', 'reset_latched_faults', self._reset_fault_state),
@@ -2681,6 +2677,8 @@ class Plotter(QWidget):
             b.setObjectName(object_name)
             b.clicked.connect(fn)
             btns.addWidget(b)
+            if object_name == 'save_calibration':
+                self.save_calibration_btn = b
 
         # Plot downsampling / rendering controls. setDownsampling(ds, auto, mode)
         # reduces how many points pyqtgraph actually draws each frame, the dominant

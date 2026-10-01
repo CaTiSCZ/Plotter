@@ -19,11 +19,11 @@ python scada.py --remote_control 127.0.0.1:8765
 python scada.py --remote_control 192.168.1.25:8765 --remote_control_token "choose-a-secret"
 ```
 
-The token is also shown in the GUI's **Token** field, immediately to the right of **Web addr:port**. Editing the field and pressing Enter or moving focus applies the new token immediately, including while the listener is running. If the active listener is bound beyond loopback, clearing the token is rejected. The token field is editable through the widget API, but its value is redacted in `/api/v1/ui/state`. The full-window screenshot naturally displays whatever is visible in the GUI.
+The token is also shown in the GUI's **Token** field on the row below **Web addr:port**. Editing the field and pressing Enter or moving focus applies the new token immediately, including while the listener is running. If the active listener is bound beyond loopback, clearing the token is rejected. The token field is editable through the widget API, but its value is redacted in `/api/v1/ui/state`. The full-window screenshot naturally displays whatever is visible in the GUI.
 
 Command-line tokens can be visible in process listings and shell history; for persistent or shared setups prefer a protected `REMOTE_CONTROL_TOKEN` setting. LAN binding still requires a non-empty token, whether it comes from settings or CLI.
 
-The selected address and token are shown in the GUI and the Enabled checkbox is checked when `--remote_control` is supplied. Other application arguments such as `DEBUG` are preserved. Supplying only `--remote_control_token` replaces the configured token without forcing the interface on.
+The selected address and token are shown in the GUI and the Enabled checkbox is checked when `--remote_control` is supplied. Other application arguments such as `DEBUG` are preserved. Supplying only `--remote_control_token` replaces the configured token without forcing the interface on. The bottom-row action buttons appear in this order: Start New Sampling, Start New Sampling on trigger, Force trigger, Save Measurement, Save calibration, Reset Counter, then the remaining controls.
 
 Base URL examples:
 
