@@ -42,6 +42,37 @@ The listener uses plain HTTP; bearer credentials and responses are not encrypted
 
 All responses set `Cache-Control: no-store`. There is no CORS support. Requests are not persisted across application restarts.
 
+## Launching Remotely over SSH (`start_remote.ps1`)
+
+SCADA is a PyQt GUI application; it cannot render inside a headless SSH session, so it must run on the machine's interactive desktop session. `start_remote.ps1` (next to `scada.py`) bridges this gap: it registers a Windows Scheduled Task with an **Interactive** logon type, which launches `scada.py` on the real desktop session, with `--remote_control` forcing the HTTP API on regardless of `default_settings.py`. Once started, use the REST endpoints below from the SSH shell instead of interacting with the window directly.
+
+```powershell
+# Start SCADA (creates/launches the "FDDS_Scada" scheduled task) and wait for the API to come up
+powershell -ExecutionPolicy Bypass -File start_remote.ps1
+powershell -ExecutionPolicy Bypass -File start_remote.ps1 -Action start
+
+# Print GET /api/v1/status, or report that SCADA is unreachable
+powershell -ExecutionPolicy Bypass -File start_remote.ps1 -Action status
+
+# Request a graceful shutdown (POST /api/v1/application/shutdown) and remove the scheduled task
+powershell -ExecutionPolicy Bypass -File start_remote.ps1 -Action stop
+
+# stop followed by start
+powershell -ExecutionPolicy Bypass -File start_remote.ps1 -Action restart
+```
+
+Parameters:
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `-Action` | `start` | One of `start`, `stop`, `restart`, `status` |
+| `-ApiAddress` | `127.0.0.1:8765` | Passed to `--remote_control`; also the address the script polls to detect readiness |
+| `-ApiToken` | *(empty)* | Passed to `--remote_control_token`; required only for non-loopback `-ApiAddress` values |
+
+`start` is idempotent: if `GET /api/v1/status` already responds at `-ApiAddress`, the task is not recreated. `start` polls the status endpoint for up to 20 seconds after launching the task; a timeout usually means Python/PyQt failed in the interactive session (check Task Scheduler's history for task `FDDS_Scada`) rather than an API problem. `stop` tries the graceful HTTP shutdown first so the GUI closes its sockets/log file cleanly, then unregisters the scheduled task; it still unregisters the task even if the API was already unreachable.
+
+The task runs as the current `$env:USERNAME` and needs that user to have an active interactive logon session on the target machine (e.g. via RDP or the physical console) for the window to actually appear; the REST API itself works regardless of whether anyone is looking at the screen.
+
 ## Response Format
 
 Successful requests return HTTP `200` and this envelope:
