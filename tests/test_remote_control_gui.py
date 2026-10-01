@@ -92,6 +92,27 @@ class RemoteControlGuiTests(unittest.TestCase):
         self.assertEqual(token['data']['text'], '********')
         self.assertEqual(self.plotter._remote_server._token, 'api-token')
 
+    def test_remote_control_stays_beside_live_values(self):
+        config_grid = self.plotter.layout().itemAt(0).layout()
+        isomon_values = config_grid.itemAtPosition(scada.ISOMON_DEVICE_INDEX, 7).widget()
+        isomon_values.setMinimumWidth(1100)
+        self.plotter.resize(3800, 800)
+        self.plotter.show()
+        self.app.processEvents()
+
+        for column in (0, 1, 3):
+            self.assertLess(config_grid.cellRect(0, column).width(), 150)
+        self.assertLess(self.plotter.device_edits[0].x(), 500)
+        remote_label = config_grid.itemAtPosition(0, 8).widget()
+        self.assertLess(self.plotter.width() - self.plotter.remote_control_addr.geometry().right(), 40)
+        self.assertGreaterEqual(remote_label.x(), isomon_values.x() + 800)
+        device_address = self.plotter.device_edits[0]
+        self.assertGreaterEqual(device_address.width(), 200)
+        for field in (self.plotter.remote_control_addr, self.plotter.remote_control_token,
+                      self.plotter.receiver_edit, self.plotter.measurement_number_edit):
+            self.assertEqual(field.width(), device_address.width())
+        self.assertEqual(config_grid.getItemPosition(config_grid.indexOf(isomon_values))[3], 3)
+
     def test_remote_control_layout_uses_two_top_rows(self):
         config_grid = self.plotter.layout().itemAt(0).layout()
         self.assertEqual(config_grid.getItemPosition(config_grid.indexOf(self.plotter.remote_control_enabled))[:2], (0, 9))

@@ -2418,7 +2418,10 @@ class Plotter(QWidget):
 
         root = QVBoxLayout(self)
         cfg = QGridLayout()
+        cfg.setColumnMinimumWidth(7, 800)
+        cfg.setColumnStretch(7, 1)
         root.addLayout(cfg)
+        address_field_width = 200
 
         self.device_labels: List[QLabel] = []
         self.device_edits: List[QLineEdit] = []
@@ -2448,6 +2451,7 @@ class Plotter(QWidget):
             le = QLineEdit()
             le.setObjectName(f'device_{i}_address')
             le.setPlaceholderText('ip:port')
+            le.setFixedWidth(address_field_width)
             if i == 0:
                 le.textChanged.connect(self._update_defaults)
             cfg.addWidget(le, i, 2)
@@ -2499,7 +2503,8 @@ class Plotter(QWidget):
             analog_widget = QWidget()
             analog_widget.setLayout(analog_box)
             analog_widget.setToolTip('Live analog values')
-            cfg.addWidget(analog_widget, i, 7, alignment=Qt.AlignLeft | Qt.AlignVCenter)
+            cfg.addWidget(analog_widget, i, 7, 1, 3 if i == ISOMON_DEVICE_INDEX else 1,
+                          Qt.AlignLeft | Qt.AlignVCenter)
             self.device_analog_value_layouts.append(analog_box)
             self.device_analog_value_labels.append([])
 
@@ -2515,22 +2520,26 @@ class Plotter(QWidget):
         self.remote_control_addr.setObjectName('remote_control_addr_port')
         self.remote_control_addr.setPlaceholderText('127.0.0.1:8765')
         self.remote_control_addr.setEnabled(not REMOTE_CONTROL_ENABLED)
+        self.remote_control_addr.setFixedWidth(address_field_width)
         cfg.addWidget(self.remote_control_addr, 1, 9)
         cfg.addWidget(QLabel('Token'), 2, 8)
         self.remote_control_token = QLineEdit(REMOTE_CONTROL_TOKEN)
         self.remote_control_token.setObjectName('remote_control_token')
         self.remote_control_token.setMaxLength(1024)
         self.remote_control_token.setToolTip('Bearer token for HTTP API authentication; changes apply when editing is finished.')
+        self.remote_control_token.setFixedWidth(address_field_width)
         cfg.addWidget(self.remote_control_token, 2, 9, 1, 3)
 
         cfg.addWidget(QLabel('Receiver addr:port'), 3, 8)
         self.receiver_edit = QLineEdit(f'0.0.0.0:{DEFAULT_DATA_PORT}')
         self.receiver_edit.setObjectName('receiver_addr_port')
+        self.receiver_edit.setFixedWidth(address_field_width)
         cfg.addWidget(self.receiver_edit, 3, 9)
 
         cfg.addWidget(QLabel('Measurement number'), 4, 8)
         self.measurement_number_edit = QLineEdit(f'0')
         self.measurement_number_edit.setObjectName('measurement_number')
+        self.measurement_number_edit.setFixedWidth(address_field_width)
         cfg.addWidget(self.measurement_number_edit, 4, 9)
 
         self.apply_btn = QPushButton('Apply Device List')
