@@ -64,7 +64,7 @@ from fdds import alg_config as fdds_alg_config
 from remote_control import APIError, RemoteControlServer
 
 APPLICATION_NAME = 'Eaton FDDS SCADA'
-APPLICATION_VERSION = '1.16.1'
+APPLICATION_VERSION = '1.16.2'
 APPLICATION_TITLE = f"{APPLICATION_NAME} v{APPLICATION_VERSION}"
 
 # Constants (protocol-level values sourced from the shared fdds core)
