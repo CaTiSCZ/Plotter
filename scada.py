@@ -22,6 +22,7 @@ import logger
 import importlib
 import math
 import asyncio, struct, socket, sys, time, threading, csv, os, tempfile
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Tuple, List
@@ -34,11 +35,12 @@ import pyqtgraph as pg
 import pyqtgraph.exporters
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QPushButton, QLineEdit, QLabel, QSpinBox, QCheckBox, QTextEdit,
-    QScrollArea, QRadioButton, QButtonGroup, QFileDialog, QMessageBox, QComboBox
+    QPushButton, QLineEdit, QLabel, QSpinBox, QDoubleSpinBox, QCheckBox, QTextEdit,
+    QPlainTextEdit, QSlider, QScrollArea, QRadioButton, QButtonGroup,
+    QFileDialog, QMessageBox, QComboBox, QAbstractButton
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint
-from PyQt5.QtGui import QFont, QFontMetrics
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint, QObject
+from PyQt5.QtGui import QFont, QFontMetrics, QTextDocument
 
 # Shared FDDS protocol core (vendored copy of the firmware repo's utils/fdds).
 # Single source of truth for packet/command enums, struct layouts and CRC so the
@@ -57,6 +59,7 @@ from fdds.protocol import (
 )
 from fdds.crc import crc16_ccitt
 from fdds import alg_config as fdds_alg_config
+from remote_control import APIError, RemoteControlServer
 
 APPLICATION_NAME = 'Eaton FDDS SCADA'
 APPLICATION_VERSION = '1.15.0'
@@ -144,6 +147,9 @@ FIREWALL_KEEPALIVE_TIMEOUT_S = 25
 # faster for very large traces but needs a working OpenGL driver. Overridable via
 # default_settings.py (USE_OPENGL).
 USE_OPENGL = False
+REMOTE_CONTROL_ENABLED = False
+REMOTE_CONTROL_ADDR_PORT = '127.0.0.1:8765'
+REMOTE_CONTROL_TOKEN = ''
 
 # Whether ISOMON is enabled in default settings. Used to decide if the
 # ISOMON-specific resistance plot row should be shown.
@@ -2318,6 +2324,35 @@ class DeviceManager:
         self.devices.clear()
 
 # Main GUI application
+class RemoteControlBridge(QObject):
+    """Marshal HTTP requests onto the Qt GUI thread and return their results."""
+
+    request = pyqtSignal(object)
+
+    def __init__(self, handler, parent=None):
+        super().__init__(parent)
+        self._handler = handler
+        self.request.connect(self._execute, Qt.QueuedConnection)
+
+    def dispatch(self, operation, arguments):
+        future = Future()
+        self.request.emit((operation, arguments, future))
+        try:
+            return future.result(timeout=60)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise TimeoutError('Timed out waiting for the SCADA GUI thread') from exc
+
+    def _execute(self, request):
+        operation, arguments, future = request
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            future.set_result(self._handler(operation, arguments))
+        except Exception as exc:
+            future.set_exception(exc)
+
+
 class Plotter(QWidget):
     # emits (ip, packet_order, stream_key)
     data_ready = pyqtSignal(str, int, str)
@@ -2399,24 +2434,29 @@ class Plotter(QWidget):
 
         for i in range(DeviceManager.MAX_DEVICES):
             lb = QLabel(DEVICE_LABELS[i] if i < len(DEVICE_LABELS) else f'Device {i}')
+            lb.setObjectName(f'device_{i}_label')
             cfg.addWidget(lb, i, 0)
             self.device_labels.append(lb)
 
             chk = QCheckBox('Enable')
+            chk.setObjectName(f'device_{i}_enabled')
             chk.setChecked(True)
             cfg.addWidget(chk, i, 1)
             self.device_checks.append(chk)
             le = QLineEdit()
+            le.setObjectName(f'device_{i}_address')
             le.setPlaceholderText('ip:port')
             if i == 0:
                 le.textChanged.connect(self._update_defaults)
             cfg.addWidget(le, i, 2)
             self.device_edits.append(le)
             rb = QRadioButton('Leader')
+            rb.setObjectName(f'device_{i}_leader')
             cfg.addWidget(rb, i, 3)
             self.leader_buttons.addButton(rb, i)
 
             cb_clock_settings = QComboBox()
+            cb_clock_settings.setObjectName(f'device_{i}_clock')
             cb_clock_settings.addItems(CLOCK_SETTINGS)
             cb_clock_settings.setCurrentIndex(0)
             cb_clock_settings.currentTextChanged.connect(lambda text, row=i: self._update_clock_settings(row, CLOCK_SETTINGS.index(text)))
@@ -2425,12 +2465,14 @@ class Plotter(QWidget):
 
             trig_box = QHBoxLayout()
             cb_trigger = QComboBox()
+            cb_trigger.setObjectName(f'device_{i}_trigger')
             cb_trigger.addItems(TRIGGER_SETTINGS)
             cb_trigger.setCurrentIndex(0)
             cb_trigger.currentIndexChanged.connect(lambda _idx, row=i: self._update_trigger_settings(row))
             trig_box.addWidget(cb_trigger)
             self.device_trigger_settings.append(cb_trigger)
             sb_holdoff = QSpinBox()
+            sb_holdoff.setObjectName(f'device_{i}_trigger_holdoff_us')
             sb_holdoff.setRange(0, 1_000_000_000)
             sb_holdoff.setSuffix(' us')
             sb_holdoff.setValue(0)
@@ -2463,17 +2505,39 @@ class Plotter(QWidget):
 
         cfg.addWidget(QLabel('Receiver addr:port'), 0, 8)
         self.receiver_edit = QLineEdit(f'0.0.0.0:{DEFAULT_DATA_PORT}')
+        self.receiver_edit.setObjectName('receiver_addr_port')
         cfg.addWidget(self.receiver_edit, 0, 9)
+
+        cfg.addWidget(QLabel('Remote Control'), 4, 8)
+        self.remote_control_enabled = QCheckBox('Enabled')
+        self.remote_control_enabled.setObjectName('remote_control_enabled')
+        self.remote_control_enabled.setChecked(REMOTE_CONTROL_ENABLED)
+        cfg.addWidget(self.remote_control_enabled, 4, 9)
+        cfg.addWidget(QLabel('Web addr:port'), 5, 8)
+        self.remote_control_addr = QLineEdit(REMOTE_CONTROL_ADDR_PORT)
+        self.remote_control_addr.setObjectName('remote_control_addr_port')
+        self.remote_control_addr.setPlaceholderText('127.0.0.1:8765')
+        cfg.addWidget(self.remote_control_addr, 5, 9)
+        self.remote_control_apply = QPushButton('Apply web address')
+        self.remote_control_apply.setObjectName('remote_control_apply')
+        cfg.addWidget(self.remote_control_apply, 7, 8)
+        self.remote_control_status = QLabel('Remote Control: disabled')
+        self.remote_control_status.setObjectName('remote_control_status')
+        self.remote_control_status.setStyleSheet('font-family: monospace')
+        cfg.addWidget(self.remote_control_status, 7, 9)
 
         cfg.addWidget(QLabel('Measurement number'), 2, 8)
         self.measurement_number_edit = QLineEdit(f'0')
+        self.measurement_number_edit.setObjectName('measurement_number')
         cfg.addWidget(self.measurement_number_edit, 2, 9)
 
         self.save_calibration_btn = QPushButton('Save calibration')
+        self.save_calibration_btn.setObjectName('save_calibration')
         cfg.addWidget(self.save_calibration_btn, 3, 9)
         self.save_calibration_btn.clicked.connect(self._save_calibration_bundle)
 
         self.apply_btn = QPushButton('Apply Device List')
+        self.apply_btn.setObjectName('apply_device_list')
         cfg.addWidget(self.apply_btn, DeviceManager.MAX_DEVICES, 2)
         self.apply_btn.clicked.connect(self._apply_devices)
 
@@ -2482,14 +2546,17 @@ class Plotter(QWidget):
         #self.get_clock_config_btn.clicked.connect(self._get_clock_config)
 
         self.save_clock_config_btn = QPushButton('Save clock config')
+        self.save_clock_config_btn.setObjectName('save_clock_config')
         cfg.addWidget(self.save_clock_config_btn, DeviceManager.MAX_DEVICES, 4)
         self.save_clock_config_btn.clicked.connect(self._save_clock_config)
 
         self.save_trigger_config_btn = QPushButton('Save trigger config')
+        self.save_trigger_config_btn.setObjectName('save_trigger_config')
         cfg.addWidget(self.save_trigger_config_btn, DeviceManager.MAX_DEVICES, 5)
         self.save_trigger_config_btn.clicked.connect(self._save_trigger_config)
 
         self.isomon_debug_chk = QCheckBox('Debug')
+        self.isomon_debug_chk.setObjectName('isomon_debug_visible')
         self.isomon_debug_chk.setToolTip('Show ISOMON HW debug controls (algorithm enable + AGPIO0..4)')
         cfg.addWidget(self.isomon_debug_chk, DeviceManager.MAX_DEVICES, 6)
         self.isomon_debug_chk.toggled.connect(self._toggle_isomon_debug_panel)
@@ -2502,12 +2569,14 @@ class Plotter(QWidget):
         debug_grid.setContentsMargins(0, 0, 0, 0)
         debug_grid.setSpacing(4)
         self.isomon_alg_enable_btn = QPushButton('ALG')
+        self.isomon_alg_enable_btn.setObjectName('isomon_alg_enable')
         self.isomon_alg_enable_btn.setCursor(Qt.PointingHandCursor)
         self.isomon_alg_enable_btn.clicked.connect(self._toggle_isomon_alg_enable)
         debug_grid.addWidget(self.isomon_alg_enable_btn, 0, 0)
         self.isomon_agpio_btns: List[QPushButton] = []
         for idx, (r, c) in enumerate([(1, 0), (0, 1), (1, 1), (0, 2), (1, 2)]):
             btn = QPushButton(f'AGPIO{idx}')
+            btn.setObjectName(f'isomon_agpio_{idx}')
             btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda _checked=False, i=idx: self._toggle_isomon_agpio(i))
             debug_grid.addWidget(btn, r, c)
@@ -2523,6 +2592,7 @@ class Plotter(QWidget):
         self._isomon_debug_alg_timer.timeout.connect(self._poll_isomon_alg_enable)
 
         self.isomon_iso_row2_lbl = QLabel('')
+        self.isomon_iso_row2_lbl.setObjectName('isomon_result_row_2')
         self.isomon_iso_row2_lbl.setStyleSheet(ANALOG_VALUE_NO_DATA_STYLE)
         self.isomon_iso_row2_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.isomon_iso_row2_lbl.setToolTip('ISOMON PACKET_ISO_RESULT live values (row 2)')
@@ -2542,17 +2612,21 @@ class Plotter(QWidget):
                           ('Apply config'            , self._apply_config        ),
                           ):
             b = QPushButton(label)
+            b.setObjectName('apply_config')
             b.clicked.connect(fn)
             btns.addWidget(b)
 
         # System startup/stop control + state monitoring
         self.system_start_btn = QPushButton('Start System')
+        self.system_start_btn.setObjectName('start_system')
         self.system_start_btn.clicked.connect(self._system_start)
         btns.addWidget(self.system_start_btn)
         self.system_stop_btn = QPushButton('Stop System')
+        self.system_stop_btn.setObjectName('stop_system')
         self.system_stop_btn.clicked.connect(self._system_stop)
         btns.addWidget(self.system_stop_btn)
         self.system_status_lbl = QLabel('System: —')
+        self.system_status_lbl.setObjectName('system_status')
         self.system_status_lbl.setStyleSheet('font-family: monospace')
         # Fixed width so the buttons after it don't shift as the status text changes
         # length. Sized to a representative long status string.
@@ -2564,6 +2638,7 @@ class Plotter(QWidget):
         pretrigger_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         btns.addWidget(pretrigger_lbl)
         self.pretrigger_spin = QSpinBox()
+        self.pretrigger_spin.setObjectName('pretrigger_ms')
         self.pretrigger_spin.setRange(0, PTP_TRIGGER_RING_PACKETS)
         self.pretrigger_spin.setValue(0)
         btns.addWidget(self.pretrigger_spin)
@@ -2572,6 +2647,7 @@ class Plotter(QWidget):
         posttrigger_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         btns.addWidget(posttrigger_lbl)
         self.sample_spin = QSpinBox()
+        self.sample_spin.setObjectName('posttrigger_ms')
         self.sample_spin.setRange(0, MAX_CAPTURE_PACKETS)
         self.sample_spin.setValue(10)
         btns.addWidget(self.sample_spin)
@@ -2580,24 +2656,27 @@ class Plotter(QWidget):
         self._update_capture_limits()
 
         self.start_sampling_btn = QPushButton('Start New Sampling')
+        self.start_sampling_btn.setObjectName('start_sampling')
         self.start_sampling_btn.clicked.connect(self._start_new_sampling)
         btns.addWidget(self.start_sampling_btn)
 
         self.start_sampling_trigger_btn = QPushButton('Start New Sampling on trigger')
+        self.start_sampling_trigger_btn.setObjectName('start_sampling_on_trigger')
         self.start_sampling_trigger_btn.clicked.connect(self._start_new_sampling_on_trigger)
         btns.addWidget(self.start_sampling_trigger_btn)
 
-        for label, fn in (('Save Measurement'               , self.save_measurement                 ),
-                          ('Force trigger'                  , self._force_trigger                   ),
+        for label, object_name, fn in (('Save Measurement', 'save_measurement', self.save_measurement),
+                  ('Force trigger', 'force_trigger', self._force_trigger),
                           #('Stop Sampling'                  , self._stop_sampling                   ),
-                          ('Reset Counter'                  , self._reset_counter                   ),
-                          ('Reset Latched Faults'           , self._reset_fault_state               ),
+                          ('Reset Counter', 'reset_counter', self._reset_counter),
+                          ('Reset Latched Faults', 'reset_latched_faults', self._reset_fault_state),
                           #('Clean Graf'                     , self.clear_plot                       ),
                           #('Penetrate Firewall'             , self._penetrate_firewall              ),
                           #('Save Data'                      , self.save_data                        ),
-                          ('Reset devices'                   , self._reset_devices                   ),
+                          ('Reset devices', 'reset_devices', self._reset_devices),
                           ):
             b=QPushButton(label)
+            b.setObjectName(object_name)
             b.clicked.connect(fn)
             btns.addWidget(b)
 
@@ -2610,6 +2689,7 @@ class Plotter(QWidget):
         downsample_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         btns.addWidget(downsample_lbl)
         self.downsample_mode_combo = QComboBox()
+        self.downsample_mode_combo.setObjectName('downsample_mode')
         self.downsample_mode_combo.addItems(['Off', 'Subsample', 'Mean', 'Peak'])
         self.downsample_mode_combo.setCurrentText('Peak')
         self.downsample_mode_combo.setToolTip(
@@ -2617,11 +2697,13 @@ class Plotter(QWidget):
             'Mean: average each group. Peak: min/max envelope (preserves spikes).')
         btns.addWidget(self.downsample_mode_combo)
         self.downsample_factor_spin = QSpinBox()
+        self.downsample_factor_spin.setObjectName('downsample_factor')
         self.downsample_factor_spin.setRange(0, 100000)
         self.downsample_factor_spin.setValue(0)
         self.downsample_factor_spin.setToolTip('Decimation factor; 0 = auto (chosen from the visible pixel width).')
         btns.addWidget(self.downsample_factor_spin)
         self.clip_to_view_chk = QCheckBox('Clip to view')
+        self.clip_to_view_chk.setObjectName('clip_to_view')
         self.clip_to_view_chk.setChecked(True)
         self.clip_to_view_chk.setToolTip('Only draw the part of each curve inside the visible x-range (huge win when zoomed in).')
         btns.addWidget(self.clip_to_view_chk)
@@ -2708,12 +2790,14 @@ class Plotter(QWidget):
         self._apply_downsampling()
 
         self.error_lbl = QLabel()
+        self.error_lbl.setObjectName('statistics')
         self.error_lbl.setStyleSheet('font-family: monospace')
         root.addWidget(self.error_lbl)
 
         # Collapsible log pane: a toggle button lets the user hide the log so it
         # doesn't take up graph area during normal operation.
         self.log_toggle_btn = QPushButton()
+        self.log_toggle_btn.setObjectName('log_visible')
         self.log_toggle_btn.setCheckable(True)
         self.log_toggle_btn.setFlat(True)
         self.log_toggle_btn.setStyleSheet('text-align:left; padding:2px')
@@ -2721,6 +2805,7 @@ class Plotter(QWidget):
         root.addWidget(self.log_toggle_btn)
 
         self.log_output = QTextEdit()
+        self.log_output.setObjectName('log_output')
         self.log_output.setReadOnly(True)
         self.log_output.setLineWrapMode(QTextEdit.NoWrap)
         self.log_output.setStyleSheet('font-family: monospace; background:#f0f0f0')
@@ -2762,9 +2847,348 @@ class Plotter(QWidget):
         self.trigger_received.connect(self._flash_device_trigger)
         self.manager.set_trigger_signal(self.trigger_received)
 
+        self._remote_bridge = RemoteControlBridge(self._remote_dispatch_gui, self)
+        self._remote_server = RemoteControlServer(
+            self._remote_bridge.dispatch,
+            token=REMOTE_CONTROL_TOKEN,
+            logger=self._logger,
+        )
+        self.remote_control_enabled.toggled.connect(self._remote_toggle)
+        self.remote_control_apply.clicked.connect(self._remote_apply_address)
+        self.remote_control_addr.editingFinished.connect(self._remote_apply_address)
+        if REMOTE_CONTROL_ENABLED:
+            if not self._remote_start(self.remote_control_addr.text()):
+                self.remote_control_enabled.blockSignals(True)
+                self.remote_control_enabled.setChecked(False)
+                self.remote_control_enabled.blockSignals(False)
+
     def closeEvent(self, event):
+        self.remote_control_enabled.blockSignals(True)
+        self.remote_control_enabled.setChecked(False)
+        self.remote_control_enabled.blockSignals(False)
+        self._remote_stop()
         self.manager.shutdown()
         super().closeEvent(event)
+
+    def _remote_set_status(self, text, error=False):
+        color = '#b00020' if error else '#207a3c'
+        self.remote_control_status.setText(text)
+        self.remote_control_status.setStyleSheet(f'font-family: monospace; color: {color}')
+
+    def _remote_start(self, address):
+        try:
+            active_address = self._remote_server.start(address)
+        except Exception as exc:
+            self._remote_set_status(f'Remote Control: error: {exc}', error=True)
+            self._logger.error(f'Remote Control listener failed to start: {exc}')
+            return False
+        self._remote_set_status(f'Remote Control: enabled at {active_address}')
+        self._logger.info(f'Remote Control listener started at {active_address}')
+        return True
+
+    def _remote_stop(self):
+        if getattr(self, '_remote_server', None) is not None:
+            self._remote_server.stop()
+        if hasattr(self, 'remote_control_status'):
+            self._remote_set_status('Remote Control: disabled')
+
+    def _remote_toggle(self, enabled):
+        if enabled:
+            if not self._remote_start(self.remote_control_addr.text().strip()):
+                self.remote_control_enabled.blockSignals(True)
+                self.remote_control_enabled.setChecked(False)
+                self.remote_control_enabled.blockSignals(False)
+        else:
+            self._remote_stop()
+
+    def _remote_apply_address(self, *_):
+        address = self.remote_control_addr.text().strip()
+        if not self.remote_control_enabled.isChecked():
+            self._remote_set_status('Remote Control: disabled; address saved for this run')
+            return
+        replacement = RemoteControlServer(
+            self._remote_bridge.dispatch,
+            token=REMOTE_CONTROL_TOKEN,
+            logger=self._logger,
+        )
+        try:
+            active_address = replacement.start(address)
+        except Exception as exc:
+            self._remote_set_status(f'Remote Control: rebind failed: {exc}', error=True)
+            self._logger.error(f'Remote Control rebind failed; keeping previous listener: {exc}')
+            return
+        previous = self._remote_server
+        self._remote_server = replacement
+        previous.stop()
+        self._remote_set_status(f'Remote Control: enabled at {active_address}')
+        self._logger.info(f'Remote Control listener rebound to {active_address}')
+
+    def _remote_widget_registry(self):
+        registry = {'window': self}
+
+        def visit(parent, parent_id):
+            counts = {}
+            for child in parent.children():
+                if not isinstance(child, QWidget):
+                    continue
+                class_name = type(child).__name__
+                name = child.objectName()
+                base = ''.join(ch if ch.isalnum() or ch in '_-' else '_' for ch in (name or class_name))
+                index = counts.get(base, 0)
+                counts[base] = index + 1
+                widget_id = name if name and name not in registry else f'{parent_id}__{base}__{index}'
+                while widget_id in registry:
+                    index += 1
+                    widget_id = f'{parent_id}__{base}__{index}'
+                registry[widget_id] = child
+                visit(child, widget_id)
+
+        visit(self, 'window')
+        return registry
+
+    @staticmethod
+    def _remote_widget_capabilities(widget):
+        if isinstance(widget, QAbstractButton):
+            actions = ['click']
+            if widget.isCheckable():
+                actions.append('set_checked')
+            return actions
+        if isinstance(widget, QLineEdit):
+            return [] if widget.isReadOnly() else ['set_text']
+        if isinstance(widget, QComboBox):
+            return ['select_index', 'select_text']
+        if isinstance(widget, (QSpinBox, QDoubleSpinBox, QSlider)):
+            return ['set_value']
+        return []
+
+    def _remote_widget_snapshot(self, widget_id, widget):
+        state = {
+            'id': widget_id,
+            'type': type(widget).__name__,
+            'object_name': widget.objectName(),
+            'visible': widget.isVisible(),
+            'enabled': widget.isEnabled(),
+            'tooltip': widget.toolTip(),
+            'capabilities': self._remote_widget_capabilities(widget),
+        }
+        if isinstance(widget, QAbstractButton):
+            state.update(text=widget.text(), checkable=widget.isCheckable(), checked=widget.isChecked())
+        elif isinstance(widget, QLineEdit):
+            state.update(text=widget.text(), read_only=widget.isReadOnly(), placeholder=widget.placeholderText())
+        elif isinstance(widget, QComboBox):
+            state.update(current_index=widget.currentIndex(), current_text=widget.currentText(),
+                         items=[widget.itemText(i) for i in range(min(widget.count(), 256))])
+        elif isinstance(widget, (QSpinBox, QDoubleSpinBox, QSlider)):
+            state.update(value=widget.value(), minimum=widget.minimum(), maximum=widget.maximum())
+        elif isinstance(widget, QLabel):
+            state['text'] = widget.text()[:16384]
+        elif isinstance(widget, (QTextEdit, QPlainTextEdit)):
+            state.update(read_only=widget.isReadOnly(), text=widget.toPlainText()[-16384:])
+        return state
+
+    def _remote_dispatch_gui(self, operation, arguments):
+        if not self.remote_control_enabled.isChecked():
+            raise APIError(503, 'remote_disabled', 'Remote Control is disabled')
+        captured_at = datetime.now().astimezone().isoformat()
+        if operation == 'ui_state':
+            registry = self._remote_widget_registry()
+            return {
+                'captured_at': captured_at,
+                'widgets': [self._remote_widget_snapshot(widget_id, widget)
+                            for widget_id, widget in registry.items()],
+            }
+        if operation == 'status':
+            return {
+                'remote_control_enabled': self.remote_control_enabled.isChecked(),
+                'remote_control_address': self._remote_server.address,
+                'system_status': self.system_status_lbl.text(),
+                'device_count': len(self.manager.devices),
+                'ptp_enabled': bool(ptp_mode.enabled),
+                'capture_active': any(dev.capture_active for dev in self.manager.devices.values()),
+            }
+        if operation == 'measurement_start':
+            mode = arguments.get('mode', 'immediate')
+            if mode not in ('immediate', 'trigger'):
+                raise APIError(400, 'invalid_mode', "mode must be 'immediate' or 'trigger'")
+            pre_ms = arguments.get('pretrigger_ms', self.pretrigger_spin.value())
+            post_ms = arguments.get('posttrigger_ms', self.sample_spin.value())
+            for value, widget, name in (
+                (pre_ms, self.pretrigger_spin, 'pretrigger_ms'),
+                (post_ms, self.sample_spin, 'posttrigger_ms'),
+            ):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise APIError(400, 'invalid_value', f'{name} must be an integer')
+                if not widget.minimum() <= value <= widget.maximum():
+                    raise APIError(400, 'out_of_range', f'{name} is outside the GUI control range')
+            if post_ms > self._posttrigger_limit_ms(pre_ms):
+                raise APIError(400, 'out_of_range', 'pretrigger_ms plus posttrigger_ms exceeds the capture limit')
+            self.pretrigger_spin.setValue(pre_ms)
+            self.sample_spin.setValue(post_ms)
+            if mode == 'trigger':
+                self._start_new_sampling_on_trigger()
+            else:
+                self._start_new_sampling()
+            return {'accepted': True, 'mode': mode, 'pretrigger_ms': pre_ms, 'posttrigger_ms': post_ms}
+        if operation == 'measurement_stop':
+            self._stop_sampling()
+            return {'accepted': True}
+        if operation == 'measurement_save':
+            return {'files': self._save_measurement(show_dialog=False)}
+        if operation == 'statistics':
+            document = QTextDocument()
+            document.setHtml(self.error_lbl.text())
+            return {'captured_at': captured_at, 'text': document.toPlainText(),
+                    'html': self.error_lbl.text()[:65536]}
+        if operation == 'live':
+            return {
+                'captured_at': captured_at,
+                'devices': [{
+                    'ip': ip,
+                    'last_data_age_s': max(0.0, time.monotonic() - dev.last_data_time) if dev.last_data_time else None,
+                    'last_fault_state': int(dev.last_fault_state),
+                    'last_fault_latched': int(dev.last_fault_latched),
+                    'fault_valid': bool(dev.last_fault_valid),
+                    'analog_values': [float(value) for value in dev.last_analog_values],
+                    'analog_valid': bool(dev.last_analog_valid),
+                } for ip, dev in self.manager.devices.items()],
+            }
+        if operation == 'plots':
+            return self._remote_plot_snapshot(arguments['points'])
+        if operation == 'plots_view':
+            return self._remote_set_plot_view(arguments)
+        if operation == 'log':
+            tail = int(arguments['tail'])
+            lines = [line[-4096:] for line in self.log_output.toPlainText().splitlines()[-tail:]]
+            while lines and sum(map(len, lines)) > 65536:
+                lines.pop(0)
+            return {'captured_at': captured_at, 'lines': lines}
+        if operation == 'widget_action':
+            return self._remote_apply_widget_action(arguments)
+        raise APIError(404, 'unknown_operation', f'Unknown operation: {operation}')
+
+    def _remote_plot_snapshot(self, point_limit):
+        plot_items = {
+            'signals': (self.ax, self.curves),
+            'detection': (self.ax_result, self.ax_result_curves),
+            'isomon_resistance': (self.ax_iso_r, self.ax_iso_r_curves),
+        }
+        result = {}
+        for plot_name, (plot, curves) in plot_items.items():
+            series = []
+            for key, curve in curves.items():
+                x_values, y_values = curve.getData()
+                if x_values is None or y_values is None:
+                    continue
+                length = min(len(x_values), len(y_values))
+                if length == 0:
+                    continue
+                sample_count = min(length, point_limit)
+                indices = (np.linspace(0, length - 1, sample_count, dtype=np.int64)
+                           if sample_count < length else None)
+                x_sample = np.asarray(x_values) if indices is None else np.asarray(x_values)[indices]
+                y_sample = np.asarray(y_values) if indices is None else np.asarray(y_values)[indices]
+                series.append({
+                    'key': repr(key),
+                    'total_points': int(length),
+                    'x': [float(value) if np.isfinite(value) else None for value in x_sample],
+                    'y': [float(value) if np.isfinite(value) else None for value in y_sample],
+                })
+            ranges = plot.viewRange()
+            result[plot_name] = {
+                'visible': bool(plot.isVisible()),
+                'x_range': [float(value) for value in ranges[0]],
+                'y_range': [float(value) for value in ranges[1]],
+                'series': series,
+            }
+        return {'captured_at': datetime.now().astimezone().isoformat(), 'plots': result}
+
+    def _remote_set_plot_view(self, arguments):
+        plot_name = arguments.get('plot', 'signals')
+        plot_items = {
+            'signals': self.ax,
+            'detection': self.ax_result,
+            'isomon_resistance': self.ax_iso_r,
+        }
+        plot = plot_items.get(plot_name)
+        if plot is None:
+            raise APIError(400, 'invalid_plot', 'plot must be signals, detection, or isomon_resistance')
+        changed = False
+        for key, setter, label in (('x_range', plot.setXRange, 'x_range'),
+                                   ('y_range', plot.setYRange, 'y_range')):
+            if key not in arguments:
+                continue
+            values = arguments[key]
+            if (not isinstance(values, list) or len(values) != 2
+                    or any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values)
+                    or not all(math.isfinite(value) for value in values)
+                    or values[0] >= values[1]):
+                raise APIError(400, 'invalid_range', f'{label} must be two increasing finite numbers')
+            setter(float(values[0]), float(values[1]), padding=0)
+            changed = True
+        if not changed:
+            raise APIError(400, 'missing_range', 'Provide x_range and/or y_range')
+        ranges = plot.viewRange()
+        return {'plot': plot_name, 'x_range': list(ranges[0]), 'y_range': list(ranges[1])}
+
+    def _remote_apply_widget_action(self, arguments):
+        widget_id = str(arguments.get('widget_id', ''))
+        widget = self._remote_widget_registry().get(widget_id)
+        if widget is None:
+            raise APIError(404, 'widget_not_found', f'Unknown widget ID: {widget_id}')
+        action = arguments.get('action')
+        capabilities = self._remote_widget_capabilities(widget)
+
+        if action == 'save_to_path' and widget is self.save_calibration_btn:
+            path = os.path.realpath(str(arguments.get('path', '')))
+            allowed_root = os.path.realpath(os.path.join(os.getcwd(), 'RICE_mereni'))
+            if not path or os.path.commonpath((allowed_root, path)) != allowed_root:
+                raise APIError(400, 'invalid_path', 'Save path must be inside RICE_mereni')
+            self._save_calibration_bundle(path=path)
+        elif action == 'click' and action in capabilities:
+            if widget is self.save_calibration_btn:
+                raise APIError(409, 'path_required', 'Use action save_to_path with a path inside RICE_mereni')
+            if widget is self.save_clock_config_btn:
+                self._save_clock_config(confirmed=True)
+            elif widget is self.save_trigger_config_btn:
+                self._save_trigger_config(confirmed=True)
+            elif widget.objectName() == 'save_measurement':
+                self._save_measurement(show_dialog=False)
+            else:
+                widget.click()
+        elif action == 'set_checked' and action in capabilities:
+            value = arguments.get('checked')
+            if not isinstance(value, bool):
+                raise APIError(400, 'invalid_value', 'checked must be a boolean')
+            widget.setChecked(value)
+        elif action == 'set_text' and action in capabilities:
+            value = arguments.get('text')
+            if not isinstance(value, str) or len(value) > 4096:
+                raise APIError(400, 'invalid_value', 'text must be a string of at most 4096 characters')
+            widget.setText(value)
+        elif action == 'set_value' and action in capabilities:
+            value = arguments.get('value')
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise APIError(400, 'invalid_value', 'value must be numeric')
+            if not math.isfinite(value):
+                raise APIError(400, 'invalid_value', 'value must be finite')
+            if value < widget.minimum() or value > widget.maximum():
+                raise APIError(400, 'out_of_range', 'value is outside the widget range')
+            widget.setValue(value)
+        elif action == 'select_index' and action in capabilities:
+            index = arguments.get('index')
+            if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < widget.count():
+                raise APIError(400, 'out_of_range', 'index is outside the combo box options')
+            widget.setCurrentIndex(index)
+        elif action == 'select_text' and action in capabilities:
+            text = arguments.get('text')
+            index = widget.findText(text) if isinstance(text, str) else -1
+            if index < 0:
+                raise APIError(400, 'invalid_value', 'text is not an available combo box option')
+            widget.setCurrentIndex(index)
+        else:
+            raise APIError(400, 'unsupported_action', f'Action {action!r} is not supported for this widget')
+
+        return self._remote_widget_snapshot(widget_id, widget)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -3441,6 +3865,15 @@ class Plotter(QWidget):
         if complete:
             self._set_sampling_indicator(None)
 
+    def _posttrigger_limit_ms(self, pre_ms):
+        specs = self._stream_specs()
+        post_max_ms = []
+        for _ip, _stream_key, rate_hz in specs:
+            pre_packets = _packets_from_ms_ceil(pre_ms, rate_hz)
+            available_packets = max(0, MAX_CAPTURE_PACKETS - pre_packets)
+            post_max_ms.append(int((available_packets * 1000.0) // rate_hz))
+        return max(0, min(post_max_ms) if post_max_ms else MAX_CAPTURE_PACKETS)
+
     def _update_capture_limits(self):
         """Cap trigger windows in ms so all active streams fit ring/buffer limits."""
         specs = self._stream_specs()
@@ -3451,13 +3884,7 @@ class Plotter(QWidget):
         if pre_ms != self.pretrigger_spin.value():
             self.pretrigger_spin.setValue(pre_ms)
 
-        post_max_ms = []
-        for _ip, _stream_key, rate_hz in specs:
-            pre_packets = _packets_from_ms_ceil(pre_ms, rate_hz)
-            available_packets = max(0, MAX_CAPTURE_PACKETS - pre_packets)
-            post_max_ms.append(int((available_packets * 1000.0) // rate_hz))
-        post_max = max(0, min(post_max_ms) if post_max_ms else MAX_CAPTURE_PACKETS)
-        self.sample_spin.setMaximum(post_max)
+        self.sample_spin.setMaximum(self._posttrigger_limit_ms(pre_ms))
 
     def _apply_downsampling(self, *_):
         """Apply the GUI downsampling / clip-to-view settings to both plots.
@@ -4109,12 +4536,13 @@ class Plotter(QWidget):
         for k in self.device_clock_settings:
             k.blockSignals(False)
 
-    def _save_clock_config(self):
-        reply = QMessageBox.question(self, "Save?",
-                                    "Do you really want to save clock configuration to EEPROM?",
-                                    QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
+    def _save_clock_config(self, confirmed=False):
+        if not confirmed:
+            reply = QMessageBox.question(self, "Save?",
+                                        "Do you really want to save clock configuration to EEPROM?",
+                                        QMessageBox.Yes | QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
             
         for row in range(DeviceManager.MAX_DEVICES):
             if not self.device_checks[row].isChecked():
@@ -4163,12 +4591,13 @@ class Plotter(QWidget):
             f'[TriggerCtrl] {ip}: {TRIGGER_SETTINGS[index]} ({config_byte:02X}), holdoff={holdoff_ns} ns command sent'
         )
 
-    def _save_trigger_config(self):
-        reply = QMessageBox.question(self, "Save?",
-                                    "Do you really want to save trigger configuration to EEPROM?",
-                                    QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
+    def _save_trigger_config(self, confirmed=False):
+        if not confirmed:
+            reply = QMessageBox.question(self, "Save?",
+                                        "Do you really want to save trigger configuration to EEPROM?",
+                                        QMessageBox.Yes | QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
         for row in range(DeviceManager.MAX_DEVICES):
             if not self.device_checks[row].isChecked():
                 continue
@@ -4305,11 +4734,16 @@ class Plotter(QWidget):
         self._logger.info('Graf cleaned')
     
     def save_measurement(self):
+        self._save_measurement(show_dialog=True)
+
+    def _save_measurement(self, show_dialog):
         try:
             measurement_nr = int(self.measurement_number_edit.text())
         except ValueError:
-            QMessageBox.warning(self, "Saving error", "Measurement number is invalid.")
-            return
+            if show_dialog:
+                QMessageBox.warning(self, "Saving error", "Measurement number is invalid.")
+                return
+            raise APIError(400, 'invalid_measurement_number', 'Measurement number must be an integer')
 
         try:
             dir_path = 'RICE_mereni'
@@ -4320,15 +4754,18 @@ class Plotter(QWidget):
 
         except Exception as e:
             self._logger.exception("Measurement save failed")
-            QMessageBox.critical(
-                self,
-                "Measurement was not saved correctly",
-                f"Saving failed:\n{e}"
-            )
-            return
+            if show_dialog:
+                QMessageBox.critical(
+                    self,
+                    "Measurement was not saved correctly",
+                    f"Saving failed:\n{e}"
+                )
+                return
+            raise
 
         measurement_nr += 1
         self.measurement_number_edit.setText(str(measurement_nr))
+        return files
 
         #QMessageBox.information(
         #    self,
@@ -4474,17 +4911,21 @@ class Plotter(QWidget):
             out['missing_sections'] = missing_sections
         return out
 
-    def _save_calibration_bundle(self):
+    def _save_calibration_bundle(self, path=None):
+        requested_path = path is not None
         if not self.manager.devices:
+            if path is not None:
+                raise APIError(409, 'no_devices', 'No devices are currently applied')
             QMessageBox.warning(self, 'Save calibration', 'Nejsou aplikovaná žádná zařízení.')
             return
 
         os.makedirs('RICE_mereni', exist_ok=True)
-        default_name = datetime.now().strftime('RICE_mereni/calibration_%Y%m%d_%H%M%S.json')
-        path, _ = QFileDialog.getSaveFileName(self, 'Save calibration + alg config', default_name,
-                                              'JSON Files (*.json)')
-        if not path:
-            return
+        if path is None:
+            default_name = datetime.now().strftime('RICE_mereni/calibration_%Y%m%d_%H%M%S.json')
+            path, _ = QFileDialog.getSaveFileName(self, 'Save calibration + alg config', default_name,
+                                                  'JSON Files (*.json)')
+            if not path:
+                return
 
         try:
             devices_out = []
@@ -4515,8 +4956,11 @@ class Plotter(QWidget):
                 f.write('\n')
 
             self._logger.info(f'Saved calibration+alg config JSON: {path}')
+            return path
         except Exception as e:
             self._logger.exception('Calibration/config save failed')
+            if requested_path:
+                raise
             QMessageBox.critical(self, 'Save calibration', f'Uložení selhalo:\n{e}')
 
     def save_data(self, file_prefix=None, strict=True):
@@ -5297,6 +5741,7 @@ def main(argv):
         global USE_OPENGL
         global GUI_REFRESH_INTERVAL_MS
         global ISOMON_ENABLED
+        global REMOTE_CONTROL_ENABLED, REMOTE_CONTROL_ADDR_PORT, REMOTE_CONTROL_TOKEN
 
         DEFAULT_FIRST_IP = getattr(ds, 'DEFAULT_FIRST_IP', "192.168.137.100")
         DEFAULT_LEADER = getattr(ds, 'DEFAULT_LEADER', 1)
@@ -5304,6 +5749,9 @@ def main(argv):
         # ISOMON is disabled by default: until it actually streams data, enabling it
         # would break the running-system status (a checked device with no data).
         ISOMON_ENABLED = bool(getattr(ds, 'ISOMON_ENABLED', False))
+        REMOTE_CONTROL_ENABLED = bool(getattr(ds, 'REMOTE_CONTROL_ENABLED', False))
+        REMOTE_CONTROL_ADDR_PORT = str(getattr(ds, 'REMOTE_CONTROL_ADDR_PORT', REMOTE_CONTROL_ADDR_PORT))
+        REMOTE_CONTROL_TOKEN = str(getattr(ds, 'REMOTE_CONTROL_TOKEN', '') or '')
         DEFAULT_AVG_LEN_MS = getattr(ds, 'DEFAULT_AVG_LEN_MS', 1000)
         DEFAULT_PRETRIGGER_MS = int(getattr(ds, 'DEFAULT_PRETRIGGER_MS', getattr(ds, 'DEFAULT_PRETRIGGER_PACKETS', 0)))
         # Fall back to DEFAULT_AVG_LEN_MS so behaviour is unchanged when the setting/file is absent.
@@ -5397,6 +5845,7 @@ def main(argv):
         try:
             return app.exec_()
         finally:
+            gui._remote_stop()
             manager.shutdown()
 
 if __name__=='__main__':

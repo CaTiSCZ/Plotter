@@ -15,3 +15,6 @@ GUI_REFRESH_INTERVAL_MS = 100 ## how often the plot, fault indicators and analog
 FIREWALL_PENETRATION = 'on' ## stall-diagnostic firewall test: 'off' = never test; 'on' = silent ping via data socket; 'verbose' = same but the ping is not silent so it shows up in the device log
 FIREWALL_KEEPALIVE_TIMEOUT_S = 25 ## firewall idle-close timeout (s); SCADA re-pings the device command port (where logs originate) when a device is silent this long so sparse logs keep arriving. Gated by FIREWALL_PENETRATION ('off' disables it; 'verbose' = non-silent ping). Set at or slightly below the real firewall timeout.
 USE_OPENGL = False ## render plot curves with OpenGL (GPU); can be much faster for very large traces but requires a working OpenGL driver (PyOpenGL). Leave False to use the default CPU painter.
+REMOTE_CONTROL_ENABLED = False ## start the optional HTTP control interface on application launch
+REMOTE_CONTROL_ADDR_PORT = '127.0.0.1:8765' ## IPv4 bind address and port; can be changed from the GUI without restarting SCADA
+REMOTE_CONTROL_TOKEN = '' ## bearer token; required for non-loopback binds and used for every API request when configured
