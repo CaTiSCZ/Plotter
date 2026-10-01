@@ -2503,37 +2503,31 @@ class Plotter(QWidget):
 
         self.leader_buttons.buttonClicked[int].connect(self._leader_changed)
 
-        cfg.addWidget(QLabel('Receiver addr:port'), 0, 8)
-        self.receiver_edit = QLineEdit(f'0.0.0.0:{DEFAULT_DATA_PORT}')
-        self.receiver_edit.setObjectName('receiver_addr_port')
-        cfg.addWidget(self.receiver_edit, 0, 9)
-
-        cfg.addWidget(QLabel('Remote Control'), 4, 8)
+        cfg.addWidget(QLabel('Remote Control'), 0, 8)
         self.remote_control_enabled = QCheckBox('Enabled')
         self.remote_control_enabled.setObjectName('remote_control_enabled')
         self.remote_control_enabled.setChecked(REMOTE_CONTROL_ENABLED)
-        cfg.addWidget(self.remote_control_enabled, 4, 9)
-        cfg.addWidget(QLabel('Web addr:port'), 5, 8)
+        cfg.addWidget(self.remote_control_enabled, 0, 9)
+        cfg.addWidget(QLabel('Web addr:port'), 1, 8)
         self.remote_control_addr = QLineEdit(REMOTE_CONTROL_ADDR_PORT)
         self.remote_control_addr.setObjectName('remote_control_addr_port')
         self.remote_control_addr.setPlaceholderText('127.0.0.1:8765')
-        cfg.addWidget(self.remote_control_addr, 5, 9)
-        self.remote_control_apply = QPushButton('Apply web address')
-        self.remote_control_apply.setObjectName('remote_control_apply')
-        cfg.addWidget(self.remote_control_apply, 7, 8)
-        self.remote_control_status = QLabel('Remote Control: disabled')
-        self.remote_control_status.setObjectName('remote_control_status')
-        self.remote_control_status.setStyleSheet('font-family: monospace')
-        cfg.addWidget(self.remote_control_status, 7, 9)
+        self.remote_control_addr.setEnabled(not REMOTE_CONTROL_ENABLED)
+        cfg.addWidget(self.remote_control_addr, 1, 9)
 
-        cfg.addWidget(QLabel('Measurement number'), 2, 8)
+        cfg.addWidget(QLabel('Receiver addr:port'), 2, 8)
+        self.receiver_edit = QLineEdit(f'0.0.0.0:{DEFAULT_DATA_PORT}')
+        self.receiver_edit.setObjectName('receiver_addr_port')
+        cfg.addWidget(self.receiver_edit, 2, 9)
+
+        cfg.addWidget(QLabel('Measurement number'), 3, 8)
         self.measurement_number_edit = QLineEdit(f'0')
         self.measurement_number_edit.setObjectName('measurement_number')
-        cfg.addWidget(self.measurement_number_edit, 2, 9)
+        cfg.addWidget(self.measurement_number_edit, 3, 9)
 
         self.save_calibration_btn = QPushButton('Save calibration')
         self.save_calibration_btn.setObjectName('save_calibration')
-        cfg.addWidget(self.save_calibration_btn, 3, 9)
+        cfg.addWidget(self.save_calibration_btn, 4, 9)
         self.save_calibration_btn.clicked.connect(self._save_calibration_bundle)
 
         self.apply_btn = QPushButton('Apply Device List')
@@ -2854,13 +2848,13 @@ class Plotter(QWidget):
             logger=self._logger,
         )
         self.remote_control_enabled.toggled.connect(self._remote_toggle)
-        self.remote_control_apply.clicked.connect(self._remote_apply_address)
-        self.remote_control_addr.editingFinished.connect(self._remote_apply_address)
+        self.remote_control_addr.setEnabled(not self.remote_control_enabled.isChecked())
         if REMOTE_CONTROL_ENABLED:
             if not self._remote_start(self.remote_control_addr.text()):
                 self.remote_control_enabled.blockSignals(True)
                 self.remote_control_enabled.setChecked(False)
                 self.remote_control_enabled.blockSignals(False)
+            self.remote_control_addr.setEnabled(True)
 
     def closeEvent(self, event):
         self.remote_control_enabled.blockSignals(True)
@@ -2870,27 +2864,22 @@ class Plotter(QWidget):
         self.manager.shutdown()
         super().closeEvent(event)
 
-    def _remote_set_status(self, text, error=False):
-        color = '#b00020' if error else '#207a3c'
-        self.remote_control_status.setText(text)
-        self.remote_control_status.setStyleSheet(f'font-family: monospace; color: {color}')
-
     def _remote_start(self, address):
         try:
             active_address = self._remote_server.start(address)
         except Exception as exc:
-            self._remote_set_status(f'Remote Control: error: {exc}', error=True)
+            self.remote_control_enabled.setToolTip(f'Listener failed to start: {exc}')
             self._logger.error(f'Remote Control listener failed to start: {exc}')
             return False
-        self._remote_set_status(f'Remote Control: enabled at {active_address}')
+        self.remote_control_enabled.setToolTip(f'HTTP API listening at {active_address}')
         self._logger.info(f'Remote Control listener started at {active_address}')
         return True
 
     def _remote_stop(self):
         if getattr(self, '_remote_server', None) is not None:
             self._remote_server.stop()
-        if hasattr(self, 'remote_control_status'):
-            self._remote_set_status('Remote Control: disabled')
+        if hasattr(self, 'remote_control_enabled'):
+            self.remote_control_enabled.setToolTip('Remote Control listener is disabled')
 
     def _remote_toggle(self, enabled):
         if enabled:
@@ -2898,30 +2887,12 @@ class Plotter(QWidget):
                 self.remote_control_enabled.blockSignals(True)
                 self.remote_control_enabled.setChecked(False)
                 self.remote_control_enabled.blockSignals(False)
+                self.remote_control_addr.setEnabled(True)
+            else:
+                self.remote_control_addr.setEnabled(False)
         else:
             self._remote_stop()
-
-    def _remote_apply_address(self, *_):
-        address = self.remote_control_addr.text().strip()
-        if not self.remote_control_enabled.isChecked():
-            self._remote_set_status('Remote Control: disabled; address saved for this run')
-            return
-        replacement = RemoteControlServer(
-            self._remote_bridge.dispatch,
-            token=REMOTE_CONTROL_TOKEN,
-            logger=self._logger,
-        )
-        try:
-            active_address = replacement.start(address)
-        except Exception as exc:
-            self._remote_set_status(f'Remote Control: rebind failed: {exc}', error=True)
-            self._logger.error(f'Remote Control rebind failed; keeping previous listener: {exc}')
-            return
-        previous = self._remote_server
-        self._remote_server = replacement
-        previous.stop()
-        self._remote_set_status(f'Remote Control: enabled at {active_address}')
-        self._logger.info(f'Remote Control listener rebound to {active_address}')
+            self.remote_control_addr.setEnabled(True)
 
     def _remote_widget_registry(self):
         registry = {'window': self}

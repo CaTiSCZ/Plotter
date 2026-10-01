@@ -24,6 +24,7 @@ class RemoteControlGuiTests(unittest.TestCase):
         self.plotter.remote_control_enabled.blockSignals(True)
         self.plotter.remote_control_enabled.setChecked(True)
         self.plotter.remote_control_enabled.blockSignals(False)
+        self.plotter.remote_control_addr.setEnabled(False)
         self.server = RemoteControlServer(self.plotter._remote_bridge.dispatch)
         address = self.server.start('127.0.0.1:0')
         host, port = address.rsplit(':', 1)
@@ -69,6 +70,8 @@ class RemoteControlGuiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         widgets = {widget['id']: widget for widget in snapshot['data']['widgets']}
         self.assertIn('remote_control_enabled', widgets)
+        self.assertIn('remote_control_addr_port', widgets)
+        self.assertFalse(widgets['remote_control_addr_port']['enabled'])
         self.assertIn('statistics', widgets)
         self.assertIn('log_output', widgets)
         self.assertGreater(len(widgets), 25)
@@ -79,6 +82,15 @@ class RemoteControlGuiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(updated['data']['value'], 123)
         self.assertEqual(self.plotter.sample_spin.value(), 123)
+
+    def test_remote_control_layout_uses_two_top_rows(self):
+        config_grid = self.plotter.layout().itemAt(0).layout()
+        self.assertEqual(config_grid.getItemPosition(config_grid.indexOf(self.plotter.remote_control_enabled))[:2], (0, 9))
+        self.assertEqual(config_grid.getItemPosition(config_grid.indexOf(self.plotter.remote_control_addr))[:2], (1, 9))
+        self.assertEqual(config_grid.itemAtPosition(0, 8).widget().text(), 'Remote Control')
+        self.assertEqual(config_grid.itemAtPosition(1, 8).widget().text(), 'Web addr:port')
+        self.assertFalse(hasattr(self.plotter, 'remote_control_apply'))
+        self.assertFalse(hasattr(self.plotter, 'remote_control_status'))
 
     def test_measurement_routes_and_log_route_are_exposed(self):
         status, live = self._request_on_gui_event_loop('/api/v1/live')
@@ -102,19 +114,27 @@ class RemoteControlGuiTests(unittest.TestCase):
 
     def test_runtime_toggle_and_rebind(self):
         self.plotter.remote_control_enabled.setChecked(False)
+        self.assertTrue(self.plotter.remote_control_addr.isEnabled())
         self.plotter.remote_control_addr.setText('127.0.0.1:0')
         self.plotter.remote_control_enabled.setChecked(True)
         self.assertTrue(self.plotter._remote_server.running)
+        self.assertFalse(self.plotter.remote_control_addr.isEnabled())
         first_address = self.plotter._remote_server.address
 
-        self.plotter.remote_control_addr.setText('127.0.0.1:0')
-        self.plotter._remote_apply_address()
-        second_address = self.plotter._remote_server.address
-        self.assertNotEqual(first_address, second_address)
+        self.plotter.remote_control_enabled.setChecked(False)
+        self.assertTrue(self.plotter.remote_control_addr.isEnabled())
+        self.assertFalse(self.plotter._remote_server.running)
 
         self.plotter.remote_control_addr.setText('not-an-address')
-        self.plotter._remote_apply_address()
-        self.assertEqual(self.plotter._remote_server.address, second_address)
+        self.plotter.remote_control_enabled.setChecked(True)
+        self.assertFalse(self.plotter.remote_control_enabled.isChecked())
+        self.assertFalse(self.plotter._remote_server.running)
+        self.assertTrue(self.plotter.remote_control_addr.isEnabled())
+
+        self.plotter.remote_control_addr.setText('127.0.0.1:0')
+        self.plotter.remote_control_enabled.setChecked(True)
+        self.assertTrue(self.plotter._remote_server.running)
+        self.assertNotEqual(first_address, self.plotter._remote_server.address)
 
         self.plotter.remote_control_enabled.setChecked(False)
         self.assertFalse(self.plotter._remote_server.running)

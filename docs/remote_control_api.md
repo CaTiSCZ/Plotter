@@ -8,9 +8,9 @@ This document is the agent-facing contract. Clients should discover widget IDs f
 
 ## Availability and Base URL
 
-The listener is controlled by the **Remote Control** checkbox in the SCADA window. When unchecked, the HTTP listener is stopped and requests cannot be made. Toggle it on in the GUI to start the listener. The **Web addr:port** field can be changed and applied while SCADA is running; a failed rebind leaves the previous listener active.
+The top-right configuration rows contain **Remote Control** with its **Enabled** checkbox, followed by **Web addr:port** and its text field. When unchecked, the HTTP listener is stopped. When checked, the listener starts using the current address and the address field becomes disabled. To change the bind address while SCADA is running, uncheck **Enabled**, edit **Web addr:port**, then check **Enabled** again. If the new bind fails, the checkbox returns to unchecked and the field stays editable; the failure is logged and available as the checkbox tooltip.
 
-At startup, `REMOTE_CONTROL_ENABLED` and `REMOTE_CONTROL_ADDR_PORT` are loaded from `default_settings.py`. Runtime GUI changes are temporary and are not written back to that file. The default bind is `127.0.0.1:8765`. The GUI status label shows the active address; `GET /api/v1/status` also reports it while the listener is running. Port `0` asks the operating system for an available port; use the actual port shown by the status label or status endpoint.
+At startup, `REMOTE_CONTROL_ENABLED` and `REMOTE_CONTROL_ADDR_PORT` are loaded from `default_settings.py`. Runtime GUI changes are temporary and are not written back to that file. The default bind is `127.0.0.1:8765`. `GET /api/v1/status` reports the active address while the listener is running. Port `0` asks the operating system for an available port; use the actual port returned by the status endpoint.
 
 Base URL examples:
 
@@ -98,7 +98,7 @@ Example descriptor:
 }
 ```
 
-Important object names include `remote_control_enabled`, `remote_control_addr_port`, `remote_control_apply`, `remote_control_status`, `receiver_addr_port`, `measurement_number`, `apply_device_list`, `apply_config`, `start_system`, `stop_system`, `system_status`, `pretrigger_ms`, `posttrigger_ms`, `start_sampling`, `start_sampling_on_trigger`, `save_measurement`, `save_calibration`, `force_trigger`, `reset_counter`, `reset_latched_faults`, `reset_devices`, `downsample_mode`, `downsample_factor`, `clip_to_view`, `statistics`, `log_visible`, and `log_output`. Device-row controls use names such as `device_0_enabled`, `device_0_address`, `device_0_leader`, `device_0_clock`, `device_0_trigger`, and `device_0_trigger_holdoff_us`; ISOMON controls use `isomon_*` names.
+Important object names include `remote_control_enabled`, `remote_control_addr_port`, `receiver_addr_port`, `measurement_number`, `apply_device_list`, `apply_config`, `start_system`, `stop_system`, `system_status`, `pretrigger_ms`, `posttrigger_ms`, `start_sampling`, `start_sampling_on_trigger`, `save_measurement`, `save_calibration`, `force_trigger`, `reset_counter`, `reset_latched_faults`, `reset_devices`, `downsample_mode`, `downsample_factor`, `clip_to_view`, `statistics`, `log_visible`, and `log_output`. Device-row controls use names such as `device_0_enabled`, `device_0_address`, `device_0_leader`, `device_0_clock`, `device_0_trigger`, and `device_0_trigger_holdoff_us`; ISOMON controls use `isomon_*` names.
 
 Some Qt widgets do not have an explicit object name. Their IDs are generated from their current widget hierarchy. Treat every returned ID as opaque, use it exactly as returned, and rediscover it after application upgrades or UI changes. Labels, plots, and other read-only widgets have an empty `capabilities` list. Text widgets are truncated to the most recent 16 KiB in the snapshot.
 
@@ -227,7 +227,7 @@ Equivalent widget interactions can be used for device configuration: set device 
 | `503` | `busy`, `remote_disabled` | Request capacity is full or a queued request reached the GUI after Remote Control was disabled |
 | `504` | `timeout` | GUI thread did not complete within 60 seconds |
 
-Bind errors are shown in the GUI status label. If a runtime rebind fails, the old listener stays active. The HTTP service does not support CORS or IPv6.
+Bind errors are logged and shown in the Remote Control checkbox tooltip; a failed start leaves the listener disabled. The HTTP service does not support CORS or IPv6.
 
 ## Python Example
 
