@@ -3684,6 +3684,7 @@ class Plotter(QWidget):
                 self._logger.warning(f'Bad entry: {txt}')
         self._refresh_fault_indicators()
         self._refresh_analog_values()
+        self._discover_isomon_stream_rates()
         self._update_capture_limits()
         self._logger.info(f'Applied {count} devices')
 
