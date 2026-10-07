@@ -28,7 +28,7 @@ from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Tuple, List
-from datetime import datetime
+from datetime import datetime, timezone
 from contextlib import ExitStack
 
 import numpy as np
@@ -5011,7 +5011,7 @@ class Plotter(QWidget):
 
             payload = {
                 'format': 'fdds_scada_calibration_alg_config_v1',
-                'created_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'created_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
                 'app': {
                     'name': APPLICATION_NAME,
                     'version': APPLICATION_VERSION,
