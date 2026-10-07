@@ -2,6 +2,7 @@
 import json
 import base64
 import os
+import tempfile
 import threading
 import time
 import unittest
@@ -92,6 +93,52 @@ class RemoteControlGuiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(token['data']['text'], '********')
         self.assertEqual(self.plotter._remote_server._token, 'api-token')
+
+    def test_save_calibration_manual_and_remote(self):
+        ip = '127.0.0.2'
+        self.manager.add_device(ip)
+        calibration = {'channels': [{'unit': 'V', 'gain': 2.0, 'offset': 0.5}]}
+        os.makedirs('RICE_mereni', exist_ok=True)
+        with tempfile.TemporaryDirectory(dir='RICE_mereni') as directory, \
+             patch.object(self.plotter, '_calibration_from_loaded_id', return_value=calibration), \
+             patch.object(self.plotter, '_read_alg_config_snapshot', return_value={}), \
+             patch.object(self.plotter, '_identity_from_loaded_id', return_value={}), \
+             patch.object(scada.QMessageBox, 'critical') as error_dialog:
+            for mode in ('manual', 'remote'):
+                with self.subTest(mode=mode):
+                    path = os.path.join(directory, f'{mode}.json')
+                    with patch.object(scada.QFileDialog, 'getSaveFileName',
+                                      return_value=(path, 'JSON Files (*.json)')) as dialog:
+                        if mode == 'manual':
+                            self.plotter.save_calibration_btn.click()
+                            dialog.assert_called_once()
+                        else:
+                            status, _ = self._request_on_gui_event_loop(
+                                '/api/v1/widgets/save_calibration', method='POST',
+                                body={'action': 'save_to_path', 'path': path})
+                            self.assertEqual(status, 200)
+                            dialog.assert_not_called()
+                    with open(path, encoding='utf-8') as saved_file:
+                        payload = json.load(saved_file)
+                    self.assertEqual(payload['format'], 'fdds_scada_calibration_alg_config_v1')
+                    self.assertEqual(payload['devices'][0]['ip'], ip)
+                    self.assertEqual(payload['devices'][0]['calibration'], calibration)
+            error_dialog.assert_not_called()
+
+    def test_save_calibration_manual_without_devices(self):
+        with patch.object(scada.QMessageBox, 'warning') as warning, \
+             patch.object(scada.QFileDialog, 'getSaveFileName') as dialog:
+            self.plotter.save_calibration_btn.click()
+            warning.assert_called_once()
+            dialog.assert_not_called()
+
+    def test_save_calibration_manual_cancel(self):
+        self.manager.add_device('127.0.0.2')
+        with patch.object(scada.QFileDialog, 'getSaveFileName', return_value=('', '')) as dialog, \
+             patch.object(self.plotter, '_calibration_from_loaded_id') as calibration:
+            self.plotter.save_calibration_btn.click()
+            dialog.assert_called_once()
+            calibration.assert_not_called()
 
     def test_remote_control_stays_beside_live_values(self):
         config_grid = self.plotter.layout().itemAt(0).layout()

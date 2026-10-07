@@ -2677,7 +2677,7 @@ class Plotter(QWidget):
 
         for label, object_name, fn in (('Force trigger', 'force_trigger', self._force_trigger),
               ('Save Measurement', 'save_measurement', self.save_measurement),
-              ('Save calibration', 'save_calibration', self._save_calibration_bundle),
+              ('Save calibration', 'save_calibration', lambda: self._save_calibration_bundle()),
                           #('Stop Sampling'                  , self._stop_sampling                   ),
                           ('Reset Counter', 'reset_counter', self._reset_counter),
                           ('Reset Latched Faults', 'reset_latched_faults', self._reset_fault_state),
