@@ -152,11 +152,13 @@ class RemoteControlGuiTests(unittest.TestCase):
                     'body': b'',
                 }
             section = scada.fdds_alg_config.section_by_id(device_type, section_id)
-            values = {
-                name: ([(0.0 if not rest or rest[0] == 'f' else 0)] * count
-                       if count > 1 else (0.0 if not rest or rest[0] == 'f' else 0))
-                for name, count, *rest in section.fields
-            }
+            values = {}
+            for name, count, *rest in section.fields:
+                value = 1000.0 if device_type == 'isomon' and name in (
+                    'r3', 'r4', 'r5', 'r6', 'r7', 'r8') else 0
+                if not rest or rest[0] == 'f':
+                    value = float(value)
+                values[name] = [value] * count if count > 1 else value
             return {
                 'tag': tag,
                 'schema': 1,
@@ -229,6 +231,8 @@ class RemoteControlGuiTests(unittest.TestCase):
                 self.assertEqual(len(isomon._channel_widgets), 2)
                 self.assertAlmostEqual(isomon._channel_widgets[0][1].value(), 2.656798363)
                 self.assertAlmostEqual(isomon._channel_widgets[1][1].value(), 32.016990662)
+                self.assertTrue(all(isomon._isomon_resistor_widgets[name].value() == 1000.0
+                                    for name in ('r3', 'r4', 'r5', 'r6', 'r7', 'r8')))
                 self.assertTrue(isomon._dirty)
             finally:
                 os.unlink(imported_path)
@@ -237,6 +241,11 @@ class RemoteControlGuiTests(unittest.TestCase):
                 {'unit': 'A', 'offset': 1.25, 'gain': 0.5},
                 {'unit': 'mV', 'offset': -2.5, 'gain': 0.25},
             ]
+            bundle_resistors = {
+                name: value for name, value in zip(
+                    ('r3', 'r4', 'r5', 'r6', 'r7', 'r8'),
+                    (3.0, 4.0, 5.0, 6.0, 7.0, 8.0))
+            }
             bundle_payload = {
                 'format': 'fdds_scada_calibration_alg_config_v1',
                 'devices': [
@@ -253,6 +262,7 @@ class RemoteControlGuiTests(unittest.TestCase):
                         'calibration': {
                             'channels': bundle_channels,
                             'calibration_info': {'time': 0, 'id': 11},
+                            'isomon_resistors': bundle_resistors,
                         },
                         'alg_config': {
                             'device': 'isomon',
@@ -273,10 +283,19 @@ class RemoteControlGuiTests(unittest.TestCase):
                     isomon._import_values()
                 self.assertEqual(isomon._calibration['channels'], bundle_channels)
                 self.assertEqual(isomon._calibration['calibration_info']['id'], 11)
+                self.assertEqual(
+                    isomon._calibration['isomon_resistors'], bundle_resistors)
                 self.assertEqual(isomon._channel_widgets[0][0].text(), 'A')
                 self.assertAlmostEqual(isomon._channel_widgets[0][1].value(), 1.25)
                 self.assertEqual(isomon._channel_widgets[1][0].text(), 'mV')
                 self.assertAlmostEqual(isomon._channel_widgets[1][1].value(), -2.5)
+                self.assertEqual(
+                    {name: editor.value()
+                     for name, editor in isomon._isomon_resistor_widgets.items()},
+                    bundle_resistors)
+                calibration_values, _ = isomon._collect_values()
+                self.assertEqual(
+                    calibration_values['isomon_resistors'], bundle_resistors)
                 self.assertTrue(isomon._dirty)
             finally:
                 os.unlink(bundle_path)
@@ -289,6 +308,55 @@ class RemoteControlGuiTests(unittest.TestCase):
             for dialog in list(self.plotter._settings_dialogs.values()):
                 dialog._dirty = False
                 dialog.close()
+
+    def test_isomon_calibration_codec_includes_resistor_values(self):
+        device = scada.Device(
+            '127.0.0.20', scada.DEFAULT_CMD_PORT, scada.DEFAULT_DATA_PORT,
+            None, manager=self.manager)
+        try:
+            channels = [
+                {'unit': 'V', 'offset': 1.5, 'gain': 0.25},
+                {'unit': 'mV', 'offset': -2.0, 'gain': 0.5},
+            ]
+            resistor_values = {
+                name: value for name, value in zip(
+                    ('r3', 'r4', 'r5', 'r6', 'r7', 'r8'),
+                    (3.0, 4.0, 5.0, 6.0, 7.0, 8.0))
+            }
+            captured = {}
+
+            def send_ack(command, payload=b''):
+                captured['command'] = command
+                captured['payload'] = payload
+                return 0, b'\xff'
+
+            device._send_cmd_with_ack = send_ack
+            self.assertTrue(device.set_calibration(
+                channels, save=False,
+                calibration_info={'time': 123, 'id': 9},
+                isomon_resistors=resistor_values))
+            payload = captured['payload']
+            resistor_offset = 4 + len(channels) * scada.STRUCT.CHANNEL.size + 12
+            self.assertEqual(
+                scada.struct.unpack_from('<6f', payload, resistor_offset),
+                tuple(float(resistor_values[name])
+                      for name in ('r3', 'r4', 'r5', 'r6', 'r7', 'r8')))
+
+            response = (
+                bytes((0,)) + scada.struct.pack('<H', len(channels)) +
+                b''.join(scada.STRUCT.CHANNEL.pack(
+                    channel['unit'].encode(), channel['offset'], channel['gain'])
+                         for channel in channels) +
+                scada.STRUCT.CALIBRATION_INFO.pack(123, 9) +
+                scada.struct.pack('<6f', *resistor_values.values())
+            )
+            device._send_cmd_with_ack = lambda command, payload=b'': (0, response)
+            parsed = device.get_calibration(source=0)
+            self.assertEqual(parsed['channels'], channels)
+            self.assertEqual(parsed['calibration_info'], {'time': 123, 'id': 9})
+            self.assertEqual(parsed['isomon_resistors'], resistor_values)
+        finally:
+            device.cmd_sock.close()
 
     def test_remote_control_stays_beside_live_values(self):
         config_grid = self.plotter.layout().itemAt(0).layout()

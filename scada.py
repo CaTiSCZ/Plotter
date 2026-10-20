@@ -1167,14 +1167,22 @@ class Device:
             cal_time, cal_id = STRUCT.CALIBRATION_INFO.unpack(
                 extra[offset:offset + CALIBRATION_INFO_DATA_SIZE])
             calibration_info = {'time': cal_time, 'id': cal_id}
+            offset += CALIBRATION_INFO_DATA_SIZE
+        isomon_resistors = None
+        if offset + 6 * struct.calcsize('<f') <= len(extra):
+            resistor_values = struct.unpack_from('<6f', extra, offset)
+            isomon_resistors = dict(zip(
+                ('r3', 'r4', 'r5', 'r6', 'r7', 'r8'), resistor_values))
         return {
             'source': actual_source,
             'channels': channels,
             'calibration_info': calibration_info,
+            'isomon_resistors': isomon_resistors,
         }
 
     def set_calibration(self, channels: list[dict], save: bool = False,
-                        calibration_info: dict | None = None) -> bool | None:
+                        calibration_info: dict | None = None,
+                        isomon_resistors: dict | None = None) -> bool | None:
         """Apply device calibration values, optionally persisting them."""
         calibration_info = calibration_info or {}
         payload = struct.pack(
@@ -1186,8 +1194,18 @@ class Device:
         payload += struct.pack(
             '<QI', int(calibration_info.get('time', 0)),
             int(calibration_info.get('id', 0)))
+        if isomon_resistors is not None:
+            resistor_names = ('r3', 'r4', 'r5', 'r6', 'r7', 'r8')
+            resistor_values = [float(isomon_resistors[name]) for name in resistor_names]
+            if any(not math.isfinite(value) or value <= 0 for value in resistor_values):
+                raise ValueError('Hodnoty rezistorové kalibrace ISOMON musí být konečné a kladné.')
+            payload += struct.pack('<6f', *resistor_values)
         res = self._send_cmd_with_ack(int(CMD.SET_CALIBRATION), payload)
-        return res is not None
+        if res is None:
+            return None
+        state, extra = res
+        expected_status = 0 if save else 0xFF
+        return state == 0 and len(extra) == 1 and extra[0] == expected_status
 
     def set_alg_config_section(self, section_id: int, data: bytes, save: bool = False) -> dict | None:
         """Update one section of the live (RAM) algorithm parameters.
@@ -2457,6 +2475,7 @@ class DeviceSettingsDialog(QDialog):
         self._section_specs = []
         self._field_widgets: dict[str, dict[str, list[QWidget]]] = {}
         self._channel_widgets: list[tuple[QLineEdit, QDoubleSpinBox, QDoubleSpinBox]] = []
+        self._isomon_resistor_widgets: dict[str, QDoubleSpinBox] = {}
 
         self.setWindowTitle(f'{device_label} — {device.ip} — Settings')
         self.setWindowModality(Qt.NonModal)
@@ -2621,6 +2640,18 @@ class DeviceSettingsDialog(QDialog):
                 raise RuntimeError(
                     f'Sekce {section.name} má neplatnou délku ({len(body)} B; očekáváno {section.size} B).')
             values[section.name] = section.unpack(body)
+        if calibration is not None and (self.device.role == 'isomon' or self.device.is_isomon):
+            if not calibration.get('isomon_resistors'):
+                algorithm_resistors = values.get('isomon_iso', {})
+                resistor_names = ('r3', 'r4', 'r5', 'r6', 'r7', 'r8')
+                if all(name in algorithm_resistors for name in resistor_names):
+                    calibration['isomon_resistors'] = {
+                        name: float(algorithm_resistors[name])
+                        for name in resistor_names
+                    }
+                else:
+                    raise RuntimeError(
+                        'Kalibrační rezistory ISOMON R3–R8 nejsou v odpovědi zařízení ani v konfiguraci algoritmu.')
         return calibration, device_type, sections, values
 
     def _read_values(self, source: str, initial: bool = False):
@@ -2679,6 +2710,7 @@ class DeviceSettingsDialog(QDialog):
         self._clear_layout(self.calibration_layout)
         self._clear_layout(self.algorithms_layout)
         self._channel_widgets.clear()
+        self._isomon_resistor_widgets.clear()
         self._field_widgets.clear()
 
         calibration_title = QLabel('Kalibrace kanálů')
@@ -2727,6 +2759,22 @@ class DeviceSettingsDialog(QDialog):
                 grid.addWidget(unit, index + 1, 3)
                 self._channel_widgets.append((unit, offset, gain))
             self.calibration_layout.addLayout(grid)
+            if self.device.role == 'isomon' or self.device.is_isomon:
+                resistor_values = (self._calibration or {}).get('isomon_resistors') or {}
+                resistor_group = QWidget()
+                resistor_layout = QFormLayout(resistor_group)
+                resistor_layout.addRow(QLabel('<b>Kalibrace rezistorů ISOMON [Ω]</b>'))
+                for name in ('r3', 'r4', 'r5', 'r6', 'r7', 'r8'):
+                    editor = QDoubleSpinBox()
+                    editor.setObjectName(f'isomon_calibration_{name}')
+                    editor.setRange(0.000001, 1e30)
+                    editor.setDecimals(6)
+                    if name in resistor_values:
+                        editor.setValue(float(resistor_values[name]))
+                    editor.valueChanged.connect(self._mark_dirty)
+                    resistor_layout.addRow(name.upper(), editor)
+                    self._isomon_resistor_widgets[name] = editor
+                self.calibration_layout.addWidget(resistor_group)
 
         for section in self._section_specs:
             group = QWidget()
@@ -2748,16 +2796,29 @@ class DeviceSettingsDialog(QDialog):
             self.algorithms_layout.addWidget(group)
         self._loading = False
 
-    def _collect_values(self) -> tuple[list[dict] | None, dict]:
+    def _collect_values(self) -> tuple[dict | None, dict]:
         calibration = None
         if self._supports_calibration():
-            calibration = []
+            channels = []
             for unit, offset, gain in self._channel_widgets:
-                calibration.append({
+                channels.append({
                     'unit': unit.text(),
                     'offset': offset.value(),
                     'gain': gain.value(),
                 })
+            calibration = {
+                'channels': channels,
+                'calibration_info': (self._calibration or {}).get('calibration_info'),
+            }
+            if self._isomon_resistor_widgets:
+                calibration['isomon_resistors'] = {
+                    name: editor.value()
+                    for name, editor in self._isomon_resistor_widgets.items()
+                }
+                if any(
+                        not math.isfinite(value) or value <= 0
+                        for value in calibration['isomon_resistors'].values()):
+                    raise ValueError('Hodnoty rezistorové kalibrace ISOMON musí být konečné a kladné.')
         sections = {}
         for section in self._section_specs:
             fields = {}
@@ -2781,9 +2842,11 @@ class DeviceSettingsDialog(QDialog):
 
     def _send_values(self, calibration, sections, save: bool) -> bool:
         if calibration is not None:
-            current_info = (self._calibration or {}).get('calibration_info') or {}
             result = self.device.set_calibration(
-                calibration, save=save, calibration_info=current_info)
+                calibration['channels'],
+                save=save,
+                calibration_info=calibration.get('calibration_info'),
+                isomon_resistors=calibration.get('isomon_resistors'))
             if result is not True:
                 raise RuntimeError('Zařízení nepotvrdilo zápis kalibrace.')
         for section in self._section_specs:
@@ -2848,7 +2911,8 @@ class DeviceSettingsDialog(QDialog):
                 raise RuntimeError('Aktivní kalibraci se nepodařilo načíst pro uložení.')
             if self.device.set_calibration(
                     calibration['channels'], save=True,
-                    calibration_info=calibration.get('calibration_info')) is not True:
+                    calibration_info=calibration.get('calibration_info'),
+                    isomon_resistors=calibration.get('isomon_resistors')) is not True:
                 raise RuntimeError('Uložení kalibrace selhalo.')
         result = self.device.save_alg_config()
         if result is not True:
@@ -2948,6 +3012,32 @@ class DeviceSettingsDialog(QDialog):
                     if not isinstance(channel, dict) or not all(
                             key in channel for key in ('unit', 'offset', 'gain')):
                         raise ValueError(f'Kalibrace kanálu {index} v souboru není platná.')
+                if self.device.role == 'isomon' or self.device.is_isomon:
+                    resistor_names = ('r3', 'r4', 'r5', 'r6', 'r7', 'r8')
+                    resistor_values = calibration.get('isomon_resistors')
+                    if not isinstance(resistor_values, dict):
+                        resistor_values = {
+                            name: imported['isomon_iso'][name]
+                            for name in resistor_names
+                            if name in imported.get('isomon_iso', {})
+                        }
+                    if len(resistor_values) != len(resistor_names):
+                        current_resistors = (self._calibration or {}).get('isomon_resistors', {})
+                        if all(name in current_resistors for name in resistor_names):
+                            resistor_values = current_resistors
+                        else:
+                            raise ValueError('Soubor neobsahuje kalibraci rezistorů ISOMON R3–R8.')
+                    try:
+                        resistor_values = {
+                            name: float(resistor_values[name])
+                            for name in resistor_names
+                        }
+                    except (TypeError, ValueError, KeyError) as exc:
+                        raise ValueError('Kalibrace rezistorů ISOMON v souboru není platná.') from exc
+                    if any(not math.isfinite(value) or value <= 0
+                           for value in resistor_values.values()):
+                        raise ValueError('Kalibrační rezistory ISOMON musí být konečné a kladné.')
+                    calibration['isomon_resistors'] = resistor_values
 
             self._loading = True
             self._sections = imported
@@ -5573,6 +5663,15 @@ class Plotter(QWidget):
 
     def _calibration_from_loaded_id(self, dev: Device) -> dict:
         """Build calibration snapshot from data currently loaded in SCADA."""
+        if dev.role == 'isomon' or dev.is_isomon:
+            calibration = dev.get_calibration(source=0)
+            if calibration is None:
+                raise RuntimeError(f'Zařízení {dev.ip}: nelze načíst ISOMON kalibraci.')
+            if not calibration.get('isomon_resistors'):
+                raise RuntimeError(
+                    f'Zařízení {dev.ip}: odpověď neobsahuje kalibrační rezistory ISOMON.')
+            return calibration
+
         info = getattr(dev, 'info', None)
         if not info or 'channels' not in info:
             info = dev.get_id()

@@ -37,8 +37,7 @@ ALG_CONFIG_TAG_CCU = 0x4343   # 'CC'
 ALG_CONFIG_TAG_ISOMON = 0x4953  # 'IS'
 NODE_ALG_SCHEMA_VER = 1
 CCU_ALG_SCHEMA_VER = 1
-ISOMON_STREAM_SCHEMA_VER = 1
-ISOMON_ISO_SCHEMA_VER = 1
+ISOMON_ISO_SCHEMA_VER = 2
 
 # Section ids
 ALG_SEC_ALL = 0xFF
@@ -48,8 +47,8 @@ ALG_SEC_NODE_DV_CURV = 0x03  # dvc_upper/lower bound voltage+time
 ALG_SEC_CCU_ARC = 0x10       # arc_* matrices + arc_flagBias
 ALG_SEC_CCU_SC = 0x11        # sc_a, sc_i0, sc_threshold
 ALG_SEC_CCU_DS = 0x12        # ds_z1..z3, ds_id_length
-ALG_SEC_ISOMON_STREAM = 0x20  # agg_count, stream_enable, reserved bytes
-ALG_SEC_ISOMON_ISO = 0x21     # isomon_iso_config_t
+ALG_SEC_ISOMON_STREAM = 0x20  # agg_count, stream_enable
+ALG_SEC_ISOMON_ISO = 0x21     # resistors, average, enable, settling parameters
 
 # ---------------------------------------------------------------------------
 # Enum helpers
@@ -158,6 +157,12 @@ class CMD(IntEnumName):
     INJECT_FAULT_STATE = 60
     GET_DIGITAL_CHANNELS = 61
     LOCATE = 62
+    GET_NODE_TX_DROPS = 63
+    I2C_DISCOVERY = 64
+    I2C_DIAG_CONTROL = 65
+    I2C_WRITE = 66
+    I2C_READ = 67
+    I2C_WRITE_READ = 68
 
 
 # ---------------------------------------------------------------------------

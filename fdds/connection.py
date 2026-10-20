@@ -156,6 +156,19 @@ class DeviceConnection:
         """Ping the device. Returns True if responds."""
         return self.send_cmd(CMD.PING) is not None
 
+    def locate(self, on: bool = True) -> Optional[bool]:
+        """Physical board locate: fast-blink all LEDs (green+blue+red) for identification.
+
+        Returns the resulting state (bool) or ``None`` on failure.
+        """
+        result = self.send_cmd_with_ack(CMD.LOCATE, bytes([1 if on else 0]))
+        if result is None:
+            return None
+        _state, extra = result
+        if len(extra) < 1:
+            return None
+        return bool(extra[0])
+
     def enable_broadcast_rx(self, enable: bool) -> Optional[bool]:
         """Enable/disable acceptance of broadcast commands (RAM-only).
 
@@ -424,6 +437,16 @@ class DeviceConnection:
             "overrun_count": overrun_count,
         }
 
+    def get_node_tx_drops(self, reset: bool = False) -> Optional[int]:
+        """Read node DATA packets evicted before TX; optionally clear atomically."""
+        result = self.send_cmd_with_ack(CMD.GET_NODE_TX_DROPS, bytes([int(reset)]))
+        if result is None:
+            return None
+        _state, extra = result
+        if len(extra) != 4:
+            return None
+        return struct.unpack('<I', extra)[0]
+
     def register_receiver(self, receiver_ip: str, receiver_port: int,
                           receiver_type: int = RECEIVER_TYPE_DATA,
                           save: bool = False) -> bool:
@@ -514,7 +537,8 @@ class DeviceConnection:
     def set_calibration(self, channels: int,
                         info: list[tuple[str, float, float]],
                         save: bool = True,
-                        cal_time: int = 0, cal_id: int = 0) -> bool:
+                        cal_time: int = 0, cal_id: int = 0,
+                        resistors: Optional[tuple[float, float, float, float, float, float]] = None) -> bool:
         """Set channel calibration on device.
 
         Args:
@@ -523,19 +547,32 @@ class DeviceConnection:
             save: persist to EEPROM
             cal_time: calibration timestamp (uint64, Unix epoch seconds)
             cal_id: calibration identifier (uint32)
+            resistors: Optional Isomon (R3, R4, R5, R6, R7, R8) calibration
+                in ohms. Both resistor fields are persisted in the ADC EEPROM
+                alongside channel calibration. Omit it for channel-only calibration.
         """
+        if resistors is not None:
+            if len(resistors) != 6 or any(not math.isfinite(value) or value <= 0 for value in resistors):
+                raise ValueError("Isomon resistor calibration must contain six finite, positive values")
         pkt = struct.pack('<IBxH', int(CMD.SET_CALIBRATION),
                           SAVE_KEY if save else 0, channels)
         for unit, offset, gain in info:
             pkt += struct.pack('<3sxff', unit.encode('utf-8')[:3], offset, gain)
         # Append calibration_info_t (12 bytes)
         pkt += struct.pack('<QI', cal_time, cal_id)
+        if resistors is not None:
+            pkt += struct.pack('<6f', *resistors)
         crc_val = crc16_ccitt(pkt)
         pkt += struct.pack('<H', crc_val)
         self.sock.sendto(pkt, (self.ip, self.cmd_port))
         try:
             resp, addr = self.sock.recvfrom(4096)
-            return resp is not None and len(resp) > 0
+            if len(resp) != STRUCT.ACK.size + 1:
+                return False
+            pkt_type, state, command = STRUCT.ACK.unpack_from(resp)
+            expected_status = 0 if save else 255
+            return (pkt_type == PACKET.ACK and state == 0
+                    and command == CMD.SET_CALIBRATION and resp[-1] == expected_status)
         except socket.timeout:
             return False
 
@@ -569,10 +606,16 @@ class DeviceConnection:
             cal_time, cal_id = STRUCT.CALIBRATION_INFO.unpack(
                 extra[offset:offset + CALIBRATION_INFO_DATA_SIZE])
             cal_info = {"time": cal_time, "id": cal_id}
+            offset += CALIBRATION_INFO_DATA_SIZE
+        isomon_resistors = None
+        if offset + 6 * 4 <= len(extra):
+            values = struct.unpack('<6f', extra[offset:offset + 6 * 4])
+            isomon_resistors = dict(zip(("r3", "r4", "r5", "r6", "r7", "r8"), values))
         return {
             "source": src,
             "channels": channels,
             "calibration_info": cal_info,
+            "isomon_resistors": isomon_resistors,
         }
 
     def get_channel_minmax(self, source: int = 0) -> Optional[dict]:
@@ -595,12 +638,21 @@ class DeviceConnection:
         src = extra[0]
         channels_count = struct.unpack('<H', extra[1:3])[0]
         offset = 3
+        # The device serializes the snapshot in its native ADC width: 16-bit nodes
+        # send four int16 fields/channel (8 bytes), 20-bit isomons send four int32
+        # fields/channel (16 bytes). Infer the field width from the payload length
+        # so a single decoder handles both without a device-type hint.
+        stride = ((len(extra) - offset) // channels_count) if channels_count else 8
+        if stride >= 16:
+            fmt, stride = '<iiii', 16
+        else:
+            fmt, stride = '<hhhh', 8
         channels = []
         for _ in range(channels_count):
-            end = offset + 8
+            end = offset + stride
             if end > len(extra):
                 break
-            absolute_min, absolute_max, run_min, run_max = struct.unpack('<hhhh', extra[offset:end])
+            absolute_min, absolute_max, run_min, run_max = struct.unpack(fmt, extra[offset:end])
             channels.append({
                 "absolute_min": absolute_min,
                 "absolute_max": absolute_max,
@@ -750,6 +802,101 @@ class DeviceConnection:
             return None
         return struct.unpack('<I', extra[:4])[0]
 
+    def i2c_discovery(self, bus: int = 0, addresses: Optional[list[int]] = None) -> Optional[dict]:
+        """Scan 0x08..0x77 (7-bit). Bus 0 selects the analog bus by HW revision.
+
+        addresses optionally restricts the actual probes; duplicates are removed
+        and probes are sent in ascending order. Requires selection-aware firmware.
+        A nonzero status means the scan failed or was incomplete; any returned
+        addresses then represent only the ACKs observed before the failure.
+        """
+        if bus not in (0, 1, 2, 4):
+            raise ValueError("I2C bus must be 0 (analog auto), 1, 2, or 4")
+        selected = None
+        if addresses is not None:
+            if not addresses or any(not isinstance(a, int) or not 0x08 <= a <= 0x77
+                                    for a in addresses):
+                raise ValueError("Select at least one 7-bit address in 0x08..0x77")
+            selected = sorted(set(addresses))
+        result = self.send_cmd_with_ack(CMD.I2C_DISCOVERY, bytes([bus] + (selected or [])))
+        if result is None:
+            return None
+        _, extra = result
+        if len(extra) < 3:
+            raise RuntimeError("Truncated I2C discovery response")
+        status, resolved_bus, count = extra[:3]
+        addresses = list(extra[3:])
+        if (status not in range(5) or len(addresses) != count or count > 112
+                or any(not 0x08 <= address <= 0x77 for address in addresses)
+                or addresses != sorted(set(addresses))
+                or (selected is not None and any(a not in selected for a in addresses))
+                or (status == 0 and resolved_bus not in (1, 2, 4))):
+            raise RuntimeError("Invalid I2C discovery response")
+        return {"status": status, "bus": resolved_bus, "addresses": addresses}
+
+    def i2c_diag_control(self, operation: str,
+                         timeout_ms: Optional[int] = None, bus: int = 0) -> Optional[dict]:
+        """Control raw I2C; bus=1 scopes the lock to spare I2C1 on HW v2/v3."""
+        if type(bus) is not int or bus not in (0, 1):
+            raise ValueError("Control scope must be 0 (global) or 1 (spare I2C1)")
+        if operation not in ("lock", "unlock", "status", "activate-i2c1"):
+            raise ValueError("I2C diagnostic operation must be lock, unlock, status, or activate-i2c1")
+        if timeout_ms is not None and (
+                operation != "unlock" or type(timeout_ms) is not int
+                or not 1 <= timeout_ms <= 0x7FFFFFFF):
+            raise ValueError("Unlock timeout must be 1..2147483647 milliseconds")
+        payload = {"lock": b"\x00", "unlock": b"\x01I2C!", "status": b"\x02",
+                   "activate-i2c1": b"\x03"}[operation]
+        if bus == 1 and operation != "activate-i2c1":
+            payload = {"lock": b"\x05", "unlock": b"\x04I2C!", "status": b"\x06"}[operation]
+        if timeout_ms is not None:
+            payload += struct.pack("<I", timeout_ms)
+        result = self.send_cmd_with_ack(CMD.I2C_DIAG_CONTROL, payload)
+        if result is None:
+            return None
+        _, extra = result
+        if len(extra) != 6:
+            raise RuntimeError("Invalid I2C diagnostic control response length")
+        status, unlocked, remaining = struct.unpack("<BBI", extra)
+        if (status not in range(8) or unlocked not in (0, 1)
+                or remaining > 0x7FFFFFFF or (not unlocked and remaining)
+                or (status == 0 and operation == "lock" and unlocked)):
+            raise RuntimeError("Invalid I2C diagnostic control response")
+        return {"status": status, "unlocked": bool(unlocked), "remaining_ms": remaining}
+
+    def i2c_transfer(self, bus: int, address: int, tx: bytes = b"",
+                     read_length: int = 0) -> Optional[dict]:
+        """Raw WRITE/READ/WRITE_READ. No retry, page splitting, or cache reload.
+
+        Both lengths are limited to 128 bytes. Combined transfers use repeated
+        START, with no STOP between TX and RX. Requires explicit diagnostic unlock.
+        """
+        if type(bus) is not int or bus not in (0, 1, 2, 4):
+            raise ValueError("I2C bus must be 0 (analog auto), 1, 2, or 4")
+        if type(address) is not int or not 0x08 <= address <= 0x77:
+            raise ValueError("I2C address must be 7-bit in 0x08..0x77")
+        if (not isinstance(tx, bytes) or len(tx) > 128
+                or type(read_length) is not int or not 0 <= read_length <= 128
+                or (not tx and not read_length)):
+            raise ValueError("Supply 1..128 TX bytes and/or 1..128 RX bytes")
+        command = CMD.I2C_WRITE_READ if tx and read_length else (
+            CMD.I2C_WRITE if tx else CMD.I2C_READ)
+        payload = bytes([bus, address, len(tx), read_length]) + tx
+        result = self.send_cmd_with_ack(command, payload)
+        if result is None:
+            return None
+        _, extra = result
+        if len(extra) < 3:
+            raise RuntimeError("Truncated I2C transfer response")
+        status, resolved_bus, count = extra[:3]
+        if (status not in range(8) or len(extra) != 3 + count
+                or (status == 0 and (resolved_bus not in (1, 2, 4)
+                                    or count != read_length))
+                or (status != 0 and count != 0)
+                or (status == 0 and bus != 0 and resolved_bus != bus)):
+            raise RuntimeError("Invalid I2C transfer response")
+        return {"status": status, "bus": resolved_bus, "data": extra[3:]}
+
     def set_hw_info(self, target: int, version_id: int,
                     major: int, minor: int, serial: int) -> bool:
         """Set HW version and serial number in device EEPROM.
@@ -761,13 +908,15 @@ class DeviceConnection:
             minor: minor version (u8)
             serial: serial number (u32)
         """
+        if type(target) is not int or target not in (0, 1):
+            raise ValueError("HW target must be 0 (MCU) or 1 (ADC)")
         payload = struct.pack('<BB2xHBBI', target, SAVE_KEY,
                               version_id, major, minor, serial)
         result = self.send_cmd_with_ack(CMD.HW_CONFIG, payload)
         if result is None:
             return False
-        state, _ = result
-        return state == 0
+        state, extra = result
+        return state == 0 and extra == b"\x00"
 
     def startup_control(self, sub_cmd: int) -> Optional[tuple[int, bytes]]:
         """Send CMD_STARTUP_CONTROL with a sub-command byte."""
@@ -777,7 +926,8 @@ class DeviceConnection:
     def startup_start(self, samples: int = 0) -> bool:
         """Start the autonomous startup sequence. samples=0 means infinite."""
         payload = struct.pack('<BI', 1, samples)
-        return self.send_cmd_with_ack(CMD.STARTUP_CONTROL, payload) is not None
+        result = self.send_cmd_with_ack(CMD.STARTUP_CONTROL, payload)
+        return result is not None and result[1] == b""
 
     def startup_abort(self) -> bool:
         """Abort an in-progress startup."""
@@ -1224,7 +1374,7 @@ class NodeConnection(DeviceConnection):
         cmd = CMD.START_ON_TRIGGER if wait_trigger else CMD.START_SAMPLING
         payload = struct.pack('<I', samples)
         result = self.send_cmd_with_ack(cmd, payload)
-        return result is not None
+        return result is not None and len(result[1]) == 4
 
     def start_sampling_deferred(self, sec: int, ns: int, samples: int = 0) -> Optional[int]:
         """Start acquisition with PTP-deferred trigger.
@@ -1235,7 +1385,8 @@ class NodeConnection(DeviceConnection):
             samples: number of sample-chunks to acquire (0 = infinite)
 
         Returns:
-            Response code (0=OK, 1=bad payload, 2=time too close), or None on failure.
+            Response code (0=OK, 1=bad payload, 2=time too close,
+            3=I2C diagnostics unlocked), or None on failure.
         """
         payload = struct.pack('<III', sec, ns, samples)
         result = self.send_cmd_with_ack(CMD.START_SAMPLING_DEFERRED, payload)
@@ -1342,7 +1493,7 @@ class CCUConnection(DeviceConnection):
         cmd = CMD.START_ON_TRIGGER if wait_trigger else CMD.START_SAMPLING
         payload = struct.pack('<I', samples)
         result = self.send_cmd_with_ack(cmd, payload)
-        return result is not None
+        return result is not None and len(result[1]) == 4
 
     def stop_gathering(self) -> Optional[int]:
         """Stop gathering. Returns chunks counter, or None on failure."""
