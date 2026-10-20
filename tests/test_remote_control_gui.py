@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 import scada
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QPushButton, QLabel
 from remote_control import RemoteControlServer
 
@@ -140,6 +141,155 @@ class RemoteControlGuiTests(unittest.TestCase):
             dialog.assert_called_once()
             calibration.assert_not_called()
 
+    def test_settings_windows_are_modeless_and_independent_per_device(self):
+        def live_config(device_type, section_id):
+            tag = scada.fdds_alg_config.DEVICE_TABLES[device_type]['tag']
+            if section_id == 0xFF:
+                return {
+                    'tag': tag,
+                    'schema': 1,
+                    'section': section_id,
+                    'body': b'',
+                }
+            section = scada.fdds_alg_config.section_by_id(device_type, section_id)
+            values = {
+                name: ([(0.0 if not rest or rest[0] == 'f' else 0)] * count
+                       if count > 1 else (0.0 if not rest or rest[0] == 'f' else 0))
+                for name, count, *rest in section.fields
+            }
+            return {
+                'tag': tag,
+                'schema': 1,
+                'section': section_id,
+                'body': section.pack(values),
+            }
+
+        for row, ip, device_type in (
+                (0, '127.0.0.2', 'node'),
+                (scada.ISOMON_DEVICE_INDEX, '127.0.0.3', 'isomon')):
+            self.plotter.device_edits[row].setText(f'{ip}:10578')
+            self.manager.add_device(ip)
+            device = self.manager.devices[ip]
+            device.role = device_type
+            device.is_isomon = device_type == 'isomon'
+            device.get_calibration = lambda source=0, count=(2 if device_type == 'isomon' else 1): {
+                'source': source,
+                'channels': [
+                    {'unit': 'V', 'offset': 0.0, 'gain': 1.0}
+                    for _ in range(count)
+                ],
+                'calibration_info': {'time': 0, 'id': 7},
+            }
+            device.get_alg_config_section = (
+                lambda section_id, kind=device_type, read=live_config:
+                read(kind, section_id))
+            self.plotter.device_settings_buttons[row].click()
+
+        deadline = time.monotonic() + 3
+        while (time.monotonic() < deadline and
+               any(not dialog._loaded for dialog in self.plotter._settings_dialogs.values())):
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.app.processEvents()
+
+        self.assertEqual(len(self.plotter._settings_dialogs), 2)
+        try:
+            for ip, dialog in self.plotter._settings_dialogs.items():
+                self.assertTrue(dialog._loaded)
+                self.assertEqual(dialog._source, 'effective')
+                self.assertEqual(dialog.windowModality(), Qt.NonModal)
+                self.assertIn(ip, dialog.windowTitle())
+                self.assertEqual(
+                    len(dialog._channel_widgets), 2 if ip == '127.0.0.3' else 1)
+            isomon = self.plotter._settings_dialogs['127.0.0.3']
+            self.assertEqual(isomon._device_type, 'isomon')
+            imported_channels = [
+                {'unit': 'V', 'offset': 2.656798363, 'gain': 0.002133012},
+                {'unit': 'V', 'offset': 32.016990662, 'gain': 0.002108254},
+            ]
+            imported_payload = {
+                'format': 'fdds_scada_device_settings_v1',
+                'device': {'type': 'isomon'},
+                'calibration': imported_channels,
+                'alg_config': {
+                    'device': 'isomon',
+                    'sections': isomon._sections,
+                },
+            }
+            with tempfile.NamedTemporaryFile(
+                    'w', suffix='.json', encoding='utf-8', delete=False) as source_file:
+                json.dump(imported_payload, source_file)
+                imported_path = source_file.name
+            try:
+                with patch.object(
+                        scada.QFileDialog, 'getOpenFileName',
+                        return_value=(imported_path, 'JSON Files (*.json)')):
+                    isomon._import_values()
+                self.assertEqual(isomon._calibration['channels'], imported_channels)
+                self.assertEqual(len(isomon._channel_widgets), 2)
+                self.assertAlmostEqual(isomon._channel_widgets[0][1].value(), 2.656798363)
+                self.assertAlmostEqual(isomon._channel_widgets[1][1].value(), 32.016990662)
+                self.assertTrue(isomon._dirty)
+            finally:
+                os.unlink(imported_path)
+
+            bundle_channels = [
+                {'unit': 'A', 'offset': 1.25, 'gain': 0.5},
+                {'unit': 'mV', 'offset': -2.5, 'gain': 0.25},
+            ]
+            bundle_payload = {
+                'format': 'fdds_scada_calibration_alg_config_v1',
+                'devices': [
+                    {
+                        'ip': '127.0.0.99',
+                        'calibration': {'channels': []},
+                        'alg_config': {
+                            'device': 'isomon',
+                            'sections': isomon._sections,
+                        },
+                    },
+                    {
+                        'ip': '127.0.0.3',
+                        'calibration': {
+                            'channels': bundle_channels,
+                            'calibration_info': {'time': 0, 'id': 11},
+                        },
+                        'alg_config': {
+                            'device': 'isomon',
+                            'sections': isomon._sections,
+                        },
+                    },
+                ],
+            }
+            isomon._dirty = False
+            with tempfile.NamedTemporaryFile(
+                    'w', suffix='.json', encoding='utf-8', delete=False) as source_file:
+                json.dump(bundle_payload, source_file)
+                bundle_path = source_file.name
+            try:
+                with patch.object(
+                        scada.QFileDialog, 'getOpenFileName',
+                        return_value=(bundle_path, 'JSON Files (*.json)')):
+                    isomon._import_values()
+                self.assertEqual(isomon._calibration['channels'], bundle_channels)
+                self.assertEqual(isomon._calibration['calibration_info']['id'], 11)
+                self.assertEqual(isomon._channel_widgets[0][0].text(), 'A')
+                self.assertAlmostEqual(isomon._channel_widgets[0][1].value(), 1.25)
+                self.assertEqual(isomon._channel_widgets[1][0].text(), 'mV')
+                self.assertAlmostEqual(isomon._channel_widgets[1][1].value(), -2.5)
+                self.assertTrue(isomon._dirty)
+            finally:
+                os.unlink(bundle_path)
+
+            first = self.plotter._settings_dialogs['127.0.0.2']
+            first._field_widgets['node_dv_filt']['dv_refSourceVoltage'][0].setText('12.5')
+            self.assertTrue(first._dirty)
+            self.assertIn('zaps', first.status_label.text())
+        finally:
+            for dialog in list(self.plotter._settings_dialogs.values()):
+                dialog._dirty = False
+                dialog.close()
+
     def test_remote_control_stays_beside_live_values(self):
         config_grid = self.plotter.layout().itemAt(0).layout()
         isomon_values = config_grid.itemAtPosition(scada.ISOMON_DEVICE_INDEX, 7).widget()
@@ -217,6 +367,9 @@ class RemoteControlGuiTests(unittest.TestCase):
         self.assertEqual(config_grid.itemAtPosition(2, 8).widget().text(), 'Token')
         self.assertEqual(config_grid.itemAtPosition(3, 8).widget().text(), 'Receiver addr:port')
         self.assertEqual(config_grid.itemAtPosition(4, 8).widget().text(), 'Measurement number')
+        for row, button in enumerate(self.plotter.device_settings_buttons):
+            self.assertEqual(
+                config_grid.getItemPosition(config_grid.indexOf(button.parentWidget()))[:2], (row, 6))
         self.assertEqual(config_grid.indexOf(self.plotter.save_calibration_btn), -1)
         button_row = self.plotter.layout().itemAt(1).layout()
         action_order = (

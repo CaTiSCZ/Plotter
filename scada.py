@@ -36,7 +36,7 @@ os.environ.setdefault('PYQTGRAPH_QT_LIB', 'PyQt5') # ensure PyQt5 is used for py
 import pyqtgraph as pg
 import pyqtgraph.exporters
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QApplication, QWidget, QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QPushButton, QLineEdit, QLabel, QSpinBox, QDoubleSpinBox, QCheckBox, QTextEdit,
     QPlainTextEdit, QSlider, QScrollArea, QRadioButton, QButtonGroup,
     QFileDialog, QMessageBox, QComboBox, QAbstractButton, QSizePolicy
@@ -50,6 +50,7 @@ from PyQt5.QtGui import QFont, QFontMetrics, QTextDocument
 # the wire protocol changes.
 from fdds.protocol import (
     PACKET, CMD, STRUCT,
+    SAVE_KEY, CALIBRATION_INFO_DATA_SIZE,
     SAMPLES_PER_PACKET as FDDS_SAMPLES_PER_PACKET,
     GATHERING_DEVICES as FDDS_GATHERING_DEVICES,
     ACQUISITION_CHANNELS as FDDS_ACQUISITION_CHANNELS,
@@ -819,6 +820,7 @@ class Device:
         self.manager = manager
         self.channels = 2
         self.result_channels = 2
+        self._cmd_lock = threading.Lock()
         self.cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.cmd_sock.settimeout(RECV_TIMEOUT_S)
         self.cmd_sock.connect((ip, cmd_port))
@@ -1027,17 +1029,18 @@ class Device:
         self.stream_rate_hz[STREAM_ISO_RESULT] = float(ISOMON_ALG_SAMPLE_RATE_HZ) / (float(ISOMON_STATE_CYCLE_COUNT) * float(avg))
 
     def _send_cmd(self, code:int, payload:bytes=b'', expect:bool=True, socket_ = None, port:int|None = None):
-        pkt = struct.pack('<I', code) + payload
-        if socket_ is None:
-            self.cmd_sock.send(pkt)
-        else:
-            socket_.sendto(pkt, (self.ip, port or self.cmd_port))
-        if not expect:
-            return None
-        try:
-            return (socket_ or self.cmd_sock).recv(2048)
-        except socket.timeout:
-            return None
+        with self._cmd_lock:
+            pkt = struct.pack('<I', code) + payload
+            if socket_ is None:
+                self.cmd_sock.send(pkt)
+            else:
+                socket_.sendto(pkt, (self.ip, port or self.cmd_port))
+            if not expect:
+                return None
+            try:
+                return (socket_ or self.cmd_sock).recv(2048)
+            except socket.timeout:
+                return None
         
     def ping(self, socket_=None, silent=False, port:int|None = None)->bool:
         self.silent_ping = silent
@@ -1111,6 +1114,80 @@ class Device:
             return None
         _state, extra = res
         return self._parse_alg_get(extra)
+
+    @staticmethod
+    def _parse_alg_get_saved(extra: bytes) -> dict | None:
+        if len(extra) < 6:
+            return None
+        tag, schema, section, valid = struct.unpack_from('<HHBB', extra, 0)
+        return {'tag': tag, 'schema': schema, 'section': section,
+                'valid': bool(valid), 'body': extra[6:]}
+
+    def get_alg_config_saved_section(self, section_id: int) -> dict | None:
+        """Read one persisted algorithm-config section."""
+        res = self._send_cmd_with_ack(
+            int(CMD.GET_ALG_CONFIG_SAVED), bytes([section_id & 0xFF]))
+        if res is None:
+            return None
+        _state, extra = res
+        return self._parse_alg_get_saved(extra)
+
+    def save_alg_config(self) -> bool | None:
+        """Persist the current algorithm config to flash."""
+        res = self._send_cmd_with_ack(int(CMD.SAVE_ALG_CONFIG), bytes([SAVE_KEY]))
+        if res is None:
+            return None
+        _state, extra = res
+        return bool(extra[0]) if extra else False
+
+    def get_calibration(self, source: int = 0) -> dict | None:
+        """Read device calibration: source 0 is effective RAM, 1 is stored flash."""
+        res = self._send_cmd_with_ack(int(CMD.GET_CALIBRATION), bytes([source & 0xFF]))
+        if res is None:
+            return None
+        _state, extra = res
+        if len(extra) < 3:
+            return None
+        actual_source, channel_count = struct.unpack_from('<BH', extra, 0)
+        offset = 3
+        channels = []
+        for _ in range(channel_count):
+            end = offset + STRUCT.CHANNEL.size
+            if end > len(extra):
+                return None
+            unit_bytes, ch_offset, ch_gain = STRUCT.CHANNEL.unpack(extra[offset:end])
+            channels.append({
+                'unit': unit_bytes.decode('utf-8', errors='replace').rstrip('\x00'),
+                'offset': ch_offset,
+                'gain': ch_gain,
+            })
+            offset = end
+        calibration_info = None
+        if offset + CALIBRATION_INFO_DATA_SIZE <= len(extra):
+            cal_time, cal_id = STRUCT.CALIBRATION_INFO.unpack(
+                extra[offset:offset + CALIBRATION_INFO_DATA_SIZE])
+            calibration_info = {'time': cal_time, 'id': cal_id}
+        return {
+            'source': actual_source,
+            'channels': channels,
+            'calibration_info': calibration_info,
+        }
+
+    def set_calibration(self, channels: list[dict], save: bool = False,
+                        calibration_info: dict | None = None) -> bool | None:
+        """Apply device calibration values, optionally persisting them."""
+        calibration_info = calibration_info or {}
+        payload = struct.pack(
+            '<BxH', SAVE_KEY if save else 0, len(channels))
+        for channel in channels:
+            payload += struct.pack(
+                '<3sxff', str(channel['unit']).encode('utf-8')[:3],
+                float(channel['offset']), float(channel['gain']))
+        payload += struct.pack(
+            '<QI', int(calibration_info.get('time', 0)),
+            int(calibration_info.get('id', 0)))
+        res = self._send_cmd_with_ack(int(CMD.SET_CALIBRATION), payload)
+        return res is not None
 
     def set_alg_config_section(self, section_id: int, data: bytes, save: bool = False) -> dict | None:
         """Update one section of the live (RAM) algorithm parameters.
@@ -2355,6 +2432,556 @@ class RemoteControlBridge(QObject):
             future.set_exception(exc)
 
 
+class DeviceSettingsDialog(QDialog):
+    """Modeless editor for one device's calibration and algorithm parameters."""
+
+    closed = pyqtSignal(str)
+    _job_succeeded = pyqtSignal(object)
+    _job_failed = pyqtSignal(object)
+
+    def __init__(self, device: Device, device_label: str, parent=None):
+        super().__init__(parent)
+        self.device = device
+        self.device_label = device_label
+        self._logger = logging.getLogger(
+            f'{__name__}.DeviceSettingsDialog')
+        self._source = 'effective'
+        self._dirty = False
+        self._loading = False
+        self._busy = False
+        self._loaded = False
+        self._notice = ''
+        self._calibration: dict | None = None
+        self._device_type: str | None = None
+        self._sections: dict[str, dict] = {}
+        self._section_specs = []
+        self._field_widgets: dict[str, dict[str, list[QWidget]]] = {}
+        self._channel_widgets: list[tuple[QLineEdit, QDoubleSpinBox, QDoubleSpinBox]] = []
+
+        self.setWindowTitle(f'{device_label} — {device.ip} — Settings')
+        self.setWindowModality(Qt.NonModal)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.resize(760, 720)
+        self._job_succeeded.connect(self._finish_job_success)
+        self._job_failed.connect(self._finish_job_failure)
+        self._operation_buttons: list[QPushButton] = []
+
+        root = QVBoxLayout(self)
+        self.status_label = QLabel('Načítání efektivních hodnot…')
+        self.status_label.setObjectName('settings_value_status')
+        root.addWidget(self.status_label)
+        self.calibration_info_label = QLabel('Kalibrace zatím nebyla načtena.')
+        self.calibration_info_label.setObjectName('settings_calibration_info')
+        root.addWidget(self.calibration_info_label)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self._scroll_area = scroll
+        content = QWidget()
+        self.content_layout = QVBoxLayout(content)
+        self.calibration_group = QWidget()
+        self.calibration_layout = QVBoxLayout(self.calibration_group)
+        self.content_layout.addWidget(self.calibration_group)
+        self.algorithms_group = QWidget()
+        self.algorithms_layout = QVBoxLayout(self.algorithms_group)
+        self.content_layout.addWidget(self.algorithms_group)
+        self.content_layout.addStretch(1)
+        scroll.setWidget(content)
+        root.addWidget(scroll, 1)
+
+        controls = QHBoxLayout()
+        for label, slot, name in (
+            ('Read effective', lambda: self._read_values('effective'), 'read_effective'),
+            ('Read stored', lambda: self._read_values('stored'), 'read_stored'),
+            ('Write', self._write_values, 'write_settings'),
+            ('Save', self._save_values, 'save_settings'),
+            ('Write and save', self._write_and_save, 'write_and_save_settings'),
+        ):
+            button = QPushButton(label)
+            button.setObjectName(name)
+            button.clicked.connect(slot)
+            controls.addWidget(button)
+            self._operation_buttons.append(button)
+        root.addLayout(controls)
+        file_controls = QHBoxLayout()
+        self.import_button = QPushButton('Import…')
+        self.import_button.setObjectName('import_settings')
+        self.import_button.clicked.connect(self._import_values)
+        file_controls.addWidget(self.import_button)
+        self._operation_buttons.append(self.import_button)
+        self.export_button = QPushButton('Export…')
+        self.export_button.setObjectName('export_settings')
+        self.export_button.clicked.connect(self._export_values)
+        file_controls.addWidget(self.export_button)
+        self._operation_buttons.append(self.export_button)
+        file_controls.addStretch(1)
+        root.addLayout(file_controls)
+
+        self._update_action_availability()
+        QTimer.singleShot(0, lambda: self._read_values('effective', initial=True))
+
+    def _supports_calibration(self) -> bool:
+        return self.device.role in ('node', 'isomon') or self.device.is_isomon
+
+    def _update_action_availability(self):
+        for index, button in enumerate(self._operation_buttons):
+            button.setEnabled(
+                not self._busy and (index < 2 or self._loaded))
+        self._scroll_area.setEnabled(not self._busy)
+
+    def _set_status(self):
+        if not self._loaded:
+            self.status_label.setText('Hodnoty zařízení zatím nebyly načteny.')
+            return
+        source_name = 'efektivní (RAM)' if self._source == 'effective' else 'uložené (flash)'
+        dirty_text = ' — změny zatím nebyly zapsány' if self._dirty else ''
+        notice_text = f' — {self._notice}' if self._notice else ''
+        self.status_label.setText(
+            f'Zobrazené hodnoty: {source_name}{dirty_text}{notice_text}')
+
+    def _mark_dirty(self, *_args):
+        if not self._loading:
+            self._dirty = True
+            self._set_status()
+
+    def _confirm_replace(self, action: str) -> bool:
+        if not self._dirty:
+            return True
+        reply = QMessageBox.question(
+            self, 'Nezapsané změny',
+            f'{action} nahradí hodnoty změněné v tomto okně, které ještě nebyly zapsány do zařízení. Pokračovat?',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        return reply == QMessageBox.Yes
+
+    def _start_job(self, action: str, operation, on_success):
+        if self._busy:
+            return
+        self._busy = True
+        self._notice = ''
+        self.status_label.setText(f'{action}…')
+        self._update_action_availability()
+
+        def run():
+            try:
+                self._job_succeeded.emit((on_success, operation()))
+            except Exception as exc:
+                self._job_failed.emit(exc)
+
+        threading.Thread(
+            target=run, name=f'settings-{self.device.ip}', daemon=True).start()
+
+    def _finish_job(self):
+        self._busy = False
+        self._update_action_availability()
+
+    def _finish_job_success(self, result):
+        self._finish_job()
+        callback, value = result
+        try:
+            callback(value)
+        except Exception as exc:
+            self._logger.exception('Failed to update settings window after device operation')
+            QMessageBox.critical(self, 'Chyba nastavení zařízení', str(exc))
+
+    def _finish_job_failure(self, exc):
+        self._finish_job()
+        self._logger.error(
+            'Device settings operation failed for %s: %s',
+            self.device.ip, exc,
+            exc_info=(type(exc), exc, exc.__traceback__))
+        self._set_status()
+        QMessageBox.critical(self, 'Operace konfigurace selhala', str(exc))
+
+    def _read_snapshot(self, source: str) -> tuple[dict | None, str, list, dict]:
+        calibration = None
+        if self._supports_calibration():
+            calibration = self.device.get_calibration(source=0 if source == 'effective' else 1)
+            if calibration is None:
+                raise RuntimeError('Kalibraci kanálů se nepodařilo načíst.')
+
+        header = self.device.get_alg_config_section(0xFF)
+        if header is None:
+            raise RuntimeError('Nepodařilo se načíst hlavičku konfigurace algoritmů.')
+        device_type = fdds_alg_config.device_for_tag(int(header.get('tag', 0)))
+        if device_type is None:
+            raise RuntimeError(f'Neznámý typ konfigurace algoritmů (tag 0x{int(header.get("tag", 0)):04X}).')
+        sections = fdds_alg_config.sections_for_device(device_type)
+        values = {}
+        for section in sections:
+            if source == 'effective':
+                response = self.device.get_alg_config_section(section.id)
+            else:
+                response = self.device.get_alg_config_saved_section(section.id)
+                if response is not None and not response.get('valid', False):
+                    raise RuntimeError(f'Uložená sekce {section.name} není k dispozici.')
+            if response is None:
+                raise RuntimeError(f'Sekci {section.name} se nepodařilo načíst.')
+            body = response.get('body', b'')
+            if len(body) < section.size:
+                raise RuntimeError(
+                    f'Sekce {section.name} má neplatnou délku ({len(body)} B; očekáváno {section.size} B).')
+            values[section.name] = section.unpack(body)
+        return calibration, device_type, sections, values
+
+    def _read_values(self, source: str, initial: bool = False):
+        if not initial and not self._confirm_replace(
+                'Načtení konfigurace'):
+            return
+        self._start_job(
+            'Načítání hodnot',
+            lambda: self._read_snapshot(source),
+            lambda result: self._read_complete(source, result))
+
+    def _read_complete(self, source: str, result):
+        calibration, device_type, sections, values = result
+        self._calibration = calibration
+        self._device_type = device_type
+        self._section_specs = sections
+        self._sections = values
+        self._source = source
+        self._dirty = False
+        self._loaded = True
+        self._notice = ''
+        self._build_editor()
+        self._update_action_availability()
+        self._set_status()
+
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget is not None:
+                widget.deleteLater()
+            elif child_layout is not None:
+                self._clear_layout(child_layout)
+
+    def _number_widget(self, value, fmt: str) -> QWidget:
+        if fmt == 'f':
+            widget = QLineEdit(format(float(value), '.9g'))
+            widget.setMaximumWidth(150)
+            widget.textChanged.connect(self._mark_dirty)
+            return widget
+        if fmt == 'I':
+            widget = QDoubleSpinBox()
+            widget.setRange(0, 4294967295)
+            widget.setDecimals(0)
+            widget.setSingleStep(1)
+        else:
+            widget = QSpinBox()
+            widget.setRange(0, 255 if fmt == 'B' else 65535)
+        widget.setValue(int(value))
+        widget.valueChanged.connect(self._mark_dirty)
+        return widget
+
+    def _build_editor(self):
+        self._loading = True
+        self._clear_layout(self.calibration_layout)
+        self._clear_layout(self.algorithms_layout)
+        self._channel_widgets.clear()
+        self._field_widgets.clear()
+
+        calibration_title = QLabel('Kalibrace kanálů')
+        calibration_title.setStyleSheet('font-weight: bold')
+        self.calibration_layout.addWidget(calibration_title)
+        if not self._supports_calibration():
+            self.calibration_layout.addWidget(QLabel(
+                'Firmware neposkytuje tomuto typu zařízení rozhraní pro čtení/zápis kalibrace kanálů.'))
+            self.calibration_info_label.setText('Informace o kalibraci nejsou pro tento typ zařízení dostupné.')
+        else:
+            cal_info = (self._calibration or {}).get('calibration_info')
+            if cal_info:
+                timestamp = int(cal_info.get('time', 0))
+                date_text = 'neuvedeno'
+                if timestamp:
+                    try:
+                        date_text = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+                    except (OverflowError, OSError, ValueError):
+                        date_text = str(timestamp)
+                self.calibration_info_label.setText(
+                    f"Kalibrace ID: {cal_info.get('id', '—')} | Datum: {date_text}")
+            else:
+                self.calibration_info_label.setText('Informace o verzi/datu kalibrace nejsou k dispozici.')
+            grid = QGridLayout()
+            for column, title in enumerate(('Kanál', 'Offset', 'Gain', 'Jednotka')):
+                grid.addWidget(QLabel(title), 0, column)
+            for index, channel in enumerate((self._calibration or {}).get('channels', [])):
+                unit = QLineEdit(str(channel.get('unit', '')))
+                unit.setMaxLength(3)
+                offset = QDoubleSpinBox()
+                offset.setRange(-1e30, 1e30)
+                offset.setDecimals(9)
+                offset.setValue(float(channel.get('offset', 0.0)))
+                gain = QDoubleSpinBox()
+                gain.setRange(-1e30, 1e30)
+                gain.setDecimals(9)
+                gain.setValue(float(channel.get('gain', 1.0)))
+                for widget in (unit, offset, gain):
+                    if isinstance(widget, QLineEdit):
+                        widget.textChanged.connect(self._mark_dirty)
+                    else:
+                        widget.valueChanged.connect(self._mark_dirty)
+                grid.addWidget(QLabel(str(index)), index + 1, 0)
+                grid.addWidget(offset, index + 1, 1)
+                grid.addWidget(gain, index + 1, 2)
+                grid.addWidget(unit, index + 1, 3)
+                self._channel_widgets.append((unit, offset, gain))
+            self.calibration_layout.addLayout(grid)
+
+        for section in self._section_specs:
+            group = QWidget()
+            group_layout = QFormLayout(group)
+            group_layout.addRow(QLabel(f'<b>{section.name}</b>'))
+            self._field_widgets[section.name] = {}
+            for field_spec in section.fields:
+                name, count, *rest = field_spec
+                fmt = rest[0] if rest else 'f'
+                raw = self._sections[section.name][name]
+                values = raw if count != 1 else [raw]
+                editors = [self._number_widget(value, fmt) for value in values]
+                self._field_widgets[section.name][name] = editors
+                row = QHBoxLayout()
+                for editor in editors:
+                    row.addWidget(editor)
+                row.addStretch(1)
+                group_layout.addRow(name, row)
+            self.algorithms_layout.addWidget(group)
+        self._loading = False
+
+    def _collect_values(self) -> tuple[list[dict] | None, dict]:
+        calibration = None
+        if self._supports_calibration():
+            calibration = []
+            for unit, offset, gain in self._channel_widgets:
+                calibration.append({
+                    'unit': unit.text(),
+                    'offset': offset.value(),
+                    'gain': gain.value(),
+                })
+        sections = {}
+        for section in self._section_specs:
+            fields = {}
+            for name, count, *rest in section.fields:
+                fmt = rest[0] if rest else 'f'
+                editors = self._field_widgets[section.name][name]
+                values = []
+                for editor in editors:
+                    if fmt == 'f':
+                        try:
+                            value = float(editor.text())
+                        except ValueError as exc:
+                            raise ValueError(
+                                f'Neplatná číselná hodnota v {section.name}.{name}.') from exc
+                    else:
+                        value = int(editor.value())
+                    values.append(value)
+                fields[name] = values[0] if count == 1 else values
+            sections[section.name] = fields
+        return calibration, sections
+
+    def _send_values(self, calibration, sections, save: bool) -> bool:
+        if calibration is not None:
+            current_info = (self._calibration or {}).get('calibration_info') or {}
+            result = self.device.set_calibration(
+                calibration, save=save, calibration_info=current_info)
+            if result is not True:
+                raise RuntimeError('Zařízení nepotvrdilo zápis kalibrace.')
+        for section in self._section_specs:
+            result = self.device.set_alg_config_section(
+                section.id, section.pack(sections[section.name]), save=False)
+            if result is None or not result.get('applied', False):
+                raise RuntimeError(
+                    f'Zápis sekce {section.name} selhal; některé předchozí hodnoty již mohou být změněny.')
+        if save:
+            result = self.device.save_alg_config()
+            if result is not True:
+                raise RuntimeError(
+                    'Konfigurace algoritmů byla zapsána do RAM, ale uložení do flash selhalo.')
+        return True
+
+    def _write_values(self):
+        try:
+            calibration, sections = self._collect_values()
+        except Exception as exc:
+            QMessageBox.critical(self, 'Neplatné hodnoty konfigurace', str(exc))
+            return
+        self._start_job(
+            'Zápis do zařízení',
+            lambda: self._send_values(calibration, sections, save=False),
+            self._write_complete)
+
+    def _write_and_save(self):
+        try:
+            calibration, sections = self._collect_values()
+        except Exception as exc:
+            QMessageBox.critical(self, 'Neplatné hodnoty konfigurace', str(exc))
+            return
+        self._start_job(
+            'Zápis a ukládání do zařízení',
+            lambda: self._send_values(calibration, sections, save=True),
+            self._write_and_save_complete)
+
+    def _write_complete(self, _result):
+        self._dirty = False
+        self._source = 'effective'
+        self._notice = 'zapsáno do RAM'
+        self._set_status()
+
+    def _write_and_save_complete(self, _result):
+        self._dirty = False
+        self._source = 'effective'
+        self._notice = 'zapsáno do RAM a uloženo do flash'
+        self._set_status()
+
+    def _save_values(self):
+        if not self._confirm_replace('Uložení aktivních hodnot'):
+            return
+        self._start_job(
+            'Ukládání hodnot zařízení',
+            self._save_active_values,
+            self._save_complete)
+
+    def _save_active_values(self):
+        if self._supports_calibration():
+            calibration = self.device.get_calibration(source=0)
+            if calibration is None:
+                raise RuntimeError('Aktivní kalibraci se nepodařilo načíst pro uložení.')
+            if self.device.set_calibration(
+                    calibration['channels'], save=True,
+                    calibration_info=calibration.get('calibration_info')) is not True:
+                raise RuntimeError('Uložení kalibrace selhalo.')
+        result = self.device.save_alg_config()
+        if result is not True:
+            raise RuntimeError('Uložení konfigurace algoritmů selhalo.')
+        return self._read_snapshot('stored')
+
+    def _save_complete(self, result):
+        self._read_complete('stored', result)
+        self._notice = 'aktivní hodnoty uloženy do flash'
+        self._set_status()
+
+    def _export_values(self):
+        try:
+            calibration, sections = self._collect_values()
+            path, _ = QFileDialog.getSaveFileName(
+                self, 'Export konfigurace zařízení',
+                f'{self.device.ip.replace(".", "_")}_settings.json',
+                'JSON Files (*.json)')
+            if not path:
+                return
+            payload = {
+                'format': 'fdds_scada_device_settings_v1',
+                'device': {
+                    'label': self.device_label,
+                    'ip': self.device.ip,
+                    'type': self._device_type,
+                },
+                'calibration': calibration,
+                'alg_config': {
+                    'device': self._device_type,
+                    'sections': sections,
+                },
+            }
+            with open(path, 'w', encoding='utf-8') as output:
+                json.dump(payload, output, indent=2, ensure_ascii=False, allow_nan=True)
+                output.write('\n')
+        except Exception as exc:
+            self._logger.exception('Failed to export settings for %s', self.device.ip)
+            QMessageBox.critical(self, 'Export konfigurace selhal', str(exc))
+
+    def _import_values(self):
+        if not self._confirm_replace('Import konfigurace'):
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Import konfigurace zařízení', '', 'JSON Files (*.json)')
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as source_file:
+                payload = json.load(source_file)
+            if not isinstance(payload, dict):
+                raise ValueError('Soubor neobsahuje platný JSON objekt konfigurace.')
+            payload_format = payload.get('format')
+            if payload_format == 'fdds_scada_device_settings_v1':
+                device_payload = payload
+            elif payload_format == 'fdds_scada_calibration_alg_config_v1':
+                devices = payload.get('devices')
+                if not isinstance(devices, list) or not devices:
+                    raise ValueError('Soubor Save calibration neobsahuje seznam zařízení.')
+                matching_devices = [
+                    item for item in devices
+                    if isinstance(item, dict) and item.get('ip') == self.device.ip
+                ]
+                if matching_devices:
+                    device_payload = matching_devices[0]
+                elif len(devices) == 1 and isinstance(devices[0], dict):
+                    device_payload = devices[0]
+                else:
+                    raise ValueError(
+                        f'Soubor obsahuje více zařízení a žádné neodpovídá IP {self.device.ip}.')
+            else:
+                raise ValueError('Soubor nemá podporovaný formát konfigurace zařízení.')
+            alg_config = device_payload.get('alg_config', {})
+            if not isinstance(alg_config, dict):
+                raise ValueError('Soubor neobsahuje platnou konfiguraci algoritmů.')
+            if alg_config.get('device') != self._device_type:
+                raise ValueError('Konfigurace algoritmů v souboru neodpovídá typu tohoto zařízení.')
+            sections = alg_config.get('sections')
+            if not isinstance(sections, dict):
+                raise ValueError('Soubor neobsahuje platné sekce algoritmů.')
+            imported = {}
+            for section in self._section_specs:
+                values = sections.get(section.name)
+                if not isinstance(values, dict):
+                    raise ValueError(f'V souboru chybí sekce {section.name}.')
+                section.pack(values)
+                imported[section.name] = values
+            calibration = device_payload.get('calibration')
+            if self._supports_calibration():
+                if isinstance(calibration, list):
+                    calibration = {'channels': calibration, 'calibration_info': None}
+                if not isinstance(calibration, dict) or not isinstance(calibration.get('channels'), list):
+                    raise ValueError('Soubor neobsahuje platnou kalibraci kanálů.')
+                if len(calibration['channels']) != len(self._channel_widgets):
+                    raise ValueError('Počet kanálů v souboru neodpovídá zařízení.')
+                for index, channel in enumerate(calibration['channels']):
+                    if not isinstance(channel, dict) or not all(
+                            key in channel for key in ('unit', 'offset', 'gain')):
+                        raise ValueError(f'Kalibrace kanálu {index} v souboru není platná.')
+
+            self._loading = True
+            self._sections = imported
+            if calibration is not None:
+                self._calibration = calibration
+            self._build_editor()
+            self._loading = False
+            self._loaded = True
+            self._dirty = True
+            self._notice = 'importované hodnoty nebyly zapsány do zařízení'
+            self._update_action_availability()
+            self._set_status()
+        except Exception as exc:
+            self._loading = False
+            self._logger.exception('Failed to import settings for %s', self.device.ip)
+            QMessageBox.critical(self, 'Import konfigurace selhal', str(exc))
+
+    def closeEvent(self, event):
+        if self._busy:
+            QMessageBox.warning(
+                self, 'Probíhá operace',
+                'Před zavřením okna počkejte na dokončení komunikace se zařízením.')
+            event.ignore()
+            return
+        if self._dirty and QMessageBox.question(
+                self, 'Nezapsané změny',
+                'V okně jsou změny, které nebyly zapsány do zařízení. Přesto okno zavřít?',
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            event.ignore()
+            return
+        self.closed.emit(self.device.ip)
+        super().closeEvent(event)
+
+
 class Plotter(QWidget):
     # emits (ip, packet_order, stream_key)
     data_ready = pyqtSignal(str, int, str)
@@ -2431,6 +3058,8 @@ class Plotter(QWidget):
         self.device_clock_settings: List[QComboBox] = []
         self.device_trigger_settings: List[QComboBox] = []
         self.device_trigger_holdoff: List[QSpinBox] = []
+        self.device_settings_buttons: List[QPushButton] = []
+        self._settings_dialogs: Dict[str, DeviceSettingsDialog] = {}
         self.device_fault_indicator_layouts: List[QHBoxLayout] = []
         self.device_fault_indicators: List[List[QPushButton]] = []
         self.device_analog_value_layouts: List[QHBoxLayout] = []
@@ -2487,13 +3116,18 @@ class Plotter(QWidget):
             self.device_trigger_holdoff.append(sb_holdoff)
             cfg.addLayout(trig_box, i, 5)
 
+            settings_btn = QPushButton('Settings')
+            settings_btn.setObjectName(f'device_{i}_settings')
+            settings_btn.clicked.connect(
+                lambda _checked=False, row=i: self._open_device_settings(row))
+            self.device_settings_buttons.append(settings_btn)
+
             fault_box = QHBoxLayout()
             fault_box.setContentsMargins(0, 0, 0, 0)
             fault_box.setSpacing(4)
             fault_widget = QWidget()
             fault_widget.setLayout(fault_box)
             fault_widget.setToolTip('Digital fault outputs')
-            cfg.addWidget(fault_widget, i, 6, alignment=Qt.AlignLeft | Qt.AlignVCenter)
             self.device_fault_indicator_layouts.append(fault_box)
             self.device_fault_indicators.append([])
 
@@ -2503,6 +3137,13 @@ class Plotter(QWidget):
             analog_widget = QWidget()
             analog_widget.setLayout(analog_box)
             analog_widget.setToolTip('Live analog values')
+            settings_widget = QWidget()
+            settings_layout = QHBoxLayout(settings_widget)
+            settings_layout.setContentsMargins(0, 0, 0, 0)
+            settings_layout.setSpacing(4)
+            settings_layout.addWidget(settings_btn)
+            settings_layout.addWidget(fault_widget)
+            cfg.addWidget(settings_widget, i, 6, alignment=Qt.AlignLeft | Qt.AlignVCenter)
             if i == ISOMON_DEVICE_INDEX:
                 analog_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
                 cfg.addWidget(analog_widget, i, 7, 1, 3)
@@ -2886,6 +3527,11 @@ class Plotter(QWidget):
                 self.remote_control_addr.setEnabled(False)
 
     def closeEvent(self, event):
+        for dialog in list(self._settings_dialogs.values()):
+            dialog.close()
+        if any(dialog.isVisible() for dialog in self._settings_dialogs.values()):
+            event.ignore()
+            return
         self.remote_control_enabled.blockSignals(True)
         self.remote_control_enabled.setChecked(False)
         self.remote_control_enabled.blockSignals(False)
@@ -3652,6 +4298,10 @@ class Plotter(QWidget):
             pass
 
     def _apply_devices(self):
+        for dialog in list(self._settings_dialogs.values()):
+            dialog.close()
+        if any(dialog.isVisible() for dialog in self._settings_dialogs.values()):
+            return
         self.manager.clear()
         self.ax.clear()
         self.curves.clear()
@@ -3687,6 +4337,30 @@ class Plotter(QWidget):
         self._discover_isomon_stream_rates()
         self._update_capture_limits()
         self._logger.info(f'Applied {count} devices')
+
+    def _open_device_settings(self, row: int):
+        address = self.device_edits[row].text().strip()
+        ip = address.split(':', 1)[0] if address else ''
+        device = self.manager.devices.get(ip)
+        if device is None:
+            QMessageBox.warning(
+                self, 'Nastavení zařízení',
+                'Nejprve nastavte adresu zařízení a klikněte na Apply Device List.')
+            return
+        existing = self._settings_dialogs.get(ip)
+        if existing is not None:
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
+        label = DEVICE_LABELS[row] if row < len(DEVICE_LABELS) else f'Device {row}'
+        dialog = DeviceSettingsDialog(device, label, self)
+        dialog.closed.connect(self._forget_device_settings)
+        self._settings_dialogs[ip] = dialog
+        dialog.show()
+
+    def _forget_device_settings(self, ip: str):
+        self._settings_dialogs.pop(ip, None)
 
     def _ping_all(self):
         for ip,ok in self.manager.ping_all().items():
