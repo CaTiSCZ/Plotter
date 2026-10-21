@@ -192,6 +192,21 @@ Starts a new capture using the same Plotter workflow as the GUI buttons. The def
 
 Successful response data reports `accepted`, mode and timing values. The workflow schedules its start through Qt timers, so acceptance does not mean capture completion. Use status, live state, statistics and log to monitor it. PTP behavior follows the GUI's configured PTP mode.
 
+In PTP mode, ISOMON `ISO_RESULT` capture uses actual packet timestamps, not an
+expected packet count: firmware signal settling makes the cadence variable.
+The capture retains the nearest available packet strictly before
+`trigger - pretrigger_ms`, all packets within the interval, and the first packet
+strictly after `trigger + posttrigger_ms`. Completion waits for that final packet,
+even when it arrives much later than the requested posttrigger duration.
+The trigger PTP timestamp is shared with the other streams, rather than using the
+latest ISO packet as time zero. For immediate captures it is derived from the
+first triggering data packet; for hardware triggers it comes from the trigger packet.
+Plots linearly interpolate at the interval boundaries and show no ISO line
+segments outside them. ISO CSV exports retain the original bracketing packets
+and their timestamps, without synthetic interpolated rows. ISO statistics show
+`?` for the expected packet count. If pretrigger history is insufficient, the
+available packets are retained and a warning is logged; plots do not extrapolate.
+
 ### `POST /api/v1/measurement/stop`
 
 Stops sampling on applied devices using the GUI's sampling-stop workflow. The response means the stop request was accepted by the GUI; use `/status` and `/live` to inspect resulting state.
