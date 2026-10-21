@@ -4193,7 +4193,9 @@ class Plotter(QWidget):
             layout.addStretch(1)
         self.device_analog_value_labels[row] = labels
 
-    def _format_analog_value(self, dev: Device, channel_idx: int) -> str:
+    def _format_analog_value(self, dev: Device, channel_idx: int, *,
+                             integer_width: int | None = None,
+                             fractional_width: int | None = None) -> str:
         unit = dev.analog_units[channel_idx] if channel_idx < len(dev.analog_units) else '-'
         width = dev.analog_widths[channel_idx] if channel_idx < len(dev.analog_widths) else 8
         decimals = dev.analog_decimals[channel_idx] if channel_idx < len(dev.analog_decimals) else 3
@@ -4205,6 +4207,11 @@ class Plotter(QWidget):
                 val_s = f"{'nan':>{width}}"
         else:
             val_s = f"{'--':>{width}}"
+        if integer_width is not None and fractional_width is not None:
+            integer, separator, fraction = val_s.strip().partition('.')
+            val_s = integer.rjust(integer_width)
+            if fractional_width:
+                val_s += (separator or ' ') + fraction.ljust(fractional_width)
         return f'{val_s} {unit}'
 
     def _format_iso_value(self, field: str, value: float, valid: bool) -> str:
@@ -4246,7 +4253,17 @@ class Plotter(QWidget):
                                 dev: Device | None) -> str:
         if field in ('u_pos', 'u_neg') and dev is not None:
             channel_idx = 0 if field == 'u_pos' else 1
-            return self._format_analog_value(dev, channel_idx)
+            values = [self._format_analog_value(dev, idx).rsplit(' ', 1)[0].strip()
+                      for idx in range(2)]
+            integer_width = max(len(value.partition('.')[0]) for value in values)
+            fractional_width = 0
+            for idx in range(2):
+                width = dev.analog_widths[idx] if idx < len(dev.analog_widths) else 8
+                decimals = dev.analog_decimals[idx] if idx < len(dev.analog_decimals) else 3
+                integer_width = max(integer_width, width - decimals - int(decimals > 0))
+                fractional_width = max(fractional_width, decimals)
+            return self._format_analog_value(
+                dev, channel_idx, integer_width=integer_width, fractional_width=fractional_width)
         return self._format_iso_value(field, iso_values.get(field, np.nan), iso_valid)
 
     def _iso_row_fixed_width(self, label: QLabel, fields: Tuple[str, ...], font_size: int = 16) -> int:

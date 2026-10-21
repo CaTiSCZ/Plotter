@@ -13,7 +13,7 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 import scada
 from PyQt5.QtCore import Qt, QCoreApplication, QEvent
-from PyQt5.QtGui import QTextDocument
+from PyQt5.QtGui import QTextCursor, QTextDocument
 from PyQt5.QtWidgets import QApplication, QPushButton, QLabel
 from remote_control import RemoteControlServer
 
@@ -379,6 +379,62 @@ class RemoteControlGuiTests(unittest.TestCase):
                       self.plotter.receiver_edit, self.plotter.measurement_number_edit):
             self.assertEqual(field.width(), device_address.width())
         self.assertEqual(config_grid.getItemPosition(config_grid.indexOf(isomon_values))[3], 3)
+
+    def test_isomon_measured_voltage_decimal_points_and_units_align(self):
+        ip = '127.0.0.2'
+        self.plotter.device_edits[scada.ISOMON_DEVICE_INDEX].setText(f'{ip}:10578')
+        self.manager.add_device(ip)
+        device = self.manager.devices[ip]
+        device.iso_live_valid = True
+        device.iso_live_values = dict(zip(
+            (*scada.ISO_U_FIELDS, *scada.ISO_R_FIELDS),
+            (289.107, -314.010, 89.825, -508.559, 510.766, -97.574,
+             20_166_000.0, 81_331_000.0, 24_128_000.0, 208_400_000.0)))
+        device.last_analog_valid = True
+        device.analog_units = ['V', 'V']
+        device.analog_widths = [7, 8]
+        self.plotter.resize(3800, 800)
+        self.plotter.show()
+
+        def character_x(label, character):
+            document = QTextDocument()
+            document.documentLayout().setPaintDevice(label)
+            document.setDocumentMargin(0)
+            document.setDefaultFont(label.font())
+            document.setHtml(label.text())
+            text = document.toPlainText()
+            position = text.rindex(character)
+            cursor = QTextCursor(document)
+            cursor.setPosition(position)
+            block = cursor.block()
+            layout = block.layout()
+            return layout.lineForTextPosition(cursor.positionInBlock()).cursorToX(
+                cursor.positionInBlock())[0]
+
+        for values, decimals in (
+                ([94.054, -504.390], [3, 3]),
+                ([-1504.123, 0.001], [3, 3]),
+                ([94.05, -504.390], [2, 3])):
+            device.last_analog_values = values
+            device.analog_decimals = decimals
+            analog_values = [self.plotter._format_analog_value(device, idx) for idx in range(2)]
+            self.plotter._refresh_analog_values()
+            self.app.processEvents()
+            for character in ('.', 'V'):
+                self.assertAlmostEqual(
+                    character_x(self.plotter.isomon_iso_row1_lbl, character),
+                    character_x(self.plotter.isomon_iso_row2_lbl, character), delta=0.5)
+            self.assertEqual(analog_values, [
+                self.plotter._format_analog_value(device, idx) for idx in range(2)])
+
+        for valid in (False, True):
+            device.last_analog_valid = valid
+            device.last_analog_values = [float('nan'), -504.390]
+            self.plotter._refresh_analog_values()
+            self.app.processEvents()
+            self.assertAlmostEqual(
+                character_x(self.plotter.isomon_iso_row1_lbl, 'V'),
+                character_x(self.plotter.isomon_iso_row2_lbl, 'V'), delta=0.5)
 
     def test_isomon_live_values_fit_fhd_and_restore_full_font(self):
         ip = '127.0.0.2'
