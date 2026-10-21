@@ -12,7 +12,8 @@ from urllib.request import Request, urlopen
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 import scada
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QCoreApplication, QEvent
+from PyQt5.QtGui import QTextDocument
 from PyQt5.QtWidgets import QApplication, QPushButton, QLabel
 from remote_control import RemoteControlServer
 
@@ -389,23 +390,75 @@ class RemoteControlGuiTests(unittest.TestCase):
         device.iso_live_values = {field: -9_999_999.0 for field in (
             'u1_baseline', 'u2_baseline', 'u1_s2', 'u2_s2', 'u1_s3', 'u2_s3',
             'r1_via_r3', 'r2_via_r3', 'r1_via_r4', 'r2_via_r4')}
+        device.last_analog_valid = True
+        device.last_analog_values = [1.25, -2.5]
+        device.analog_units = ['V', 'V']
         self.plotter._refresh_analog_values()
         first_row = self.plotter.device_analog_value_labels[scada.ISOMON_DEVICE_INDEX][2]
         second_row = self.plotter.isomon_iso_row2_lbl
+        first_row_text = first_row.text()
+        second_row_text = second_row.text()
+        self.assertNotIn('R1 <sub>', first_row_text)
+        self.assertIn('R1<sub>R3</sub>', first_row_text)
+        self.assertIn('U1<sub>base</sub>', first_row_text)
+        self.assertIn('U<sub>POS</sub>', first_row_text)
+        self.assertIn('R1<sub>R4</sub>', second_row_text)
+        self.assertIn('U2<sub>S2</sub>', second_row_text)
+        self.assertIn('U<sub>NEG</sub>', second_row_text)
+        self.assertIn('1.250 V', first_row.property('iso_plain_text'))
+        self.assertIn('-2.500 V', second_row.property('iso_plain_text'))
+        self.plotter.resize(1920, 800)
+        self.plotter.show()
+        self.app.processEvents()
+        controls = self.plotter.device_settings_buttons[scada.ISOMON_DEVICE_INDEX].parentWidget()
+        controls_right = controls.mapTo(self.plotter, controls.rect().topRight()).x()
+        controls_y = controls.mapTo(self.plotter, controls.rect().center()).y()
+        self.assertGreater(first_row.mapTo(self.plotter, first_row.rect().topLeft()).x(), controls_right)
+        self.assertLessEqual(first_row.mapTo(self.plotter, first_row.rect().topLeft()).y(), controls_y)
+        self.assertGreaterEqual(first_row.mapTo(self.plotter, first_row.rect().bottomLeft()).y(), controls_y)
+        for revision in range(20):
+            device.iso_live_values['r1_via_r3'] = 11_077_000.0 + revision
+            self.plotter._refresh_analog_values()
+            self.app.processEvents()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            self.assertIs(self.plotter.device_analog_value_labels[scada.ISOMON_DEVICE_INDEX][2], first_row)
+            for label in (first_row, second_row):
+                self.assertTrue(label.isVisible())
+                self.assertGreater(label.width(), 0)
+                self.assertGreater(label.height(), 0)
+        self.plotter._rebuild_analog_value_row(scada.ISOMON_DEVICE_INDEX, device.channels)
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.plotter._refresh_analog_values()
+        self.app.processEvents()
+        self.assertIs(self.plotter.device_analog_value_labels[scada.ISOMON_DEVICE_INDEX][2], first_row)
 
-        for width, expected_font in ((1920, '16px'), (3800, '16px'), (1920, '16px')):
+        def assert_rows_render_in_place():
+            for label in (first_row, second_row):
+                self.assertTrue(label.isVisible())
+                document = QTextDocument()
+                document.documentLayout().setPaintDevice(label)
+                document.setDocumentMargin(0)
+                document.setDefaultFont(label.font())
+                document.setHtml(label.text())
+                self.assertLessEqual(document.idealWidth(), label.width())
+                self.assertLessEqual(document.size().height(), label.height())
+                self.assertGreater(label.mapTo(self.plotter, label.rect().topLeft()).x(), controls_right)
+                self.assertLessEqual(label.mapTo(self.plotter, label.rect().topRight()).x(),
+                                     self.plotter.width() - 10)
+            self.assertEqual(first_row.mapTo(self.plotter, first_row.rect().topLeft()).x(),
+                             second_row.mapTo(self.plotter, second_row.rect().topLeft()).x())
+            self.assertLess(first_row.mapTo(self.plotter, first_row.rect().bottomLeft()).y(),
+                            second_row.mapTo(self.plotter, second_row.rect().topLeft()).y())
+
+        for width in (1920, 3800, 1920):
             self.plotter.resize(width, 800)
             self.plotter.show()
             self.app.processEvents()
-            self.assertLessEqual(self.plotter.width(), width)
-            for label in (first_row, second_row):
-                self.assertLessEqual(label.mapTo(self.plotter, label.rect().topRight()).x(), width - 10)
-                self.assertGreaterEqual(label.width() - label.indent(),
-                                        label.fontMetrics().horizontalAdvance(label.text()))
-                if width == 3800:
-                    self.assertIn(expected_font, label.styleSheet())
-                else:
-                    self.assertNotIn(expected_font, label.styleSheet())
+            self.assertLessEqual(self.plotter.width(), width, f'requested={width}, min={self.plotter.minimumWidth()}')
+            assert_rows_render_in_place()
+            if width == 3800:
+                for label in (first_row, second_row):
+                    self.assertIn('16px', label.styleSheet())
 
         with patch.object(self.plotter, '_poll_isomon_alg_enable'), \
              patch.object(self.plotter, '_refresh_isomon_debug_pins'):
@@ -416,12 +469,20 @@ class RemoteControlGuiTests(unittest.TestCase):
             self.plotter._realign_isomon_row2_label()
             self.app.processEvents()
             debug_panel = self.plotter.isomon_debug_panel
+            assert_rows_render_in_place()
             self.assertLessEqual(debug_panel.geometry().right(), self.plotter.width() - 10)
-            self.assertGreater(debug_panel.x(), second_row.mapTo(
-                self.plotter, second_row.rect().topRight()).x())
-            for label in (first_row, second_row):
-                self.assertGreaterEqual(label.width() - label.indent(),
-                                        label.fontMetrics().horizontalAdvance(label.text()))
+            document = QTextDocument()
+            document.documentLayout().setPaintDevice(second_row)
+            document.setDocumentMargin(0)
+            document.setDefaultFont(second_row.font())
+            document.setHtml(second_row.text())
+            second_row_right = second_row.mapTo(
+                self.plotter, second_row.rect().topLeft()).x() + document.idealWidth()
+            if debug_panel.y() == first_row.mapTo(self.plotter, first_row.rect().topLeft()).y():
+                self.assertGreater(debug_panel.x(), second_row_right)
+            else:
+                self.assertGreater(debug_panel.y(), second_row.mapTo(
+                    self.plotter, second_row.rect().bottomLeft()).y())
 
     def test_remote_control_layout_uses_two_top_rows(self):
         config_grid = self.plotter.layout().itemAt(0).layout()

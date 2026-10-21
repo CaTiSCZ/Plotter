@@ -39,10 +39,10 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QPushButton, QLineEdit, QLabel, QSpinBox, QDoubleSpinBox, QCheckBox, QTextEdit,
     QPlainTextEdit, QSlider, QScrollArea, QRadioButton, QButtonGroup,
-    QFileDialog, QMessageBox, QComboBox, QAbstractButton, QSizePolicy
+    QFileDialog, QMessageBox, QComboBox, QAbstractButton, QSizePolicy, QLayout
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint, QObject, QBuffer, QIODevice
-from PyQt5.QtGui import QFont, QFontMetrics, QTextDocument
+from PyQt5.QtGui import QFont, QTextDocument
 
 # Shared FDDS protocol core (vendored copy of the firmware repo's utils/fdds).
 # Single source of truth for packet/command enums, struct layouts and CRC so the
@@ -324,6 +324,26 @@ ISO_U_FIELDS = (
 ISO_R_FIELDS = (
     'r1_via_r3', 'r2_via_r3', 'r1_via_r4', 'r2_via_r4',
 )
+ISO_LIVE_ROW_1_FIELDS = (
+    'r1_via_r3', 'r2_via_r3', 'u1_baseline', 'u1_s2', 'u1_s3', 'u_pos',
+)
+ISO_LIVE_ROW_2_FIELDS = (
+    'r1_via_r4', 'r2_via_r4', 'u2_baseline', 'u2_s2', 'u2_s3', 'u_neg',
+)
+ISO_LIVE_LABELS = {
+    'r1_via_r3': ('R1<sub>R3</sub>', 'R1R3'),
+    'r2_via_r3': ('R2<sub>R3</sub>', 'R2R3'),
+    'r1_via_r4': ('R1<sub>R4</sub>', 'R1R4'),
+    'r2_via_r4': ('R2<sub>R4</sub>', 'R2R4'),
+    'u1_baseline': ('U1<sub>base</sub>', 'U1base'),
+    'u2_baseline': ('U2<sub>base</sub>', 'U2base'),
+    'u1_s2': ('U1<sub>S2</sub>', 'U1S2'),
+    'u2_s2': ('U2<sub>S2</sub>', 'U2S2'),
+    'u1_s3': ('U1<sub>S3</sub>', 'U1S3'),
+    'u2_s3': ('U2<sub>S3</sub>', 'U2S3'),
+    'u_pos': ('U<sub>POS</sub>', 'UPOS'),
+    'u_neg': ('U<sub>NEG</sub>', 'UNEG'),
+}
 
 # Precomputed vectors for vectorised DATA-packet parsing (Phase 2 fast path).
 _DATA_SAMPLE_INDEX = np.arange(SAMPLES_PER_PACKET, dtype=np.int64)
@@ -3134,6 +3154,7 @@ class Plotter(QWidget):
         self.resize(1400, 800)
 
         root = QVBoxLayout(self)
+        root.setSizeConstraint(QLayout.SetNoConstraint)
         cfg = QGridLayout()
         cfg.setColumnMinimumWidth(7, 700)
         cfg.setColumnStretch(7, 1)
@@ -3331,13 +3352,25 @@ class Plotter(QWidget):
         self._isomon_debug_alg_timer.setInterval(DEBUG_ALG_POLL_INTERVAL_MS)
         self._isomon_debug_alg_timer.timeout.connect(self._poll_isomon_alg_enable)
 
+        self.isomon_iso_row1_lbl = QLabel(self)
+        self.isomon_iso_row1_lbl.setObjectName('isomon_result_row_1')
+        self.isomon_iso_row1_lbl.setStyleSheet(ANALOG_VALUE_NO_DATA_STYLE)
+        self.isomon_iso_row1_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.isomon_iso_row1_lbl.setTextFormat(Qt.RichText)
+        self.isomon_iso_row1_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.isomon_iso_row1_lbl.setProperty('iso_fields', ISO_LIVE_ROW_1_FIELDS)
+        self.isomon_iso_row1_lbl.hide()
+
         self.isomon_iso_row2_lbl = QLabel('')
         self.isomon_iso_row2_lbl.setObjectName('isomon_result_row_2')
         self.isomon_iso_row2_lbl.setStyleSheet(ANALOG_VALUE_NO_DATA_STYLE)
         self.isomon_iso_row2_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.isomon_iso_row2_lbl.setTextFormat(Qt.RichText)
         self.isomon_iso_row2_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.isomon_iso_row2_lbl.setToolTip('ISOMON PACKET_ISO_RESULT live values (row 2)')
-        self.isomon_iso_row2_lbl.setText(self._format_iso_row(('u2_baseline', 'u1_s3', 'u2_s3', 'r1_via_r4', 'r2_via_r4'), {}, False))
+        self.isomon_iso_row2_lbl.setText(self._format_iso_row(ISO_LIVE_ROW_2_FIELDS, {}, False))
+        self.isomon_iso_row2_lbl.setProperty(
+            'iso_plain_text', self._format_iso_plain_row(ISO_LIVE_ROW_2_FIELDS, {}, False))
         self.isomon_iso_row2_lbl.setVisible(False)
         cfg.addWidget(self.isomon_iso_row2_lbl, DeviceManager.MAX_DEVICES, 7, 1, 3)
 
@@ -4127,16 +4160,13 @@ class Plotter(QWidget):
         layout = self.device_analog_value_layouts[row]
         while layout.count():
             item = layout.takeAt(0)
-            child_layout = item.layout()
-            if child_layout is not None:
-                while child_layout.count():
-                    child_item = child_layout.takeAt(0)
-                    child_widget = child_item.widget()
-                    if child_widget is not None:
-                        child_widget.deleteLater()
             widget = item.widget()
             if widget is not None:
-                widget.deleteLater()
+                if widget is self.isomon_iso_row1_lbl:
+                    widget.hide()
+                    widget.setParent(self)
+                else:
+                    widget.deleteLater()
         labels: List[QLabel] = []
 
         dev = self._device_for_row(row)
@@ -4146,26 +4176,21 @@ class Plotter(QWidget):
             lbl = QLabel()
             lbl.setStyleSheet(ANALOG_VALUE_FONT_STYLE)
             lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            lbl.setVisible(not is_isomon)
             layout.addWidget(lbl)
             labels.append(lbl)
 
         if is_isomon:
-            iso_col = QVBoxLayout()
-            iso_col.setContentsMargins(0, 0, 0, 0)
-            iso_col.setSpacing(0)
-            iso_lbl = QLabel()
-            iso_lbl.setStyleSheet(ANALOG_VALUE_NO_DATA_STYLE)
-            iso_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            iso_fields = ('u1_baseline', 'u1_s2', 'u2_s2', 'r1_via_r3', 'r2_via_r3')
-            iso_lbl.setProperty('iso_fields', iso_fields)
+            iso_lbl = self.isomon_iso_row1_lbl
+            iso_fields = ISO_LIVE_ROW_1_FIELDS
             iso_lbl.setText(self._format_iso_row(iso_fields, {}, False))
-            iso_lbl.setFixedWidth(self._iso_row_fixed_width(iso_lbl, iso_fields))
-            iso_lbl.setMinimumWidth(0)
-            iso_col.addWidget(iso_lbl)
+            iso_lbl.setProperty('iso_plain_text', self._format_iso_plain_row(iso_fields, {}, False))
+            layout.addWidget(iso_lbl, 1)
+            iso_lbl.show()
             labels.append(iso_lbl)
-            layout.addLayout(iso_col)
 
-        layout.addStretch(1)
+        if not is_isomon:
+            layout.addStretch(1)
         self.device_analog_value_labels[row] = labels
 
     def _format_analog_value(self, dev: Device, channel_idx: int) -> str:
@@ -4197,23 +4222,51 @@ class Plotter(QWidget):
         else:
             value_s = f"{'--':>{ISO_VALUE_WIDTH}}"
             prefix = ' '
-        return f'{value_s} {prefix}Ω' if is_resistance else value_s
+        return f'{value_s} {prefix}Ω' if is_resistance else f'{value_s} V'
 
-    def _format_iso_row(self, fields: Tuple[str, ...], iso_values: dict, iso_valid: bool) -> str:
-        return '  '.join(
-            f'{name}:{self._format_iso_value(name, iso_values.get(name, np.nan), iso_valid)}'
-            for name in fields
-        )
+    def _format_iso_row(self, fields: Tuple[str, ...], iso_values: dict, iso_valid: bool,
+                        dev: Device | None = None) -> str:
+        rich_parts = []
+        for name in fields:
+            value = self._format_iso_field_value(name, iso_values, iso_valid, dev)
+            rich_label, _plain_label = ISO_LIVE_LABELS[name]
+            rich_parts.append(f'{rich_label}:&nbsp;{value.replace(" ", "&nbsp;")}')
+        return '  '.join(rich_parts)
+
+    def _format_iso_plain_row(self, fields: Tuple[str, ...], iso_values: dict,
+                              iso_valid: bool, dev: Device | None = None) -> str:
+        parts = []
+        for name in fields:
+            _rich_label, plain_label = ISO_LIVE_LABELS[name]
+            value = self._format_iso_field_value(name, iso_values, iso_valid, dev)
+            parts.append(f'{plain_label}: {value}')
+        return '  '.join(parts)
+
+    def _format_iso_field_value(self, field: str, iso_values: dict, iso_valid: bool,
+                                dev: Device | None) -> str:
+        if field in ('u_pos', 'u_neg') and dev is not None:
+            channel_idx = 0 if field == 'u_pos' else 1
+            return self._format_analog_value(dev, channel_idx)
+        return self._format_iso_value(field, iso_values.get(field, np.nan), iso_valid)
 
     def _iso_row_fixed_width(self, label: QLabel, fields: Tuple[str, ...], font_size: int = 16) -> int:
         samples = ({field: -9_999.999 for field in fields},
-                   {field: -9_999_999.0 for field in fields})
-        font = QFont('Consolas')
+                   {field: -9_999_999.0 if field.startswith('r') else -9_999.999
+                    for field in fields})
+        font = label.font()
         font.setPixelSize(font_size)
         font.setWeight(QFont.DemiBold)
-        metrics = QFontMetrics(font)
-        return max(metrics.horizontalAdvance(self._format_iso_row(fields, sample, True))
-                   for sample in samples) + 4
+        widths = []
+        html_rows = [self._format_iso_row(fields, sample, True) for sample in samples]
+        html_rows.append(label.text())
+        for html in html_rows:
+            document = QTextDocument()
+            document.documentLayout().setPaintDevice(label)
+            document.setDocumentMargin(0)
+            document.setDefaultFont(font)
+            document.setHtml(html)
+            widths.append(document.idealWidth())
+        return math.ceil(max(widths)) + 4
 
     def _realign_isomon_row2_label(self):
         if not hasattr(self, 'isomon_iso_row2_lbl'):
@@ -4236,26 +4289,23 @@ class Plotter(QWidget):
             self.isomon_iso_row2_lbl.setIndent(0)
             return
         x1 = first_iso_lbl.mapTo(self, QPoint(0, 0)).x()
-        x2 = self.isomon_iso_row2_lbl.mapTo(self, QPoint(0, 0)).x()
-        indent = max(0, x1 - x2)
-        self.isomon_iso_row2_lbl.setIndent(indent)
+        self.isomon_iso_row2_lbl.setIndent(0)
         row1_fields = tuple(first_iso_lbl.property('iso_fields'))
-        row2_fields = ('u2_baseline', 'u1_s3', 'u2_s3', 'r1_via_r4', 'r2_via_r4')
-        available_width = max(0, self.width() - self.layout().contentsMargins().right() - x1)
+        row2_fields = ISO_LIVE_ROW_2_FIELDS
+        available_width = max(
+            0, self.width() - self.layout().contentsMargins().right() - x1 - 16)
         if self.isomon_debug_panel.isVisible():
             self.isomon_debug_panel.adjustSize()
             available_width = max(0, available_width - self.isomon_debug_panel.width() - 8)
-        font_size = next((size for size in range(16, 7, -1)
+        font_size = next((size for size in range(16, 4, -1)
                           if max(self._iso_row_fixed_width(first_iso_lbl, row1_fields, size),
-                                 self._iso_row_fixed_width(self.isomon_iso_row2_lbl, row2_fields, size)) <= available_width), 8)
+                                 self._iso_row_fixed_width(self.isomon_iso_row2_lbl, row2_fields, size)) <= available_width), 5)
         for label in (first_iso_lbl, self.isomon_iso_row2_lbl):
             style = ANALOG_VALUE_FONT_STYLE if label.property('iso_valid') else ANALOG_VALUE_NO_DATA_STYLE
-            label.setStyleSheet(style.replace('16px', f'{font_size}px'))
-        first_iso_lbl.setFixedWidth(self._iso_row_fixed_width(first_iso_lbl, row1_fields, font_size))
-        first_iso_lbl.setMinimumWidth(0)
-        self.isomon_iso_row2_lbl.setFixedWidth(
-            self._iso_row_fixed_width(self.isomon_iso_row2_lbl, row2_fields, font_size) + indent)
-        self.isomon_iso_row2_lbl.setMinimumWidth(0)
+            style = style.replace('16px', f'{font_size}px')
+            if label.styleSheet() != style:
+                label.setStyleSheet(style)
+            label.setProperty('iso_font_size', font_size)
         self._position_isomon_debug_panel()
 
     def _position_isomon_debug_panel(self):
@@ -4269,9 +4319,18 @@ class Plotter(QWidget):
             if len(labels) > channel_count:
                 first_iso_lbl = labels[channel_count]
                 pos = first_iso_lbl.mapTo(self, QPoint(0, 0))
-                right = self.isomon_iso_row2_lbl.mapTo(
-                    self, QPoint(self.isomon_iso_row2_lbl.width(), 0)).x()
-                self.isomon_debug_panel.move(right + 8, pos.y())
+                font_size = first_iso_lbl.property('iso_font_size') or 16
+                right = pos.x() + max(
+                    self._iso_row_fixed_width(first_iso_lbl, ISO_LIVE_ROW_1_FIELDS, font_size),
+                    self._iso_row_fixed_width(self.isomon_iso_row2_lbl, ISO_LIVE_ROW_2_FIELDS, font_size))
+                panel_x = right + 8
+                if panel_x + self.isomon_debug_panel.width() > self.width() - 10:
+                    row2_bottom = self.isomon_iso_row2_lbl.mapTo(
+                        self, QPoint(0, self.isomon_iso_row2_lbl.height())).y()
+                    panel_x = pos.x()
+                    self.isomon_debug_panel.move(panel_x, row2_bottom + 4)
+                else:
+                    self.isomon_debug_panel.move(panel_x, pos.y())
                 self.isomon_debug_panel.raise_()
                 return
         pos = self.isomon_debug_chk.mapTo(self, QPoint(self.isomon_debug_chk.width() + 8, 0))
@@ -4291,6 +4350,7 @@ class Plotter(QWidget):
                 continue
             valid = bool(dev and dev.last_analog_valid)
             for ch_idx, lbl in enumerate(self.device_analog_value_labels[row][:channel_count]):
+                lbl.setVisible(not is_isomon)
                 lbl.setText(self._format_analog_value(dev, ch_idx))
                 if valid:
                     lbl.setStyleSheet(ANALOG_VALUE_FONT_STYLE)
@@ -4312,12 +4372,18 @@ class Plotter(QWidget):
                     fields = lbl.property('iso_fields')
                     if not fields:
                         continue
-                    lbl.setText(self._format_iso_row(tuple(fields), iso_values, iso_valid))
+                    lbl.setText(self._format_iso_row(tuple(fields), iso_values, iso_valid, dev))
+                    lbl.setProperty('iso_plain_text', self._format_iso_plain_row(
+                        tuple(fields), iso_values, iso_valid, dev))
                     lbl.setProperty('iso_valid', iso_valid)
                     lbl.setToolTip(iso_tooltip)
 
-                row2_fields = ('u2_baseline', 'u1_s3', 'u2_s3', 'r1_via_r4', 'r2_via_r4')
-                self.isomon_iso_row2_lbl.setText(self._format_iso_row(row2_fields, iso_values, iso_valid))
+                row2_fields = ISO_LIVE_ROW_2_FIELDS
+                self.isomon_iso_row2_lbl.setText(
+                    self._format_iso_row(row2_fields, iso_values, iso_valid, dev))
+                self.isomon_iso_row2_lbl.setProperty(
+                    'iso_plain_text', self._format_iso_plain_row(
+                        row2_fields, iso_values, iso_valid, dev))
                 self.isomon_iso_row2_lbl.setProperty('iso_valid', iso_valid)
                 self.isomon_iso_row2_lbl.setToolTip(iso_tooltip)
                 self.isomon_iso_row2_lbl.setVisible(True)
