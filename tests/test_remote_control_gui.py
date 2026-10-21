@@ -380,6 +380,22 @@ class RemoteControlGuiTests(unittest.TestCase):
             self.assertEqual(field.width(), device_address.width())
         self.assertEqual(config_grid.getItemPosition(config_grid.indexOf(isomon_values))[3], 3)
 
+    def test_isomon_column_separators_preserve_spacing(self):
+        for fields in (scada.ISO_LIVE_ROW_1_FIELDS, scada.ISO_LIVE_ROW_2_FIELDS):
+            for valid in (False, True):
+                values = {field: 123.456 for field in fields}
+                html = self.plotter._format_iso_row(fields, values, valid)
+                plain = self.plotter._format_iso_plain_row(fields, values, valid)
+                document = QTextDocument()
+                document.setHtml(html)
+                rendered = document.toPlainText()
+                self.assertEqual(html.count('&nbsp;&nbsp;|&nbsp;&nbsp;'), 5)
+                self.assertEqual(plain.count('  |  '), 5)
+                self.assertEqual(rendered.count('  |  '), 5)
+                self.assertEqual(rendered.count('|'), 5)
+                self.assertFalse(rendered.startswith(' '))
+                self.assertFalse(rendered.endswith(' '))
+
     def test_isomon_measured_voltage_decimal_points_and_units_align(self):
         ip = '127.0.0.2'
         self.plotter.device_edits[scada.ISOMON_DEVICE_INDEX].setText(f'{ip}:10578')
@@ -506,13 +522,13 @@ class RemoteControlGuiTests(unittest.TestCase):
             self.assertLess(first_row.mapTo(self.plotter, first_row.rect().bottomLeft()).y(),
                             second_row.mapTo(self.plotter, second_row.rect().topLeft()).y())
 
-        for width in (1920, 3800, 1920):
+        for width in (1920, 3800, 4400, 1920):
             self.plotter.resize(width, 800)
             self.plotter.show()
             self.app.processEvents()
             self.assertLessEqual(self.plotter.width(), width, f'requested={width}, min={self.plotter.minimumWidth()}')
             assert_rows_render_in_place()
-            if width == 3800:
+            if width == 4400:
                 for label in (first_row, second_row):
                     self.assertIn('16px', label.styleSheet())
 

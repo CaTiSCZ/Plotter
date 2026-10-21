@@ -4238,7 +4238,7 @@ class Plotter(QWidget):
             value = self._format_iso_field_value(name, iso_values, iso_valid, dev)
             rich_label, _plain_label = ISO_LIVE_LABELS[name]
             rich_parts.append(f'{rich_label}:&nbsp;{value.replace(" ", "&nbsp;")}')
-        return '  '.join(rich_parts)
+        return '&nbsp;&nbsp;|&nbsp;&nbsp;'.join(rich_parts)
 
     def _format_iso_plain_row(self, fields: Tuple[str, ...], iso_values: dict,
                               iso_valid: bool, dev: Device | None = None) -> str:
@@ -4247,7 +4247,7 @@ class Plotter(QWidget):
             _rich_label, plain_label = ISO_LIVE_LABELS[name]
             value = self._format_iso_field_value(name, iso_values, iso_valid, dev)
             parts.append(f'{plain_label}: {value}')
-        return '  '.join(parts)
+        return '  |  '.join(parts)
 
     def _format_iso_field_value(self, field: str, iso_values: dict, iso_valid: bool,
                                 dev: Device | None) -> str:
@@ -4314,9 +4314,9 @@ class Plotter(QWidget):
         if self.isomon_debug_panel.isVisible():
             self.isomon_debug_panel.adjustSize()
             available_width = max(0, available_width - self.isomon_debug_panel.width() - 8)
-        font_size = next((size for size in range(16, 4, -1)
+        font_size = next((size for size in range(16, 3, -1)
                           if max(self._iso_row_fixed_width(first_iso_lbl, row1_fields, size),
-                                 self._iso_row_fixed_width(self.isomon_iso_row2_lbl, row2_fields, size)) <= available_width), 5)
+                                 self._iso_row_fixed_width(self.isomon_iso_row2_lbl, row2_fields, size)) <= available_width), 4)
         for label in (first_iso_lbl, self.isomon_iso_row2_lbl):
             style = ANALOG_VALUE_FONT_STYLE if label.property('iso_valid') else ANALOG_VALUE_NO_DATA_STYLE
             style = style.replace('16px', f'{font_size}px')
