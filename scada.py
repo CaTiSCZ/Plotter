@@ -2336,6 +2336,23 @@ class DeviceManager:
         if self.loop and self.data_socket:
             self.loop.call_soon_threadsafe(self.data_socket.clear_queue)
 
+    def flush_input_buffers(self):
+        def clear_rings():
+            packet_count = 0
+            for dev in self.devices.values():
+                for ring in dev.input_packet_rings.values():
+                    packet_count += len(ring)
+                    ring.clear()
+            self._logger.info(
+                f'Flush buffers: cleared {packet_count} input packets '
+                f'across {len(self.devices)} devices; measurement data preserved.')
+
+        # Serialize with packet dispatch without resetting the capture state.
+        if self.loop is not None:
+            self.loop.call_soon_threadsafe(clear_rings)
+        else:
+            clear_rings()
+
     def set_trigger_signal(self, signal):
         """Register the GUI signal (pyqtSignal(str)) emitted with the source IP on trigger."""
         self.trigger_signal = signal
@@ -3566,6 +3583,7 @@ class Plotter(QWidget):
                           #('Penetrate Firewall'             , self._penetrate_firewall              ),
                           #('Save Data'                      , self.save_data                        ),
                           ('Reset devices', 'reset_devices', self._reset_devices),
+                          ('Flush buffers', 'flush_buffers', self.manager.flush_input_buffers),
                           ):
             b=QPushButton(label)
             b.setObjectName(object_name)
@@ -3573,6 +3591,11 @@ class Plotter(QWidget):
             btns.addWidget(b)
             if object_name == 'save_calibration':
                 self.save_calibration_btn = b
+            elif object_name == 'flush_buffers':
+                b.setToolTip(
+                    'Clear input packet history for all devices and streams. '
+                    'Measurement data and plots are preserved; pre-trigger history '
+                    'refills as new packets arrive.')
 
         # Plot downsampling / rendering controls. setDownsampling(ds, auto, mode)
         # reduces how many points pyqtgraph actually draws each frame, the dominant

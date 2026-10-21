@@ -6,7 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.request import Request, urlopen
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
@@ -126,6 +126,78 @@ class RemoteControlGuiTests(unittest.TestCase):
                     self.assertEqual(payload['devices'][0]['ip'], ip)
                     self.assertEqual(payload['devices'][0]['calibration'], calibration)
             error_dialog.assert_not_called()
+
+    def test_flush_buffers_manual_and_remote_preserves_measurement(self):
+        registry = self.plotter._remote_widget_registry()
+        button = registry['flush_buffers']
+        reset_button = registry['reset_devices']
+        self.assertEqual(button.text(), 'Flush buffers')
+        layout = button.parentWidget().layout()
+        row = next(layout.itemAt(i).layout() for i in range(layout.count())
+                   if layout.itemAt(i).layout() is not None
+                   and layout.itemAt(i).layout().indexOf(button) >= 0)
+        self.assertEqual(row.indexOf(button), row.indexOf(reset_button) + 1)
+        self.assertEqual(row.indexOf(button), row.count() - 1)
+        button.click()  # No applied devices is also a valid operation.
+
+        with patch.object(scada, 'BUFFER_SIZE', 16):
+            for ip in ('127.0.0.2', '127.0.0.3'):
+                self.manager.add_device(ip)
+        curve = self.plotter.ax.plot([0, 1], [10, 20])
+        old_ptp = vars(scada.ptp_mode).copy()
+        try:
+            scada.ptp_mode.waiting_for_trigger = True
+            for mode in ('manual', 'remote'):
+                with self.subTest(mode=mode):
+                    for device in self.manager.devices.values():
+                        for ring in device.input_packet_rings.values():
+                            ring.extend([b'old packet', b'new packet'])
+                        device.buffer.extend([1], [[42]], [0], [123])
+                        device.capture_active = True
+                        device.capture_counters[scada.STREAM_DATA] = 7
+                        device.trigger_order_by_stream[scada.STREAM_DATA] = 12
+                    if mode == 'manual':
+                        button.click()
+                    else:
+                        status, _ = self._request_on_gui_event_loop(
+                            '/api/v1/widgets/flush_buffers', method='POST',
+                            body={'action': 'click'})
+                        self.assertEqual(status, 200)
+                    for device in self.manager.devices.values():
+                        self.assertTrue(all(not ring for ring in device.input_packet_rings.values()))
+                        self.assertEqual(list(device.buffer.signal[1]),
+                                         [42] * (1 if mode == 'manual' else 2))
+                        self.assertTrue(device.capture_active)
+                        self.assertEqual(device.capture_counters[scada.STREAM_DATA], 7)
+                        self.assertEqual(device.trigger_order_by_stream[scada.STREAM_DATA], 12)
+                        self.assertTrue(all(ring.maxlen == scada.PTP_TRIGGER_RING_PACKETS
+                                            for ring in device.input_packet_rings.values()))
+                    self.assertTrue(scada.ptp_mode.waiting_for_trigger)
+                    self.assertIn(curve, self.plotter.ax.listDataItems())
+                    self.assertEqual(curve.getData()[1].tolist(), [10, 20])
+        finally:
+            vars(scada.ptp_mode).clear()
+            vars(scada.ptp_mode).update(old_ptp)
+            self.manager.clear()
+
+    def test_flush_buffers_runs_on_packet_dispatch_loop(self):
+        with patch.object(scada, 'BUFFER_SIZE', 16):
+            self.manager.add_device('127.0.0.2')
+        device = self.manager.devices['127.0.0.2']
+        ring = device.input_packet_rings[scada.STREAM_DATA]
+        ring.append(b'old packet')
+        try:
+            with patch.object(self.manager, 'loop', Mock()) as loop:
+                self.manager.flush_input_buffers()
+                loop.call_soon_threadsafe.assert_called_once()
+                self.assertEqual(list(ring), [b'old packet'])
+                callback = loop.call_soon_threadsafe.call_args.args[0]
+                callback()
+                self.assertFalse(ring)
+                ring.append(b'new packet')
+                self.assertEqual(list(ring), [b'new packet'])
+        finally:
+            self.manager.clear()
 
     def test_save_calibration_manual_without_devices(self):
         with patch.object(scada.QMessageBox, 'warning') as warning, \

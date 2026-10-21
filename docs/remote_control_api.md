@@ -23,7 +23,16 @@ The token is also shown in the GUI's **Token** field on the row below **Web addr
 
 Command-line tokens can be visible in process listings and shell history; for persistent or shared setups prefer a protected `REMOTE_CONTROL_TOKEN` setting. LAN binding still requires a non-empty token, whether it comes from settings or CLI.
 
-The selected address and token are shown in the GUI and the Enabled checkbox is checked when `--remote_control` is supplied. Other application arguments such as `DEBUG` are preserved. Supplying only `--remote_control_token` replaces the configured token without forcing the interface on. The bottom-row action buttons appear in this order: Start New Sampling, Start New Sampling on trigger, Force trigger, Save Measurement, Save calibration, Reset Counter, then the remaining controls.
+The selected address and token are shown in the GUI and the Enabled checkbox is checked when `--remote_control` is supplied. Other application arguments such as `DEBUG` are preserved. Supplying only `--remote_control_token` replaces the configured token without forcing the interface on. The action buttons above the plots appear in this order: Start New Sampling, Start New Sampling on trigger, Force trigger, Save Measurement, Save calibration, Reset Counter, Reset Latched Faults, Reset devices, Flush buffers.
+
+**Flush buffers** (`flush_buffers`, widget action `click`) clears only the input
+packet rings for all applied devices and all streams on the packet-dispatch loop.
+It preserves captured measurement data, plots, live values, and capture/trigger
+state, and sends no hardware reset command. New incoming packets refill the
+pre-trigger history immediately; a trigger shortly after flushing may therefore
+have insufficient history. Completion and the number of discarded packets are
+logged. The widget API response accepts the action; clearing runs asynchronously
+when the packet-dispatch loop is active.
 
 Base URL examples:
 
