@@ -59,6 +59,8 @@ from fdds.protocol import (
     DIGITAL_CHANNEL_FLAG_CURRENT, DIGITAL_CHANNEL_FLAG_LATCHED,
     UDP_CMD_PORT, UDP_DATA_PORT,
     WIDE_CH_POS, WIDE_CH_NEG, wide_record_bytes,
+    ISOMON_INVALID_RESISTANCE_ZERO, ISOMON_INVALID_RESISTANCE_NAN,
+    ISOMON_INVALID_RESISTANCE_RAW,
 )
 from fdds.crc import crc16_ccitt
 from fdds import alg_config as fdds_alg_config
@@ -2887,7 +2889,25 @@ class DeviceSettingsDialog(QDialog):
                 fmt = rest[0] if rest else 'f'
                 raw = self._sections[section.name][name]
                 values = raw if count != 1 else [raw]
-                editors = [self._number_widget(value, fmt) for value in values]
+                if section.name == 'isomon_iso' and name == 'invalid_resistance_mode':
+                    editor = QComboBox()
+                    editor.setObjectName('isomon_invalid_resistance_mode')
+                    for label, mode in (
+                            ('Zero (0)', ISOMON_INVALID_RESISTANCE_ZERO),
+                            ('NaN', ISOMON_INVALID_RESISTANCE_NAN),
+                            ('Raw (NaN / +Inf / -Inf)', ISOMON_INVALID_RESISTANCE_RAW)):
+                        editor.addItem(label, mode)
+                    index = editor.findData(raw)
+                    if index < 0:
+                        raise ValueError(f'Neznámý režim neplatných odporů ISOMON: {raw}.')
+                    editor.setCurrentIndex(index)
+                    editor.setToolTip(
+                        'Hodnota posílaná firmwarem při neplatném výpočtu odporu. '
+                        'Raw zachovává i NaN a kladné/záporné nekonečno.')
+                    editor.currentIndexChanged.connect(self._mark_dirty)
+                    editors = [editor]
+                else:
+                    editors = [self._number_widget(value, fmt) for value in values]
                 self._field_widgets[section.name][name] = editors
                 row = QHBoxLayout()
                 for editor in editors:
@@ -2928,7 +2948,9 @@ class DeviceSettingsDialog(QDialog):
                 editors = self._field_widgets[section.name][name]
                 values = []
                 for editor in editors:
-                    if fmt == 'f':
+                    if isinstance(editor, QComboBox):
+                        value = editor.currentData()
+                    elif fmt == 'f':
                         try:
                             value = float(editor.text())
                         except ValueError as exc:
@@ -3099,6 +3121,20 @@ class DeviceSettingsDialog(QDialog):
                 values = sections.get(section.name)
                 if not isinstance(values, dict):
                     raise ValueError(f'V souboru chybí sekce {section.name}.')
+                values = dict(values)
+                if section.name == 'isomon_iso':
+                    if 'invalid_resistance_mode' not in values:
+                        reserved = values.get('reserved')
+                        if not isinstance(reserved, list) or len(reserved) != 3:
+                            raise ValueError('Starší konfigurace ISOMON nemá platná rezervovaná pole.')
+                        values['invalid_resistance_mode'] = ISOMON_INVALID_RESISTANCE_ZERO
+                        values['reserved'] = reserved[1:]
+                        self._logger.info(
+                            'Importing legacy ISOMON config with invalid resistance mode Zero.')
+                    if values['invalid_resistance_mode'] not in (
+                            ISOMON_INVALID_RESISTANCE_ZERO, ISOMON_INVALID_RESISTANCE_NAN,
+                            ISOMON_INVALID_RESISTANCE_RAW):
+                        raise ValueError('Neplatný režim neplatných odporů ISOMON v souboru.')
                 section.pack(values)
                 imported[section.name] = values
             calibration = device_payload.get('calibration')
@@ -4297,7 +4333,11 @@ class Plotter(QWidget):
 
     def _format_iso_value(self, field: str, value: float, valid: bool) -> str:
         is_resistance = field.startswith('r')
-        if valid and np.isfinite(value):
+        if valid and not np.isfinite(value):
+            special_value = 'NaN' if np.isnan(value) else ('+Inf' if value > 0 else '-Inf')
+            value_s = special_value.rjust(ISO_VALUE_WIDTH)
+            prefix = ' '
+        elif valid:
             scaled_value = float(value)
             prefix = ' '
             if is_resistance and abs(scaled_value) > 10_000_000:
@@ -6507,7 +6547,8 @@ class Plotter(QWidget):
                                     y_r = y_r[iso_keep]
                                     if name not in self.ax_iso_r_curves:
                                         color = Plotter.Colors[len(self.ax_iso_r_curves) % len(Plotter.Colors)]
-                                        self.ax_iso_r_curves[name] = self.ax_iso_r.plot(pen=color, name=name)
+                                        self.ax_iso_r_curves[name] = self.ax_iso_r.plot(
+                                            pen=color, name=name, connect='finite')
                                     x_plot, y_plot = (_clip_curve_window(x_iso, y_r, *clip_bounds)
                                                       if clip_bounds is not None else (x_iso, y_r))
                                     self.ax_iso_r_curves[name].setData(x_plot, y_plot)

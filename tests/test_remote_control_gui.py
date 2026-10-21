@@ -206,6 +206,25 @@ class RemoteControlGuiTests(unittest.TestCase):
                     len(dialog._channel_widgets), 2 if ip == '127.0.0.3' else 1)
             isomon = self.plotter._settings_dialogs['127.0.0.3']
             self.assertEqual(isomon._device_type, 'isomon')
+            mode_editor = isomon._field_widgets['isomon_iso']['invalid_resistance_mode'][0]
+            self.assertIsInstance(mode_editor, scada.QComboBox)
+            self.assertEqual(mode_editor.count(), 3)
+            iso_section = scada.fdds_alg_config.section_by_name('isomon', 'isomon_iso')
+            for mode in (scada.ISOMON_INVALID_RESISTANCE_ZERO,
+                         scada.ISOMON_INVALID_RESISTANCE_NAN,
+                         scada.ISOMON_INVALID_RESISTANCE_RAW):
+                mode_editor.setCurrentIndex(mode_editor.findData(mode))
+                calibration, sections = isomon._collect_values()
+                self.assertEqual(sections['isomon_iso']['invalid_resistance_mode'], mode)
+                encoded = iso_section.pack(sections['isomon_iso'])
+                self.assertEqual(iso_section.unpack(encoded)['invalid_resistance_mode'], mode)
+                with patch.object(isomon.device, 'set_calibration', return_value=True), \
+                     patch.object(isomon.device, 'set_alg_config_section',
+                                  return_value={'applied': True}) as send:
+                    isomon._send_values(calibration, sections, save=False)
+                self.assertIn(
+                    unittest.mock.call(iso_section.id, encoded, save=False), send.call_args_list)
+            isomon._dirty = False
             imported_channels = [
                 {'unit': 'V', 'offset': 2.656798363, 'gain': 0.002133012},
                 {'unit': 'V', 'offset': 32.016990662, 'gain': 0.002108254},
@@ -219,6 +238,13 @@ class RemoteControlGuiTests(unittest.TestCase):
                     'sections': isomon._sections,
                 },
             }
+            # The former three-byte reserved field predates the mode selector.
+            imported_payload['alg_config']['sections'] = {
+                name: dict(fields) for name, fields in isomon._sections.items()
+            }
+            legacy_iso = imported_payload['alg_config']['sections']['isomon_iso']
+            del legacy_iso['invalid_resistance_mode']
+            legacy_iso['reserved'] = [0, 0, 0]
             with tempfile.NamedTemporaryFile(
                     'w', suffix='.json', encoding='utf-8', delete=False) as source_file:
                 json.dump(imported_payload, source_file)
@@ -235,6 +261,10 @@ class RemoteControlGuiTests(unittest.TestCase):
                 self.assertTrue(all(isomon._isomon_resistor_widgets[name].value() == 1000.0
                                     for name in ('r3', 'r4', 'r5', 'r6', 'r7', 'r8')))
                 self.assertTrue(isomon._dirty)
+                self.assertEqual(
+                    isomon._collect_values()[1]['isomon_iso']['invalid_resistance_mode'],
+                    scada.ISOMON_INVALID_RESISTANCE_ZERO)
+                self.assertEqual(isomon._sections['isomon_iso']['reserved'], [0, 0])
             finally:
                 os.unlink(imported_path)
 
@@ -300,6 +330,47 @@ class RemoteControlGuiTests(unittest.TestCase):
                 self.assertTrue(isomon._dirty)
             finally:
                 os.unlink(bundle_path)
+
+            for mode in (scada.ISOMON_INVALID_RESISTANCE_NAN,
+                         scada.ISOMON_INVALID_RESISTANCE_RAW):
+                snapshot = {
+                    name: dict(fields) for name, fields in isomon._sections.items()
+                }
+                snapshot['isomon_iso']['invalid_resistance_mode'] = mode
+                isomon._read_complete(
+                    'stored', (isomon._calibration, 'isomon', isomon._section_specs, snapshot))
+                mode_editor = isomon._field_widgets['isomon_iso']['invalid_resistance_mode'][0]
+                self.assertEqual(mode_editor.currentData(), mode)
+                self.assertFalse(isomon._dirty)
+                self.assertEqual(isomon._source, 'stored')
+                with tempfile.TemporaryDirectory() as directory:
+                    path = os.path.join(directory, 'settings.json')
+                    with patch.object(scada.QFileDialog, 'getSaveFileName',
+                                      return_value=(path, 'JSON Files (*.json)')):
+                        isomon._export_values()
+                    with open(path, encoding='utf-8') as source_file:
+                        exported = json.load(source_file)
+                    self.assertEqual(
+                        exported['alg_config']['sections']['isomon_iso']['invalid_resistance_mode'],
+                        mode)
+                    mode_editor.setCurrentIndex(mode_editor.findData(0))
+                    with patch.object(isomon, '_confirm_replace', return_value=True), \
+                         patch.object(scada.QFileDialog, 'getOpenFileName',
+                                      return_value=(path, 'JSON Files (*.json)')):
+                        isomon._import_values()
+                    self.assertEqual(
+                        isomon._collect_values()[1]['isomon_iso']['invalid_resistance_mode'], mode)
+                    exported['alg_config']['sections']['isomon_iso']['invalid_resistance_mode'] = 3
+                    with open(path, 'w', encoding='utf-8') as source_file:
+                        json.dump(exported, source_file)
+                    with patch.object(isomon, '_confirm_replace', return_value=True), \
+                         patch.object(scada.QFileDialog, 'getOpenFileName',
+                                      return_value=(path, 'JSON Files (*.json)')), \
+                         patch.object(scada.QMessageBox, 'critical') as error:
+                        isomon._import_values()
+                    error.assert_called_once()
+                    self.assertEqual(
+                        isomon._collect_values()[1]['isomon_iso']['invalid_resistance_mode'], mode)
 
             first = self.plotter._settings_dialogs['127.0.0.2']
             first._field_widgets['node_dv_filt']['dv_refSourceVoltage'][0].setText('12.5')

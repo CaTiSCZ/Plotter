@@ -207,6 +207,21 @@ and their timestamps, without synthetic interpolated rows. ISO statistics show
 `?` for the expected packet count. If pretrigger history is insufficient, the
 available packets are retained and a warning is logged; plots do not extrapolate.
 
+ISOMON device Settings expose `isomon_iso.invalid_resistance_mode` as **Zero (0)**
+(legacy behavior), **NaN**, or **Raw (NaN / +Inf / -Inf)**. This controls firmware
+output, not a SCADA-side replacement. Settings files exported before this field
+was added (with three reserved bytes) import as Zero; current files preserve the
+selected mode. Nonzero modes require supporting firmware; an older firmware may
+ignore the former reserved byte, so read effective values back after writing.
+
+Resistance plots omit non-finite points and break the connecting line there;
+live resistance labels distinguish `NaN`, `+Inf` and `-Inf` from unavailable
+data (`--`). Measurement buffers and `*_iso_result.csv` keep the received values:
+CSV spells them `nan`, `inf` and `-inf`, preserving infinity signs and finite
+negative resistances. Consumers must explicitly handle non-finite values in
+statistics and spreadsheet imports. Unlike CSV, the plot HTTP endpoint represents
+all three non-finite cases as JSON `null`, so use the CSV for faithful export.
+
 ### `POST /api/v1/measurement/stop`
 
 Stops sampling on applied devices using the GUI's sampling-stop workflow. The response means the stop request was accepted by the GUI; use `/status` and `/live` to inspect resulting state.

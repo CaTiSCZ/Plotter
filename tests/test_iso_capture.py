@@ -16,12 +16,14 @@ from PyQt5.QtWidgets import QApplication
 TRIGGER_NS = 1_800_000_000_000_000_000
 
 
-def iso_packet(order, offset_ms):
+def iso_packet(order, offset_ms, resistances=None):
     timestamp = TRIGGER_NS + int(offset_ms * 1_000_000)
+    values = [float(offset_ms)] * 6 + (
+        [float(offset_ms)] * 4 if resistances is None else list(resistances))
     body = scada.ISO_RESULT_PREFIX_STRUCT.pack(
         scada.Device.PKT_TYPE_ISO_RESULT, order,
         timestamp // 1_000_000_000, timestamp % 1_000_000_000,
-        *([float(offset_ms)] * 10), 0, 0)
+        *values, 0, 0)
     return body + struct.pack('<H', scada.crc16_ccitt(body))
 
 
@@ -223,6 +225,56 @@ class IsoCaptureTests(unittest.TestCase):
                 rows = list(csv.DictReader(source))
         self.assertEqual([float(row['time']) for row in rows], [-3.5, -0.4, 1.4, 12.75])
         self.assertEqual(int(rows[0]['ptp_ns']), TRIGGER_NS - 3_500_000_000)
+
+    def test_nonfinite_resistances_survive_capture_plot_and_csv(self):
+        self.trigger([-2000])
+        values = (float('nan'), float('inf'), -float('inf'), -123.5)
+        self.device.on_raw_packet(iso_packet(1, 0))
+        self.device.on_raw_packet(iso_packet(2, 1000, values))
+        self.device.on_raw_packet(iso_packet(3, 2000))
+        self.device.on_raw_packet(iso_packet(4, 4000))
+        with patch.object(scada, 'USE_OPENGL', False), \
+             patch.object(scada, 'ISOMON_ENABLED', True):
+            self.plotter = scada.Plotter(self.manager)
+            self.plotter.device_edits[scada.ISOMON_DEVICE_INDEX].setText('127.0.0.6:10578')
+            self.plotter._update_plot(force=True)
+        for name, value in zip(scada.ISO_R_FIELDS, values):
+            curve = self.plotter.ax_iso_r_curves[name]
+            x, y = curve.getData()
+            self.assertEqual(curve.opts['connect'], 'finite')
+            actual = y[np.flatnonzero(x == 1.0)[0]]
+            if np.isnan(value):
+                self.assertTrue(np.isnan(actual))
+            else:
+                self.assertEqual(actual, value)
+            path = curve.curve.getPath()
+            self.assertGreater(path.elementCount(), 0)
+            for index in range(path.elementCount()):
+                element = path.elementAt(index)
+                self.assertTrue(np.isfinite(element.x) and np.isfinite(element.y))
+                if index and element.isLineTo() and not np.isfinite(value):
+                    previous = path.elementAt(index - 1)
+                    self.assertFalse(previous.x < 1.0 < element.x)
+        self.assertIn('NaN', self.plotter._format_iso_value('r1_via_r3', values[0], True))
+        self.assertIn('+Inf', self.plotter._format_iso_value('r1_via_r3', values[1], True))
+        self.assertIn('-Inf', self.plotter._format_iso_value('r1_via_r3', values[2], True))
+        self.assertIn('--', self.plotter._format_iso_value('r1_via_r3', values[0], False))
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self.plotter.save_data(os.path.join(directory, 'nonfinite'))
+            iso_path = next(path for path in paths if path.endswith('_iso_result.csv'))
+            with open(iso_path, newline='') as source:
+                rows = list(csv.DictReader(source))
+        row = next(row for row in rows if float(row['time']) == 1.0)
+        self.assertEqual([row[name] for name in scada.ISO_R_FIELDS],
+                         ['nan', 'inf', '-inf', '-123.5'])
+        self.assertTrue(np.isnan(float(row[scada.ISO_R_FIELDS[0]])))
+        self.assertTrue(np.isposinf(float(row[scada.ISO_R_FIELDS[1]])))
+        self.assertTrue(np.isneginf(float(row[scada.ISO_R_FIELDS[2]])))
+        curve = next(iter(self.plotter.ax_iso_r_curves.values()))
+        curve.setData([0, 1, 2], [float('nan'), float('inf'), -float('inf')])
+        self.assertEqual(curve.dataBounds(1), (None, None))
+        self.assertEqual(curve.curve.getPath().elementCount(), 0)
+        self.plotter.ax_iso_r.autoRange()
 
 
 if __name__ == '__main__':

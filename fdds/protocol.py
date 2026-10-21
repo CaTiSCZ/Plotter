@@ -48,7 +48,11 @@ ALG_SEC_CCU_ARC = 0x10       # arc_* matrices + arc_flagBias
 ALG_SEC_CCU_SC = 0x11        # sc_a, sc_i0, sc_threshold
 ALG_SEC_CCU_DS = 0x12        # ds_z1..z3, ds_id_length
 ALG_SEC_ISOMON_STREAM = 0x20  # agg_count, stream_enable
-ALG_SEC_ISOMON_ISO = 0x21     # resistors, average, enable, settling parameters
+ALG_SEC_ISOMON_ISO = 0x21     # resistors, average, enable, settling and invalid-resistance parameters
+
+ISOMON_INVALID_RESISTANCE_ZERO = 0
+ISOMON_INVALID_RESISTANCE_NAN = 1
+ISOMON_INVALID_RESISTANCE_RAW = 2
 
 # ---------------------------------------------------------------------------
 # Enum helpers
@@ -163,6 +167,45 @@ class CMD(IntEnumName):
     I2C_WRITE = 66
     I2C_READ = 67
     I2C_WRITE_READ = 68
+    GET_RTC_TIME = 69
+    SET_RTC_TIME = 70
+    GET_RTC_DRIVE = 71
+    SET_RTC_DRIVE = 72
+    GET_RTC_DRIVE_SAVED = 73
+    SAVE_RTC_DRIVE = 74
+    START_RTC_CALIBRATION = 75
+    GET_RTC_CALIBRATION = 76
+    GET_TIMEZONE = 77
+    SET_TIMEZONE = 78
+    GET_TIMEZONE_SAVED = 79
+    SAVE_TIMEZONE = 80
+
+
+@unique
+class RtcDrive(IntEnumName):
+    LOW = 0
+    MEDIUMLOW = 1
+    MEDIUMHIGH = 2
+    HIGH = 3
+
+
+@unique
+class RtcCalibrationPhase(IntEnumName):
+    IDLE = 0
+    STARTING = 1
+    MEASURING = 2
+    SAVING = 3
+    RESTORING = 4
+    DONE = 5
+    FAILED = 6
+
+
+@unique
+class RtcHealth(IntEnumName):
+    UNKNOWN = 0
+    GOOD = 1
+    FAULT = 2
+    REFERENCE_ERROR = 3
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +237,11 @@ class STRUCT:
     """Binary struct formats for FDDS protocol packets."""
     CMD = struct.Struct("<I")
     ACK = struct.Struct("<HHI")             # packet_type, state, cmd
+    RTC_TIME = struct.Struct("<I")          # Unix seconds, UTC (2000..2099)
+    RTC_TIME_REPLY = struct.Struct("<BI")   # status, Unix seconds (0 on error)
+    RTC_DRIVE_REPLY = struct.Struct("<BBBBII")  # status, level, ready, busy, startup_ms, BDCR
+    RTC_DRIVE_SAVED_REPLY = struct.Struct("<BB")  # status, level (0xFF if unavailable)
+    RTC_CALIBRATION_REPLY = struct.Struct("<BBBBBBBBIiII")
     ID_V4 = struct.Struct("<HH HBB HBBI3I HBBI HH")  # last HH = channels_count + _reserved
     ID_V5 = struct.Struct("<HH HBB HBBI3I HBBI HBB") # channels_count + fault counts
     ID = ID_V4
